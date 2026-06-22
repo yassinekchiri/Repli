@@ -633,6 +633,15 @@ class MigrationOrchestrator:
             self.log.info("Job %s is already marked as completed. Nothing to do.", job_id)
             return
 
+        if status == "dest_initialized":
+            self.log.info("Destination replication was already initialized for this job.")
+            self.log.info("Use check-status to monitor progress:")
+            self.log.info("  python3 %s --action check-status --job-id %s",
+                          os.path.basename(sys.argv[0]), job_id)
+            # Delegate to check-status so the user also gets the live ONTAP state.
+            self.action_check_status(job_data)
+            return
+
         # --- Single status check on the pivot (no polling loop) -----------
         r = self.x.run(self.pivot_cluster,
                        f"snapmirror show -destination-path {pivot_dest_path} -instance")
