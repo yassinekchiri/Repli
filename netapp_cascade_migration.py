@@ -366,6 +366,37 @@ def parse_field_value(stdout: str, field_name: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
+def parse_instance(stdout: str) -> dict:
+    """Parse une sortie ONTAP '-instance' (mono-objet) en dict {clef: valeur}.
+
+    Toutes les paires 'Champ : valeur' sont collectees en une seule passe, ce qui
+    evite de relancer une commande (donc une connexion) par champ recherche. Les
+    clefs sont normalisees en minuscules pour des acces insensibles a la casse.
+    """
+    fields: dict = {}
+    for line in stdout.splitlines():
+        m = re.match(r"^\s*(.+?)\s*:\s*(.*?)\s*$", line)
+        if not m:
+            continue
+        key = m.group(1).strip().lower()
+        value = m.group(2).strip()
+        fields[key] = value
+    return fields
+
+
+def get_instance_field(fields: dict, *names: str) -> Optional[str]:
+    """Lit un champ dans un dict issu de parse_instance, avec noms alternatifs.
+
+    Renvoie la premiere valeur non vide (ni '', ni '-') trouvee parmi `names`
+    (compares de facon insensible a la casse), sinon None.
+    """
+    for name in names:
+        value = fields.get(name.lower())
+        if value not in (None, "", "-"):
+            return value
+    return None
+
+
 def parse_size_to_bytes(size_str: str) -> Optional[int]:
     """Convertit une taille ONTAP ('100GB', '1.5TB', '512MB', '2048') en octets."""
     if not size_str:
@@ -440,12 +471,15 @@ class MigrationOrchestrator:
         self.log.info("######## ACTION 'create' : initialisation de la cascade ########")
 
         # --- Etape 0 : recuperer les caracteristiques du volume source ----
-        src_size = self._get_volume_size(self.src_cluster, self.src_svm, self.volume)
+        # Un seul appel ONTAP : tout l'objet est mis en cache dans un dict, puis
+        # chaque info necessaire en est extraite (aucune connexion redondante).
+        src_info = self._get_volume_info(self.src_cluster, self.src_svm, self.volume)
+
+        src_size = get_instance_field(src_info, "Volume Size", "size")
         self.log.info("Taille du volume source '%s' : %s", self.volume, src_size)
         src_bytes = parse_size_to_bytes(src_size) if src_size else None
 
-        src_style = self._get_volume_security_style(self.src_cluster,
-                                                    self.src_svm, self.volume)
+        src_style = get_instance_field(src_info, "Security Style", "security-style")
         self.log.info("Security style du volume source '%s' : %s",
                       self.volume, src_style or "inconnu")
 
@@ -602,24 +636,18 @@ class MigrationOrchestrator:
     # =====================================================================
     # PRIMITIVES ONTAP REUTILISABLES
     # =====================================================================
-    def _get_volume_size(self, cluster: str, svm: str, volume: str) -> Optional[str]:
-        """Recupere la taille provisionnee du volume (champ 'size')."""
-        r = self.x.run(cluster,
-                       f"volume show -vserver {svm} -volume {volume} "
-                       f"-instance")
-        size = parse_field_value(r.stdout, "Volume Size") or \
-            parse_field_value(r.stdout, "size")
-        return size
+    def _get_volume_info(self, cluster: str, svm: str, volume: str) -> dict:
+        """Recupere TOUTES les caracteristiques du volume en un seul appel.
 
-    def _get_volume_security_style(self, cluster: str, svm: str,
-                                   volume: str) -> Optional[str]:
-        """Recupere le security style du volume (unix / ntfs / mixed)."""
+        Un unique 'volume show -instance' est execute puis l'integralite de
+        l'objet est mise en cache dans un dict. Les consommateurs lisent ensuite
+        la donnee voulue (taille, security style, ...) via get_instance_field
+        sans rouvrir de connexion supplementaire.
+        """
         r = self.x.run(cluster,
                        f"volume show -vserver {svm} -volume {volume} "
                        f"-instance")
-        style = parse_field_value(r.stdout, "Security Style") or \
-            parse_field_value(r.stdout, "security-style")
-        return style
+        return parse_instance(r.stdout)
 
     def _check_aggregate_space(self, cluster: str, aggr: str,
                                required_bytes: Optional[int]):
@@ -628,8 +656,8 @@ class MigrationOrchestrator:
         r = self.x.run(cluster,
                        f"storage aggregate show -aggregate {aggr} "
                        f"-instance")
-        avail_str = parse_field_value(r.stdout, "Available Size") or \
-            parse_field_value(r.stdout, "availsize")
+        aggr_info = parse_instance(r.stdout)
+        avail_str = get_instance_field(aggr_info, "Available Size", "availsize")
         avail_bytes = parse_size_to_bytes(avail_str) if avail_str else None
 
         if required_bytes is None or avail_bytes is None:
@@ -689,9 +717,10 @@ class MigrationOrchestrator:
             r = self.x.run(cluster,
                            f"snapmirror show -destination-path {dest_path} "
                            f"-instance")
-            state = (parse_field_value(r.stdout, "Mirror State") or
-                     parse_field_value(r.stdout, "Relationship Status") or
-                     parse_field_value(r.stdout, "state") or "").lower()
+            sm_info = parse_instance(r.stdout)
+            state = (get_instance_field(sm_info, "Mirror State",
+                                        "Relationship Status", "state")
+                     or "").lower()
             self.log.info("Etat SnapMirror %s : '%s'.", dest_path, state or "inconnu")
             if state in ("snapmirrored", "idle"):
                 self.log.info("Relation %s prete (etat='%s').", dest_path, state)
@@ -715,8 +744,9 @@ class MigrationOrchestrator:
             r = self.x.run(cluster,
                            f"snapmirror show -destination-path {dest_path} "
                            f"-instance")
-            status = (parse_field_value(r.stdout, "Relationship Status") or
-                      parse_field_value(r.stdout, "status") or "").lower()
+            sm_info = parse_instance(r.stdout)
+            status = (get_instance_field(sm_info, "Relationship Status", "status")
+                      or "").lower()
             self.log.info("Statut transfert %s : '%s'.", dest_path, status or "inconnu")
             if status == "idle":
                 return
