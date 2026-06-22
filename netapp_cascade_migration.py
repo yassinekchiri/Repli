@@ -4,71 +4,71 @@
 netapp_cascade_migration.py
 ===========================
 
-Outil d'orchestration pour la migration de stockage NetApp ONTAP selon une
-topologie en cascade ("passe-plat" / cascading) sur 3 niveaux :
+Orchestration tool for NetApp ONTAP storage migration using a cascading
+topology ("pass-through" / cascading) across 3 tiers:
 
-    Niveau Supérieur (Sources)        ->  Clusters de production "hauts"
-                                          (ex: CMOPARPA4MUT100, CMOPARTIGMUT100)
+    Upper Tier (Sources)          ->  High-end production clusters
+                                      (e.g. CMOPARPA4MUT100, CMOPARTIGMUT100)
                 |
-                |  SnapMirror (relation 1)
+                |  SnapMirror (relationship 1)
                 v
-    Niveau Intermédiaire (Pivot)      ->  Cluster de transit / gare de triage
-                                          (CMOPARTIGBKP110)
+    Middle Tier (Pivot)           ->  Transit / staging cluster
+                                      (CMOPARTIGBKP110)
                 |
-                |  SnapMirror (relation 2)
+                |  SnapMirror (relationship 2)
                 v
-    Niveau Inférieur (Destinations)   ->  Clusters cibles "bas"
-                                          (ex: CMOPARPA4SFS100, CMOPARDC5SFS100)
+    Lower Tier (Destinations)     ->  Low-end target clusters
+                                      (e.g. CMOPARPA4SFS100, CMOPARDC5SFS100)
 
-Objectif : migrer la donnee tout en ECLATANT la structure de stockage. Les
-volumes sources contiennent plusieurs Qtrees ; a la destination finale, chaque
-Qtree doit etre isolee dans son propre volume dedie (regle : 1 Volume = 1 Qtree).
-
-------------------------------------------------------------------------------
-CONTRAINTES STRICTES IMPLEMENTEES
-------------------------------------------------------------------------------
-* EXECUTION VIA CLI ONTAP  : toutes les actions passent par des commandes
-  ONTAP CLI standard, executees a travers SSH.
-* AUTHENTIFICATION          : aucune gestion de login/password. On s'appuie
-  exclusivement sur le trust SSH natif (echange de cles deja en place). Le
-  transport SSH par defaut est le client SSH natif du systeme (via subprocess),
-  ce qui respecte la configuration ~/.ssh/config et l'agent SSH. Un backend
-  paramiko est egalement disponible (--ssh-backend paramiko) si paramiko est
-  installe ; il utilise lui aussi les cles du systeme (aucun mot de passe).
-* TRACABILITE ABSOLUE       : chaque commande envoyee a un cluster est journalisee
-  de facon exhaustive (date/heure, cluster cible, commande brute, exit code,
-  stdout et stderr complets) dans un fichier de log dedie.
-* GESTION D'ERREURS         : la sortie textuelle (stdout/stderr) de chaque
-  commande est analysee. Toute commande qui echoue (exit code != 0) ou dont la
-  sortie contient un motif d'erreur ONTAP stoppe immediatement l'execution,
-  archive l'erreur dans le log et leve une exception propre (OntapCliError).
+Goal: migrate data while SPLITTING the storage structure. Source volumes
+contain multiple Qtrees; at the final destination each Qtree must be
+isolated in its own dedicated volume (rule: 1 Volume = 1 Qtree).
 
 ------------------------------------------------------------------------------
-INTERFACE CLI
+STRICT CONSTRAINTS IMPLEMENTED
 ------------------------------------------------------------------------------
-Arguments imposes :
-    --source-cluster   Nom/IP du cluster source (haut)
-    --pivot-cluster    Nom/IP du cluster pivot (CMOPARTIGBKP110)
-    --dest-cluster     Nom/IP du cluster destination (bas)
-    --volume           Nom du volume source concerne
+* ONTAP CLI EXECUTION   : every action goes through standard ONTAP CLI
+  commands executed over SSH.
+* AUTHENTICATION        : no login/password management. Relies exclusively on
+  native SSH key trust (key exchange already in place). The default SSH
+  transport is the system native SSH client (via subprocess), which honours
+  ~/.ssh/config and the SSH agent. A paramiko backend is also available
+  (--ssh-backend paramiko) if paramiko is installed; it also uses system keys
+  (no password).
+* FULL TRACEABILITY     : every command sent to a cluster is logged exhaustively
+  (date/time, target cluster, raw command, exit code, full stdout and stderr)
+  in a dedicated log file.
+* ERROR HANDLING        : stdout/stderr of every command is analysed. Any
+  command that fails (exit code != 0) or whose output contains an ONTAP error
+  pattern stops execution immediately, archives the error in the log, and
+  raises a clean exception (OntapCliError).
+
+------------------------------------------------------------------------------
+CLI INTERFACE
+------------------------------------------------------------------------------
+Required arguments:
+    --source-cluster   Name/IP of the source cluster (upper tier)
+    --pivot-cluster    Name/IP of the pivot cluster (CMOPARTIGBKP110)
+    --dest-cluster     Name/IP of the destination cluster (lower tier)
+    --volume           Name of the source volume
     --action           'create' | 'clone' | 'cleanup'
 
-Arguments specifiques aux actions :
-    --qtrees           (clone)   liste 'q1,q2' OU mot-cle 'all'
-    --qtree            (cleanup) une seule Qtree cible
+Action-specific arguments:
+    --qtrees           (clone)   comma-separated list 'q1,q2' OR keyword 'all'
+    --qtree            (cleanup) single target Qtree
 
-Arguments techniques additionnels (necessaires aux commandes ONTAP reelles,
-fournis avec des valeurs par defaut raisonnables ; a adapter a votre contexte) :
-    --source-vserver / --pivot-vserver / --dest-vserver   SVM par niveau
-    --pivot-aggr / --dest-aggr                            Agregats cibles
-    --noaccess-policy                                     export-policy restrictive
-    --ssh-backend {subprocess,paramiko}                   transport SSH
-    --ssh-user                                            user@host optionnel
-    --log-file                                            chemin du log
-    --dry-run                                             simulation (rien n'est execute)
-    --timeout / --poll-interval                           pour le suivi SnapMirror
+Additional technical arguments (required for real ONTAP commands,
+provided with sensible defaults; adapt to your environment):
+    --source-vserver / --pivot-vserver / --dest-vserver   SVM per tier
+    --pivot-aggr / --dest-aggr                            Target aggregates
+    --noaccess-policy                                     Restrictive export-policy
+    --ssh-backend {subprocess,paramiko}                   SSH transport
+    --ssh-user                                            optional user@host
+    --log-file                                            log file path
+    --dry-run                                             simulation (nothing executed)
+    --timeout / --poll-interval                           SnapMirror polling
 
-Exemples :
+Examples:
     python3 netapp_cascade_migration.py \\
         --source-cluster CMOPARTIGMUT100 \\
         --pivot-cluster  CMOPARTIGBKP110 \\
@@ -94,14 +94,14 @@ from typing import List, Optional
 
 
 # =============================================================================
-# 1. EXCEPTIONS ET STRUCTURES DE DONNEES
+# 1. EXCEPTIONS AND DATA STRUCTURES
 # =============================================================================
 
 class OntapCliError(Exception):
-    """Exception propre levee des qu'une commande ONTAP CLI echoue.
+    """Raised whenever an ONTAP CLI command fails.
 
-    On y embarque le contexte complet (cluster, commande, exit code, sorties)
-    afin que l'erreur remontee soit immediatement exploitable.
+    Carries full context (cluster, command, exit code, outputs) so that the
+    error surfaced to the caller is immediately actionable.
     """
 
     def __init__(self, cluster: str, command: str, exit_code: int,
@@ -113,7 +113,7 @@ class OntapCliError(Exception):
         self.stderr = stderr
         self.reason = reason
         message = (
-            f"Echec commande ONTAP sur '{cluster}' "
+            f"ONTAP command failed on '{cluster}' "
             f"(exit={exit_code}{', ' + reason if reason else ''}) : {command}"
         )
         super().__init__(message)
@@ -121,7 +121,7 @@ class OntapCliError(Exception):
 
 @dataclass
 class CommandResult:
-    """Resultat structure d'une commande ONTAP CLI executee via SSH."""
+    """Structured result of an ONTAP CLI command executed over SSH."""
     cluster: str
     command: str
     exit_code: int
@@ -132,12 +132,12 @@ class CommandResult:
 
 
 # =============================================================================
-# 2. EXECUTEUR DE COMMANDES ONTAP CLI (SSH + LOG + DETECTION D'ERREUR)
+# 2. ONTAP CLI COMMAND EXECUTOR (SSH + LOGGING + ERROR DETECTION)
 # =============================================================================
 
-# Motifs d'erreur typiques renvoyes par l'ONTAP CLI meme lorsque le code de
-# retour SSH est 0 (l'ONTAP CLI ecrit souvent l'erreur sur stdout/stderr en
-# conservant un exit code SSH a 0). On reste volontairement strict.
+# Typical error patterns returned by the ONTAP CLI even when the SSH exit code
+# is 0 (ONTAP CLI often writes errors to stdout/stderr while keeping SSH exit
+# code at 0). Kept intentionally strict.
 ONTAP_ERROR_PATTERNS = [
     re.compile(r"^\s*Error:", re.IGNORECASE | re.MULTILINE),
     re.compile(r"\berror\b.*\bfailed\b", re.IGNORECASE),
@@ -149,20 +149,20 @@ ONTAP_ERROR_PATTERNS = [
     re.compile(r"\binsufficient\b", re.IGNORECASE),
 ]
 
-# Motifs autorises (faux positifs) : certaines sorties legitimes contiennent le
-# mot "error" sans qu'il s'agisse d'une erreur (ex: colonne "Last Transfer
-# Error" vide d'un snapmirror show). On les neutralise avant l'analyse.
+# Allowed patterns (false positives): some legitimate outputs contain the word
+# "error" without it being an actual error (e.g. empty "Last Transfer Error"
+# column in snapmirror show). Neutralised before strict analysis.
 ONTAP_BENIGN_PATTERNS = [
     re.compile(r"Last Transfer Error\s*:\s*-?\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 
 class OntapCliExecutor:
-    """Encapsule l'execution d'une commande ONTAP CLI sur un cluster via SSH.
+    """Wraps execution of an ONTAP CLI command on a cluster over SSH.
 
-    - Respecte le trust SSH natif (aucun mot de passe gere).
-    - Trace chaque commande de maniere exhaustive dans le logger fourni.
-    - Analyse stdout/stderr et le code de retour pour detecter les erreurs.
+    - Relies on native SSH key trust (no password management).
+    - Logs every command exhaustively via the provided logger.
+    - Analyses stdout/stderr and exit code to detect errors.
     """
 
     def __init__(self, logger: logging.Logger, ssh_backend: str = "subprocess",
@@ -173,45 +173,44 @@ class OntapCliExecutor:
         self.ssh_user = ssh_user
         self.dry_run = dry_run
         self.connect_timeout = connect_timeout
-        self._paramiko = None  # chargement paresseux
+        self._paramiko = None  # lazy load
 
         if ssh_backend == "paramiko":
             self._init_paramiko()
 
-    # ---- Initialisation paramiko (optionnelle) --------------------------- #
+    # ---- Paramiko initialisation (optional) ------------------------------ #
     def _init_paramiko(self):
         try:
-            import paramiko  # import local pour ne pas l'imposer en dependance
+            import paramiko  # local import so paramiko is not a hard dependency
             self._paramiko = paramiko
         except ImportError as exc:
             raise RuntimeError(
-                "Backend SSH 'paramiko' demande mais le module paramiko n'est "
-                "pas installe (pip install paramiko)."
+                "SSH backend 'paramiko' requested but the paramiko module is "
+                "not installed (pip install paramiko)."
             ) from exc
 
-    # ---- Construction de la cible SSH ------------------------------------ #
+    # ---- SSH target construction ----------------------------------------- #
     def _ssh_target(self, cluster: str) -> str:
-        """Retourne 'user@cluster' si un user est fourni, sinon 'cluster'."""
+        """Returns 'user@cluster' if a user is provided, otherwise 'cluster'."""
         return f"{self.ssh_user}@{cluster}" if self.ssh_user else cluster
 
-    # ---- Execution principale -------------------------------------------- #
+    # ---- Main execution -------------------------------------------------- #
     def run(self, cluster: str, command: str,
             allow_failure: bool = False) -> CommandResult:
-        """Execute `command` sur `cluster` via SSH et retourne un CommandResult.
+        """Execute `command` on `cluster` over SSH and return a CommandResult.
 
-        :param allow_failure: si True, ne leve pas d'exception sur erreur
-            (utile pour des commandes de decouverte tolerantes). L'erreur reste
-            tracee dans le log.
-        :raises OntapCliError: si la commande echoue et allow_failure=False.
+        :param allow_failure: if True, do not raise on error (useful for
+            tolerant discovery commands). The error is still logged.
+        :raises OntapCliError: if the command fails and allow_failure=False.
         """
         started_at = datetime.datetime.now()
         t0 = time.monotonic()
 
         if self.dry_run:
-            # En dry-run on ne contacte aucun cluster : on trace l'intention.
+            # In dry-run mode no cluster is contacted: only the intent is logged.
             duration = time.monotonic() - t0
             result = CommandResult(cluster, command, 0,
-                                   "[DRY-RUN] commande non executee", "",
+                                   "[DRY-RUN] command not executed", "",
                                    started_at, duration)
             self._trace(result, dry_run=True)
             return result
@@ -226,30 +225,30 @@ class OntapCliExecutor:
                                started_at, duration)
         self._trace(result)
 
-        # Detection d'erreur (exit code OU motif textuel dans la sortie).
+        # Error detection: non-zero exit code OR error pattern in output.
         error_reason = self._detect_error(result)
         if error_reason and not allow_failure:
-            # Archivage explicite de l'erreur puis levee d'une exception propre.
-            self.log.error("ARRET : erreur detectee (%s) sur le cluster %s.",
+            # Explicitly archive the error then raise a clean exception.
+            self.log.error("STOPPING: error detected (%s) on cluster %s.",
                            error_reason, cluster)
             raise OntapCliError(cluster, command, exit_code, stdout, stderr,
                                 reason=error_reason)
         if error_reason and allow_failure:
-            self.log.warning("Erreur toleree (allow_failure) sur %s : %s",
+            self.log.warning("Tolerated error (allow_failure) on %s: %s",
                              cluster, error_reason)
 
         return result
 
-    # ---- Backend subprocess (client SSH natif) --------------------------- #
+    # ---- subprocess backend (native SSH client) -------------------------- #
     def _run_subprocess(self, cluster: str, command: str):
-        """Execute via le client ssh du systeme (trust par cles natif)."""
+        """Execute via the system SSH client (native key trust)."""
         ssh_cmd = [
             "ssh",
-            "-o", "BatchMode=yes",               # jamais de prompt interactif
+            "-o", "BatchMode=yes",               # never prompt interactively
             "-o", f"ConnectTimeout={self.connect_timeout}",
             "-o", "StrictHostKeyChecking=accept-new",
             self._ssh_target(cluster),
-            command,                              # commande ONTAP CLI integrale
+            command,                              # full ONTAP CLI command
         ]
         try:
             proc = subprocess.run(
@@ -261,19 +260,19 @@ class OntapCliExecutor:
             )
             return proc.returncode, proc.stdout, proc.stderr
         except FileNotFoundError as exc:
-            raise RuntimeError("Client 'ssh' introuvable sur le systeme.") from exc
+            raise RuntimeError("SSH client not found on the system.") from exc
 
-    # ---- Backend paramiko ------------------------------------------------ #
+    # ---- paramiko backend ----------------------------------------------- #
     def _run_paramiko(self, cluster: str, command: str):
-        """Execute via paramiko en s'appuyant sur les cles SSH du systeme."""
+        """Execute via paramiko using system SSH keys."""
         client = self._paramiko.SSHClient()
         client.load_system_host_keys()
         client.set_missing_host_key_policy(self._paramiko.AutoAddPolicy())
         try:
-            # look_for_keys + agent : aucun mot de passe, uniquement les cles.
+            # look_for_keys + agent: keys only, no password.
             client.connect(
                 hostname=cluster,
-                username=self.ssh_user,            # peut etre None -> user courant
+                username=self.ssh_user,            # may be None -> current user
                 timeout=self.connect_timeout,
                 look_for_keys=True,
                 allow_agent=True,
@@ -286,17 +285,17 @@ class OntapCliExecutor:
         finally:
             client.close()
 
-    # ---- Tracabilite exhaustive ------------------------------------------ #
+    # ---- Exhaustive traceability ----------------------------------------- #
     def _trace(self, r: CommandResult, dry_run: bool = False):
-        """Journalise integralement la commande et son resultat."""
+        """Log the command and its result in full."""
         banner = "DRY-RUN " if dry_run else ""
         self.log.info(
-            "\n%s================ COMMANDE ONTAP CLI ================\n"
-            "%sDate/heure   : %s\n"
-            "%sCluster cible: %s\n"
-            "%sCommande     : %s\n"
+            "\n%s================ ONTAP CLI COMMAND ================\n"
+            "%sDate/time    : %s\n"
+            "%sTarget cluster: %s\n"
+            "%sCommand      : %s\n"
             "%sExit code    : %s\n"
-            "%sDuree (s)    : %.2f\n"
+            "%sDuration (s) : %.2f\n"
             "%s---- STDOUT ----\n%s\n"
             "%s---- STDERR ----\n%s\n"
             "%s====================================================",
@@ -306,60 +305,60 @@ class OntapCliExecutor:
             banner, r.command,
             banner, r.exit_code,
             banner, r.duration_s,
-            banner, r.stdout.rstrip() or "(vide)",
-            banner, r.stderr.rstrip() or "(vide)",
+            banner, r.stdout.rstrip() or "(empty)",
+            banner, r.stderr.rstrip() or "(empty)",
             banner,
         )
 
-    # ---- Analyse d'erreur ------------------------------------------------- #
+    # ---- Error analysis -------------------------------------------------- #
     def _detect_error(self, r: CommandResult) -> Optional[str]:
-        """Retourne une raison d'erreur (str) si detectee, sinon None."""
+        """Return an error reason string if detected, otherwise None."""
         if r.exit_code != 0:
-            return f"exit code non nul ({r.exit_code})"
+            return f"non-zero exit code ({r.exit_code})"
 
         combined = f"{r.stdout}\n{r.stderr}"
 
-        # Neutralisation des faux positifs connus avant l'analyse stricte.
+        # Strip known false positives before strict pattern matching.
         for benign in ONTAP_BENIGN_PATTERNS:
             combined = benign.sub("", combined)
 
         for pattern in ONTAP_ERROR_PATTERNS:
             if pattern.search(combined):
-                return f"motif d'erreur ONTAP detecte ({pattern.pattern})"
+                return f"ONTAP error pattern matched ({pattern.pattern})"
         return None
 
 
 # =============================================================================
-# 3. UTILITAIRES DE PARSING DES SORTIES ONTAP
+# 3. ONTAP OUTPUT PARSING UTILITIES
 # =============================================================================
 
 def parse_qtree_list(stdout: str) -> List[str]:
-    """Extrait la liste des noms de Qtrees depuis 'volume qtree show -instance'.
+    """Extract Qtree names from 'volume qtree show -instance' output.
 
-    En mode '-instance', chaque Qtree est decrite par un bloc clef/valeur, p.ex.:
+    In -instance mode each Qtree is described as a key/value block, e.g.:
 
-                                Vserver Name: svm1
-                                 Volume Name: vol_prod_01
-                                  Qtree Name: qtree_finance
-                                       ...
+                            Vserver Name: svm1
+                             Volume Name: vol_prod_01
+                              Qtree Name: qtree_finance
+                                   ...
 
-    L'ONTAP CLI expose une qtree par defaut (racine du volume, nom vide / '-')
-    que l'on ignore.
+    The ONTAP CLI always exposes a default Qtree (volume root, empty name / '-')
+    which is ignored.
     """
     qtrees: List[str] = []
-    # Une occurrence de "Qtree Name : <valeur>" par Qtree decrite.
+    # One "Qtree Name : <value>" occurrence per described Qtree.
     pattern = re.compile(r"^\s*Qtree Name\s*:\s*(.*?)\s*$",
                          re.IGNORECASE | re.MULTILINE)
     for m in pattern.finditer(stdout):
         qtree_name = m.group(1).strip().strip('"')
-        # On ignore la qtree racine (vide) representee par "" ou '-'.
+        # Ignore the root Qtree (empty) represented as "" or '-'.
         if qtree_name and qtree_name not in ('""', "-"):
             qtrees.append(qtree_name)
     return qtrees
 
 
 def parse_field_value(stdout: str, field_name: str) -> Optional[str]:
-    """Extrait une valeur depuis une sortie ONTAP au format '-instance' (clef: valeur)."""
+    """Extract a single value from an ONTAP -instance output (key: value format)."""
     pattern = re.compile(rf"^\s*{re.escape(field_name)}\s*:\s*(.+?)\s*$",
                          re.IGNORECASE | re.MULTILINE)
     m = pattern.search(stdout)
@@ -367,11 +366,11 @@ def parse_field_value(stdout: str, field_name: str) -> Optional[str]:
 
 
 def parse_instance(stdout: str) -> dict:
-    """Parse une sortie ONTAP '-instance' (mono-objet) en dict {clef: valeur}.
+    """Parse an ONTAP -instance output (single object) into a {key: value} dict.
 
-    Toutes les paires 'Champ : valeur' sont collectees en une seule passe, ce qui
-    evite de relancer une commande (donc une connexion) par champ recherche. Les
-    clefs sont normalisees en minuscules pour des acces insensibles a la casse.
+    All 'Field : value' pairs are collected in a single pass, avoiding the need
+    to re-run a command (and open a connection) for each field. Keys are
+    normalised to lowercase for case-insensitive lookups.
     """
     fields: dict = {}
     for line in stdout.splitlines():
@@ -385,10 +384,10 @@ def parse_instance(stdout: str) -> dict:
 
 
 def get_instance_field(fields: dict, *names: str) -> Optional[str]:
-    """Lit un champ dans un dict issu de parse_instance, avec noms alternatifs.
+    """Read a field from a parse_instance dict, with alternative names.
 
-    Renvoie la premiere valeur non vide (ni '', ni '-') trouvee parmi `names`
-    (compares de facon insensible a la casse), sinon None.
+    Returns the first non-empty (not '' or '-') value found among `names`
+    (case-insensitive comparison), or None if none match.
     """
     for name in names:
         value = fields.get(name.lower())
@@ -398,7 +397,7 @@ def get_instance_field(fields: dict, *names: str) -> Optional[str]:
 
 
 def parse_size_to_bytes(size_str: str) -> Optional[int]:
-    """Convertit une taille ONTAP ('100GB', '1.5TB', '512MB', '2048') en octets."""
+    """Convert an ONTAP size string ('100GB', '1.5TB', '512MB', '2048') to bytes."""
     if not size_str:
         return None
     size_str = size_str.strip().upper().replace("B", "").replace("I", "")
@@ -412,21 +411,21 @@ def parse_size_to_bytes(size_str: str) -> Optional[int]:
 
 
 def parse_cifs_shares_for_path(stdout: str, qtree_path_fragment: str) -> List[str]:
-    """Retourne les noms de partages CIFS dont le path contient `qtree_path_fragment`.
+    """Return CIFS share names whose path contains `qtree_path_fragment`.
 
-    Attendu : sortie de 'vserver cifs share show -instance', soit un bloc
-    clef/valeur par partage, p.ex.:
+    Expected input: output of 'vserver cifs share show -instance', i.e. one
+    key/value block per share, e.g.:
 
-                                  Vserver: svm1
-                               Share Name: finance_share
-                                     Path: /vol_prod_01/qtree_finance
-                                       ...
+                              Vserver: svm1
+                           Share Name: finance_share
+                                 Path: /vol_prod_01/qtree_finance
+                                   ...
 
-    Les partages sont regroupes par bloc (separes par une ligne vide) afin
-    d'associer correctement chaque 'Share Name' a son 'Path'.
+    Shares are split by block (separated by blank lines) so that each
+    'Share Name' is correctly associated with its 'Path'.
     """
     shares: List[str] = []
-    # Decoupage en blocs (un partage par bloc) sur les lignes vides.
+    # Split into blocks (one share per block) on blank lines.
     for block in re.split(r"\n\s*\n", stdout):
         share_name = parse_field_value(block, "Share Name") or \
             parse_field_value(block, "share-name")
@@ -438,18 +437,18 @@ def parse_cifs_shares_for_path(stdout: str, qtree_path_fragment: str) -> List[st
 
 
 # =============================================================================
-# 4. ORCHESTRATEUR DE MIGRATION (LOGIQUE METIER DES 3 ACTIONS)
+# 4. MIGRATION ORCHESTRATOR (BUSINESS LOGIC FOR THE 3 ACTIONS)
 # =============================================================================
 
 class MigrationOrchestrator:
-    """Pilote la cascade Source -> Pivot -> Destination via l'ONTAP CLI."""
+    """Drives the Source -> Pivot -> Destination cascade via the ONTAP CLI."""
 
     def __init__(self, executor: OntapCliExecutor, args: argparse.Namespace):
         self.x = executor
         self.log = executor.log
-        self.a = args  # raccourci vers les arguments CLI
+        self.a = args  # shortcut to CLI arguments
 
-        # Raccourcis lisibles vers les clusters / SVM.
+        # Readable shortcuts to clusters / SVMs.
         self.src_cluster = args.source_cluster
         self.pivot_cluster = args.pivot_cluster
         self.dest_cluster = args.dest_cluster
@@ -459,37 +458,37 @@ class MigrationOrchestrator:
         self.pivot_svm = args.pivot_vserver
         self.dest_svm = args.dest_vserver
 
-    # ----- Helpers de chemins SnapMirror ---------------------------------- #
+    # ----- SnapMirror path helpers ---------------------------------------- #
     def _path(self, svm: str, volume: str) -> str:
-        """Construit un chemin SnapMirror 'svm:volume'."""
+        """Build a SnapMirror path 'svm:volume'."""
         return f"{svm}:{volume}"
 
     # =====================================================================
-    # ACTION 1 : 'create' -> Initialisation de la cascade
+    # ACTION 1 : 'create' -> Cascade initialisation
     # =====================================================================
     def action_create(self):
-        self.log.info("######## ACTION 'create' : initialisation de la cascade ########")
+        self.log.info("######## ACTION 'create': cascade initialisation ########")
 
-        # --- Etape 0 : recuperer les caracteristiques du volume source ----
-        # Un seul appel ONTAP : tout l'objet est mis en cache dans un dict, puis
-        # chaque info necessaire en est extraite (aucune connexion redondante).
+        # --- Step 0: retrieve source volume characteristics ---------------
+        # Single ONTAP call: the full object is cached in a dict; each needed
+        # field is then read from the dict (no redundant connections).
         src_info = self._get_volume_info(self.src_cluster, self.src_svm, self.volume)
 
         src_size = get_instance_field(src_info, "Volume Size", "size")
-        self.log.info("Taille du volume source '%s' : %s", self.volume, src_size)
+        self.log.info("Source volume '%s' size: %s", self.volume, src_size)
         src_bytes = parse_size_to_bytes(src_size) if src_size else None
 
         src_style = get_instance_field(src_info, "Security Style", "security-style")
-        self.log.info("Security style du volume source '%s' : %s",
-                      self.volume, src_style or "inconnu")
+        self.log.info("Source volume '%s' security style: %s",
+                      self.volume, src_style or "unknown")
 
-        # --- Etape 1 : verification de l'espace sur Pivot puis Destination -
+        # --- Step 1: check available space on Pivot then Destination ------
         self._check_aggregate_space(self.pivot_cluster, self.a.pivot_aggr, src_bytes)
         self._check_aggregate_space(self.dest_cluster, self.a.dest_aggr, src_bytes)
 
-        # --- Etape 2 : creation des volumes DP (Pivot puis Destination) ----
-        # Les volumes destinataires d'une relation SnapMirror sont de type 'DP',
-        # crees sans reservation d'espace et avec le security style de la source.
+        # --- Step 2: create DP volumes (Pivot then Destination) -----------
+        # SnapMirror destination volumes are of type 'DP', created without
+        # space reservation and with the same security style as the source.
         self._create_dp_volume(self.pivot_cluster, self.pivot_svm, self.volume,
                                self.a.pivot_aggr, src_size, src_style)
         self._create_dp_volume(self.dest_cluster, self.dest_svm, self.volume,
@@ -498,10 +497,10 @@ class MigrationOrchestrator:
         pivot_dest_path = self._path(self.pivot_svm, self.volume)
         dest_dest_path = self._path(self.dest_svm, self.volume)
 
-        # --- Etape 3a : declaration des deux relations (sans transfert) -----
-        # On cree les deux relations en amont pour que la relation Pivot->Dest
-        # existe deja au moment ou l'on lancera son initialize. Aucun transfert
-        # ne demarre a cette etape.
+        # --- Step 3a: declare both relationships (no transfer yet) --------
+        # Both relationships are created upfront so that the Pivot->Dest
+        # relationship already exists when its initialize is triggered.
+        # No data transfer starts at this step.
         self._snapmirror_create(
             run_on=self.pivot_cluster,
             source_path=self._path(self.src_svm, self.volume),
@@ -513,11 +512,10 @@ class MigrationOrchestrator:
             dest_path=dest_dest_path,
         )
 
-        # --- Etape 3b : initialisation Pivot, attente idle, PUIS Destination -
-        # Regle stricte : le transfert vers la destination ne peut demarrer
-        # qu'une fois le pivot completement synchronise (idle). Lancer les deux
-        # initialize en parallele risquerait de saturer le pivot ou de partir
-        # sur une source incomplete.
+        # --- Step 3b: initialize Pivot, wait idle, THEN initialize Destination
+        # Strict rule: the destination transfer must not start until the pivot
+        # is fully synchronized (idle). Running both initializes concurrently
+        # could overload the pivot or start from an incomplete source.
         self._snapmirror_initialize(run_on=self.pivot_cluster,
                                     dest_path=pivot_dest_path)
         self._wait_snapmirror_ready(self.pivot_cluster, pivot_dest_path)
@@ -526,52 +524,52 @@ class MigrationOrchestrator:
                                     dest_path=dest_dest_path)
         self._wait_snapmirror_ready(self.dest_cluster, dest_dest_path)
 
-        self.log.info("ACTION 'create' terminee : cascade initialisee et synchronisee.")
+        self.log.info("ACTION 'create' complete: cascade initialised and synchronised.")
 
     # =====================================================================
-    # ACTION 2 : 'clone' -> Split des Qtrees & creation des volumes cibles
+    # ACTION 2 : 'clone' -> Qtree split & target volume creation
     # =====================================================================
     def action_clone(self):
-        self.log.info("######## ACTION 'clone' : split des Qtrees ########")
+        self.log.info("######## ACTION 'clone': Qtree split ########")
 
-        # --- Etape 1 : determiner la liste des Qtrees a traiter ------------
+        # --- Step 1: determine the list of Qtrees to process --------------
         if self.a.qtrees.strip().lower() == "all":
-            self.log.info("Mode 'all' : decouverte des Qtrees du volume source.")
+            self.log.info("Mode 'all': discovering Qtrees from source volume.")
             qtrees = self._list_source_qtrees()
         else:
             qtrees = [q.strip() for q in self.a.qtrees.split(",") if q.strip()]
 
         if not qtrees:
             raise OntapCliError(self.src_cluster, "volume qtree show", 0, "", "",
-                                reason="aucune Qtree a traiter")
-        self.log.info("Qtrees a migrer (%d) : %s", len(qtrees), ", ".join(qtrees))
+                                reason="no Qtree to process")
+        self.log.info("Qtrees to migrate (%d): %s", len(qtrees), ", ".join(qtrees))
 
-        # On a besoin de l'ensemble complet des Qtrees pour l'operation de split
-        # (suppression de toutes les autres Qtrees dans chaque volume clone).
+        # The full Qtree list is needed for the split operation (deleting all
+        # other Qtrees from each cloned volume).
         all_qtrees = self._list_source_qtrees()
 
-        # --- Etape 2 : traitement Qtree par Qtree --------------------------
+        # --- Step 2: process each Qtree individually ----------------------
         for qtree in qtrees:
             self._clone_single_qtree(qtree, all_qtrees)
 
-        self.log.info("ACTION 'clone' terminee : %d volume(s) cible(s) cree(s).",
+        self.log.info("ACTION 'clone' complete: %d target volume(s) created.",
                       len(qtrees))
 
     def _clone_single_qtree(self, qtree: str, all_qtrees: List[str]):
-        """Traite une seule Qtree : snapshot, update cascade, verif, clone, split."""
-        self.log.info("---- Traitement de la Qtree '%s' ----", qtree)
+        """Process a single Qtree: snapshot, cascade update, verify, clone, split."""
+        self.log.info("---- Processing Qtree '%s' ----", qtree)
 
-        # Nom du snapshot dedie (horodate pour tracabilite et unicite).
+        # Timestamped snapshot name for traceability and uniqueness.
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         snap_name = f"migr_{qtree}_{stamp}"
-        clone_volume = f"v_{qtree}"  # regle de nommage imposee : v_[nom_qtree]
+        clone_volume = f"v_{qtree}"  # naming rule: v_[qtree_name]
 
-        # a. Creer un Snapshot sur le cluster SOURCE.
+        # a. Create a snapshot on the SOURCE cluster.
         self.x.run(self.src_cluster,
                    f"volume snapshot create -vserver {self.src_svm} "
                    f"-volume {self.volume} -snapshot {snap_name}")
 
-        # b. Propager le snapshot via la cascade (Source->Pivot, puis Pivot->Dest).
+        # b. Propagate the snapshot through the cascade (Source->Pivot, then Pivot->Dest).
         self.x.run(self.pivot_cluster,
                    f"snapmirror update "
                    f"-destination-path {self._path(self.pivot_svm, self.volume)}")
@@ -584,76 +582,74 @@ class MigrationOrchestrator:
         self._wait_snapmirror_idle(self.dest_cluster,
                                    self._path(self.dest_svm, self.volume))
 
-        # c. Verifier que le snapshot est bien arrive sur la DESTINATION.
+        # c. Verify the snapshot has reached the DESTINATION.
         self._verify_snapshot_present(self.dest_cluster, self.dest_svm,
                                       self.volume, snap_name)
 
-        # d. Creer le FlexClone sur la DESTINATION en ciblant ce snapshot precis.
+        # d. Create the FlexClone on the DESTINATION targeting this exact snapshot.
         self.x.run(self.dest_cluster,
                    f"volume clone create -vserver {self.dest_svm} "
                    f"-flexclone {clone_volume} -parent-volume {self.volume} "
                    f"-parent-snapshot {snap_name} -junction-active true")
-        self.log.info("FlexClone '%s' cree a partir du snapshot '%s'.",
+        self.log.info("FlexClone '%s' created from snapshot '%s'.",
                       clone_volume, snap_name)
 
-        # e. Operation de SPLIT : supprimer toutes les AUTRES Qtrees du clone
-        #    pour ne garder que la Qtree destinee a ce volume (1 Volume = 1 Qtree).
+        # e. SPLIT operation: delete all OTHER Qtrees from the clone so that
+        #    only the target Qtree remains (1 Volume = 1 Qtree rule).
         others = [q for q in all_qtrees if q != qtree]
         for other in others:
             self.x.run(self.dest_cluster,
                        f"volume qtree delete -vserver {self.dest_svm} "
                        f"-volume {clone_volume} -qtree {other} -force true")
-            self.log.info("Qtree '%s' supprimee du clone '%s'.", other, clone_volume)
+            self.log.info("Qtree '%s' deleted from clone '%s'.", other, clone_volume)
 
-        self.log.info("Qtree '%s' isolee dans le volume '%s'.", qtree, clone_volume)
+        self.log.info("Qtree '%s' isolated in volume '%s'.", qtree, clone_volume)
 
     # =====================================================================
-    # ACTION 3 : 'cleanup' -> Cut-off des acces a la source
+    # ACTION 3 : 'cleanup' -> Source access cut-off
     # =====================================================================
     def action_cleanup(self):
-        self.log.info("######## ACTION 'cleanup' : cut-off des acces source ########")
+        self.log.info("######## ACTION 'cleanup': source access cut-off ########")
         qtree = self.a.qtree
 
-        # 1. Isolation : appliquer l'export-policy restrictive a la Qtree source.
+        # 1. Isolation: apply the restrictive export-policy to the source Qtree.
         self.x.run(self.src_cluster,
                    f"volume qtree modify -vserver {self.src_svm} "
                    f"-volume {self.volume} -qtree {qtree} "
                    f"-export-policy {self.a.noaccess_policy}")
-        self.log.info("Export-policy '%s' appliquee a la Qtree '%s'.",
+        self.log.info("Export-policy '%s' applied to Qtree '%s'.",
                       self.a.noaccess_policy, qtree)
 
-        # 2. Suppression CIFS : identifier puis supprimer les partages pointant
-        #    vers cette Qtree.
+        # 2. CIFS cleanup: identify then delete shares pointing to this Qtree.
         shares = self._find_cifs_shares_for_qtree(qtree)
         if not shares:
-            self.log.info("Aucun partage CIFS associe a la Qtree '%s'.", qtree)
+            self.log.info("No CIFS share associated with Qtree '%s'.", qtree)
         for share in shares:
             self.x.run(self.src_cluster,
                        f"vserver cifs share delete -vserver {self.src_svm} "
                        f"-share-name {share}")
-            self.log.info("Partage CIFS '%s' supprime.", share)
+            self.log.info("CIFS share '%s' deleted.", share)
 
-        # 3. Renommage : injecter le suffixe horodate du jour.
+        # 3. Rename: append a dated suffix to mark the Qtree for deletion.
         today = datetime.datetime.now().strftime("%d_%m_%Y")
         new_name = f"{qtree}_tobedeleted_migratedtosfs_{today}"
         self.x.run(self.src_cluster,
                    f"volume qtree rename -vserver {self.src_svm} "
                    f"-volume {self.volume} -qtree {qtree} "
                    f"-new-qtree-name {new_name}")
-        self.log.info("Qtree source renommee : '%s' -> '%s'.", qtree, new_name)
+        self.log.info("Source Qtree renamed: '%s' -> '%s'.", qtree, new_name)
 
-        self.log.info("ACTION 'cleanup' terminee pour la Qtree '%s'.", qtree)
+        self.log.info("ACTION 'cleanup' complete for Qtree '%s'.", qtree)
 
     # =====================================================================
-    # PRIMITIVES ONTAP REUTILISABLES
+    # REUSABLE ONTAP PRIMITIVES
     # =====================================================================
     def _get_volume_info(self, cluster: str, svm: str, volume: str) -> dict:
-        """Recupere TOUTES les caracteristiques du volume en un seul appel.
+        """Retrieve ALL volume attributes in a single ONTAP call.
 
-        Un unique 'volume show -instance' est execute puis l'integralite de
-        l'objet est mise en cache dans un dict. Les consommateurs lisent ensuite
-        la donnee voulue (taille, security style, ...) via get_instance_field
-        sans rouvrir de connexion supplementaire.
+        A single 'volume show -instance' is executed and the entire object is
+        cached in a dict. Callers then read the desired field (size, security
+        style, ...) via get_instance_field without opening extra connections.
         """
         r = self.x.run(cluster,
                        f"volume show -vserver {svm} -volume {volume} "
@@ -662,8 +658,8 @@ class MigrationOrchestrator:
 
     def _check_aggregate_space(self, cluster: str, aggr: str,
                                required_bytes: Optional[int]):
-        """Verifie que l'agregat dispose d'assez d'espace pour le volume source."""
-        self.log.info("Verification de l'espace sur %s / agregat %s.", cluster, aggr)
+        """Verify that the aggregate has enough free space for the source volume."""
+        self.log.info("Checking space on %s / aggregate %s.", cluster, aggr)
         r = self.x.run(cluster,
                        f"storage aggregate show -aggregate {aggr} "
                        f"-instance")
@@ -673,27 +669,27 @@ class MigrationOrchestrator:
 
         if required_bytes is None or avail_bytes is None:
             self.log.warning(
-                "Impossible de comparer precisement l'espace (requis=%s, dispo=%s). "
-                "Verification manuelle recommandee.", required_bytes, avail_bytes)
+                "Cannot accurately compare space (required=%s, available=%s). "
+                "Manual verification recommended.", required_bytes, avail_bytes)
             return
 
-        self.log.info("Agregat %s : dispo=%d octets, requis=%d octets.",
+        self.log.info("Aggregate %s: available=%d bytes, required=%d bytes.",
                       aggr, avail_bytes, required_bytes)
         if avail_bytes < required_bytes:
             raise OntapCliError(
                 cluster, f"storage aggregate show -aggregate {aggr}", 0,
                 r.stdout, r.stderr,
-                reason=(f"espace insuffisant sur l'agregat {aggr} "
-                        f"(dispo={avail_bytes} < requis={required_bytes})"))
-        self.log.info("Espace suffisant sur l'agregat %s.", aggr)
+                reason=(f"insufficient space on aggregate {aggr} "
+                        f"(available={avail_bytes} < required={required_bytes})"))
+        self.log.info("Sufficient space on aggregate %s.", aggr)
 
     def _create_dp_volume(self, cluster: str, svm: str, volume: str,
                           aggr: str, size: Optional[str],
                           security_style: Optional[str] = None):
-        """Cree un volume de type DP (destinataire SnapMirror) calque sur la source.
+        """Create a DP-type volume (SnapMirror destination) mirroring the source.
 
-        Le volume est cree sans reservation d'espace (-space-guarantee none) et,
-        si connu, avec le meme security style que le volume source.
+        The volume is created without space reservation (-space-guarantee none)
+        and, if known, with the same security style as the source volume.
         """
         size_opt = f"-size {size} " if size else ""
         style_opt = f"-security-style {security_style} " if security_style else ""
@@ -701,30 +697,30 @@ class MigrationOrchestrator:
                    f"volume create -vserver {svm} -volume {volume} "
                    f"-aggregate {aggr} {size_opt}{style_opt}"
                    f"-space-guarantee none -type DP")
-        self.log.info("Volume DP '%s' cree sur %s (agregat %s, taille %s, "
+        self.log.info("DP volume '%s' created on %s (aggregate %s, size %s, "
                       "security-style %s, space-guarantee none).",
                       volume, cluster, aggr, size or "auto",
-                      security_style or "defaut")
+                      security_style or "default")
 
     def _snapmirror_create(self, run_on: str, source_path: str, dest_path: str):
-        """Declare une relation SnapMirror XDP (sans declencher le transfert)."""
-        self.log.info("SnapMirror create %s -> %s (sur %s).",
+        """Declare an XDP SnapMirror relationship (no transfer triggered)."""
+        self.log.info("SnapMirror create %s -> %s (on %s).",
                       source_path, dest_path, run_on)
         self.x.run(run_on,
                    f"snapmirror create -source-path {source_path} "
                    f"-destination-path {dest_path} -type XDP")
 
     def _snapmirror_initialize(self, run_on: str, dest_path: str):
-        """Lance l'initialisation (transfert de base) d'une relation SnapMirror."""
-        self.log.info("SnapMirror initialize %s (sur %s).", dest_path, run_on)
+        """Trigger the baseline transfer (initialize) for a SnapMirror relationship."""
+        self.log.info("SnapMirror initialize %s (on %s).", dest_path, run_on)
         self.x.run(run_on,
                    f"snapmirror initialize -destination-path {dest_path}")
 
     def _wait_snapmirror_ready(self, cluster: str, dest_path: str):
-        """Attend que la relation atteigne l'etat 'Snapmirrored' (init terminee)."""
-        self.log.info("Attente de l'etat 'Snapmirrored' pour %s ...", dest_path)
+        """Wait until the relationship reaches 'Snapmirrored' state (init done)."""
+        self.log.info("Waiting for 'Snapmirrored' state on %s ...", dest_path)
         if self.x.dry_run:
-            self.log.info("[DRY-RUN] Relation %s supposee 'Snapmirrored'.", dest_path)
+            self.log.info("[DRY-RUN] Relationship %s assumed 'Snapmirrored'.", dest_path)
             return
         deadline = time.monotonic() + self.a.timeout
         while True:
@@ -735,23 +731,23 @@ class MigrationOrchestrator:
             state = (get_instance_field(sm_info, "Mirror State",
                                         "Relationship Status", "state")
                      or "").lower()
-            self.log.info("Etat SnapMirror %s : '%s'.", dest_path, state or "inconnu")
+            self.log.info("SnapMirror state %s: '%s'.", dest_path, state or "unknown")
             if state in ("snapmirrored", "idle"):
-                self.log.info("Relation %s prete (etat='%s').", dest_path, state)
+                self.log.info("Relationship %s ready (state='%s').", dest_path, state)
                 return
             if time.monotonic() > deadline:
                 raise OntapCliError(
                     cluster, f"snapmirror show -destination-path {dest_path}", 0,
                     r.stdout, r.stderr,
-                    reason=(f"timeout ({self.a.timeout}s) en attendant "
-                            f"'Snapmirrored' (etat actuel='{state}')"))
+                    reason=(f"timeout ({self.a.timeout}s) waiting for "
+                            f"'Snapmirrored' (current state='{state}')"))
             time.sleep(self.a.poll_interval)
 
     def _wait_snapmirror_idle(self, cluster: str, dest_path: str):
-        """Attend la fin d'un transfert (statut 'Idle') apres un snapmirror update."""
-        self.log.info("Attente de la fin du transfert (Idle) pour %s ...", dest_path)
+        """Wait for a transfer to complete (status 'Idle') after a snapmirror update."""
+        self.log.info("Waiting for transfer to complete (Idle) on %s ...", dest_path)
         if self.x.dry_run:
-            self.log.info("[DRY-RUN] Transfert %s suppose 'Idle'.", dest_path)
+            self.log.info("[DRY-RUN] Transfer %s assumed 'Idle'.", dest_path)
             return
         deadline = time.monotonic() + self.a.timeout
         while True:
@@ -761,19 +757,19 @@ class MigrationOrchestrator:
             sm_info = parse_instance(r.stdout)
             status = (get_instance_field(sm_info, "Relationship Status", "status")
                       or "").lower()
-            self.log.info("Statut transfert %s : '%s'.", dest_path, status or "inconnu")
+            self.log.info("Transfer status %s: '%s'.", dest_path, status or "unknown")
             if status == "idle":
                 return
             if time.monotonic() > deadline:
                 raise OntapCliError(
                     cluster, f"snapmirror show -destination-path {dest_path}", 0,
                     r.stdout, r.stderr,
-                    reason=(f"timeout ({self.a.timeout}s) en attendant 'Idle' "
-                            f"(statut actuel='{status}')"))
+                    reason=(f"timeout ({self.a.timeout}s) waiting for 'Idle' "
+                            f"(current status='{status}')"))
             time.sleep(self.a.poll_interval)
 
     def _list_source_qtrees(self) -> List[str]:
-        """Liste les Qtrees du volume source via 'volume qtree show'."""
+        """List Qtrees on the source volume via 'volume qtree show'."""
         r = self.x.run(self.src_cluster,
                        f"volume qtree show -vserver {self.src_svm} "
                        f"-volume {self.volume} -instance")
@@ -781,12 +777,12 @@ class MigrationOrchestrator:
 
     def _verify_snapshot_present(self, cluster: str, svm: str, volume: str,
                                  snapshot: str):
-        """Verifie sur la destination que le snapshot attendu est bien present."""
+        """Verify that the expected snapshot is present on the destination."""
         r = self.x.run(cluster,
                        f"volume snapshot show -vserver {svm} -volume {volume} "
                        f"-snapshot {snapshot} -instance")
         if self.x.dry_run:
-            self.log.info("[DRY-RUN] Snapshot '%s' suppose present sur %s.",
+            self.log.info("[DRY-RUN] Snapshot '%s' assumed present on %s.",
                           snapshot, cluster)
             return
         if snapshot not in r.stdout:
@@ -794,41 +790,40 @@ class MigrationOrchestrator:
                 cluster,
                 f"volume snapshot show -snapshot {snapshot}", 0,
                 r.stdout, r.stderr,
-                reason=f"snapshot '{snapshot}' absent sur la destination")
-        self.log.info("Snapshot '%s' confirme present sur %s.", snapshot, cluster)
+                reason=f"snapshot '{snapshot}' not found on destination")
+        self.log.info("Snapshot '%s' confirmed present on %s.", snapshot, cluster)
 
     def _find_cifs_shares_for_qtree(self, qtree: str) -> List[str]:
-        """Identifie les partages CIFS pointant vers la Qtree (via leur path)."""
+        """Identify CIFS shares pointing to the Qtree (matched by path)."""
         r = self.x.run(self.src_cluster,
                        f"vserver cifs share show -vserver {self.src_svm} "
                        f"-instance", allow_failure=True)
-        # On recherche le fragment de path correspondant a la qtree, p.ex.
-        # '/vol_prod_01/qtree_finance' ou simplement '/qtree'.
+        # Match the path fragment for this Qtree, e.g. '/vol_prod_01/qtree_finance'.
         fragment = f"/{qtree}"
         return parse_cifs_shares_for_path(r.stdout, fragment)
 
 
 # =============================================================================
-# 5. CONFIGURATION DU LOGGING (TRACABILITE EXHAUSTIVE)
+# 5. LOGGING SETUP (EXHAUSTIVE TRACEABILITY)
 # =============================================================================
 
 def setup_logging(log_file: str) -> logging.Logger:
-    """Configure un logger ecrivant a la fois dans un fichier dedie et la console."""
+    """Configure a logger writing to both a dedicated file and the console."""
     logger = logging.getLogger("netapp_cascade_migration")
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()  # evite les doublons en cas de reappel
+    logger.handlers.clear()  # avoid duplicate handlers on re-call
 
     fmt = logging.Formatter(
         fmt="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Handler fichier : trace exhaustive et persistante.
+    # File handler: exhaustive and persistent trace.
     file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
 
-    # Handler console : suivi en temps reel par l'operateur.
+    # Console handler: real-time operator feedback.
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(fmt)
     logger.addHandler(console_handler)
@@ -837,82 +832,82 @@ def setup_logging(log_file: str) -> logging.Logger:
 
 
 # =============================================================================
-# 6. PARSING DES ARGUMENTS CLI
+# 6. CLI ARGUMENT PARSING
 # =============================================================================
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Orchestration de migration NetApp ONTAP en cascade "
-                    "(Source -> Pivot -> Destination) avec eclatement des Qtrees.",
+        description="NetApp ONTAP cascading migration orchestration "
+                    "(Source -> Pivot -> Destination) with Qtree splitting.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # --- Arguments imposes ---
+    # --- Required arguments ---
     parser.add_argument("--source-cluster", required=True,
-                        help="Nom/IP du cluster source (niveau haut).")
+                        help="Name/IP of the source cluster (upper tier).")
     parser.add_argument("--pivot-cluster", required=True,
-                        help="Nom/IP du cluster pivot (CMOPARTIGBKP110).")
+                        help="Name/IP of the pivot cluster (CMOPARTIGBKP110).")
     parser.add_argument("--dest-cluster", required=True,
-                        help="Nom/IP du cluster destination (niveau bas).")
+                        help="Name/IP of the destination cluster (lower tier).")
     parser.add_argument("--volume", required=True,
-                        help="Nom du volume source concerne.")
+                        help="Name of the source volume.")
     parser.add_argument("--action", required=True,
                         choices=["create", "clone", "cleanup"],
-                        help="Action a executer.")
+                        help="Action to execute.")
 
-    # --- Arguments specifiques aux actions ---
+    # --- Action-specific arguments ---
     parser.add_argument("--qtrees",
-                        help="(clone) liste 'q1,q2' OU mot-cle 'all'.")
+                        help="(clone) comma-separated list 'q1,q2' OR keyword 'all'.")
     parser.add_argument("--qtree",
-                        help="(cleanup) une seule Qtree cible.")
+                        help="(cleanup) single target Qtree.")
 
-    # --- Arguments techniques additionnels (necessaires aux commandes ONTAP) ---
+    # --- Additional technical arguments (required for real ONTAP commands) ---
     parser.add_argument("--source-vserver", default="svm_source",
-                        help="SVM/vserver cote source (defaut: svm_source).")
+                        help="SVM/vserver on the source side (default: svm_source).")
     parser.add_argument("--pivot-vserver", default="svm_pivot",
-                        help="SVM/vserver cote pivot (defaut: svm_pivot).")
+                        help="SVM/vserver on the pivot side (default: svm_pivot).")
     parser.add_argument("--dest-vserver", default="svm_dest",
-                        help="SVM/vserver cote destination (defaut: svm_dest).")
+                        help="SVM/vserver on the destination side (default: svm_dest).")
     parser.add_argument("--pivot-aggr", default="aggr1_pivot",
-                        help="Agregat cible sur le pivot (defaut: aggr1_pivot).")
+                        help="Target aggregate on the pivot (default: aggr1_pivot).")
     parser.add_argument("--dest-aggr", default="aggr1_dest",
-                        help="Agregat cible sur la destination (defaut: aggr1_dest).")
+                        help="Target aggregate on the destination (default: aggr1_dest).")
     parser.add_argument("--noaccess-policy", default="ep_noaccess",
-                        help="Export-policy restrictive (defaut: ep_noaccess).")
+                        help="Restrictive export-policy name (default: ep_noaccess).")
 
-    # --- Transport SSH / tracabilite / securite d'execution ---
+    # --- SSH transport / traceability / execution safety ---
     parser.add_argument("--ssh-backend", choices=["subprocess", "paramiko"],
                         default="subprocess",
-                        help="Transport SSH (defaut: subprocess = client ssh natif).")
+                        help="SSH transport (default: subprocess = native ssh client).")
     parser.add_argument("--ssh-user", default=None,
-                        help="Utilisateur SSH optionnel (user@cluster). "
-                             "Par defaut, l'utilisateur courant / la conf SSH.")
+                        help="Optional SSH user (user@cluster). "
+                             "Defaults to current user / SSH config.")
     parser.add_argument("--log-file", default=None,
-                        help="Chemin du fichier de log "
-                             "(defaut: migration_<action>_<timestamp>.log).")
+                        help="Log file path "
+                             "(default: migration_<action>_<timestamp>.log).")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Simulation : trace les commandes sans les executer.")
+                        help="Simulation mode: log commands without executing them.")
 
-    # --- Parametres de suivi SnapMirror ---
+    # --- SnapMirror polling parameters ---
     parser.add_argument("--timeout", type=int, default=3600,
-                        help="Timeout (s) d'attente des etats SnapMirror (defaut: 3600).")
+                        help="Timeout (s) waiting for SnapMirror states (default: 3600).")
     parser.add_argument("--poll-interval", type=int, default=30,
-                        help="Intervalle (s) entre deux 'snapmirror show' (defaut: 30).")
+                        help="Interval (s) between 'snapmirror show' polls (default: 30).")
 
     return parser
 
 
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
-    """Valide la coherence des arguments selon l'action demandee."""
+    """Validate argument consistency for the requested action."""
     if args.action == "clone" and not args.qtrees:
-        parser.error("--qtrees est obligatoire pour l'action 'clone' "
-                     "(liste 'q1,q2' ou 'all').")
+        parser.error("--qtrees is required for action 'clone' "
+                     "(comma-separated list 'q1,q2' or 'all').")
     if args.action == "cleanup" and not args.qtree:
-        parser.error("--qtree est obligatoire pour l'action 'cleanup'.")
+        parser.error("--qtree is required for action 'cleanup'.")
 
 
 # =============================================================================
-# 7. POINT D'ENTREE
+# 7. ENTRY POINT
 # =============================================================================
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -920,20 +915,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     validate_args(args, parser)
 
-    # Fichier de log dedie par defaut, horodate, par action.
+    # Default log file: timestamped per action.
     if not args.log_file:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.log_file = f"migration_{args.action}_{stamp}.log"
 
     logger = setup_logging(args.log_file)
     logger.info("================================================================")
-    logger.info("Demarrage orchestration NetApp ONTAP - action '%s'.", args.action)
+    logger.info("Starting NetApp ONTAP orchestration - action '%s'.", args.action)
     logger.info("Source=%s | Pivot=%s | Destination=%s | Volume=%s",
                 args.source_cluster, args.pivot_cluster,
                 args.dest_cluster, args.volume)
-    logger.info("Fichier de log : %s", args.log_file)
+    logger.info("Log file: %s", args.log_file)
     if args.dry_run:
-        logger.info("MODE DRY-RUN ACTIF : aucune commande ne sera reellement executee.")
+        logger.info("DRY-RUN MODE ACTIVE: no command will actually be executed.")
     logger.info("================================================================")
 
     executor = OntapCliExecutor(
@@ -951,16 +946,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             orchestrator.action_clone()
         elif args.action == "cleanup":
             orchestrator.action_cleanup()
-        logger.info("SUCCES : action '%s' terminee sans erreur.", args.action)
+        logger.info("SUCCESS: action '%s' completed without error.", args.action)
         return 0
 
     except OntapCliError as exc:
-        # Erreur metier ONTAP : deja tracee exhaustivement par l'executeur.
-        logger.error("ECHEC ONTAP : %s", exc)
-        logger.error("Execution interrompue. Consultez le log : %s", args.log_file)
+        # ONTAP business error: already logged exhaustively by the executor.
+        logger.error("ONTAP FAILURE: %s", exc)
+        logger.error("Execution interrupted. Check the log: %s", args.log_file)
         return 2
-    except Exception as exc:  # garde-fou : toute autre erreur reste tracee.
-        logger.exception("ECHEC INATTENDU : %s", exc)
+    except Exception as exc:  # safety net: any other error is still logged.
+        logger.exception("UNEXPECTED FAILURE: %s", exc)
         return 3
 
 
