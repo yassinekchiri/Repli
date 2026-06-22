@@ -334,28 +334,24 @@ class OntapCliExecutor:
 # =============================================================================
 
 def parse_qtree_list(stdout: str) -> List[str]:
-    """Extrait la liste des noms de Qtrees depuis 'volume qtree show -fields qtree'.
+    """Extrait la liste des noms de Qtrees depuis 'volume qtree show -instance'.
 
-    L'ONTAP CLI expose une qtree par defaut '' (racine du volume) qu'on ignore.
-    La sortie tabulaire ressemble a :
+    En mode '-instance', chaque Qtree est decrite par un bloc clef/valeur, p.ex.:
 
-        vserver   volume        qtree
-        --------- ------------- -----------
-        svm1      vol_prod_01   ""
-        svm1      vol_prod_01   qtree_finance
-        svm1      vol_prod_01   qtree_rh
+                                Vserver Name: svm1
+                                 Volume Name: vol_prod_01
+                                  Qtree Name: qtree_finance
+                                       ...
+
+    L'ONTAP CLI expose une qtree par defaut (racine du volume, nom vide / '-')
+    que l'on ignore.
     """
     qtrees: List[str] = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith("-") or line.lower().startswith("vserver"):
-            continue
-        if "entries were displayed" in line.lower():
-            continue
-        cols = line.split()
-        if not cols:
-            continue
-        qtree_name = cols[-1].strip('"')
+    # Une occurrence de "Qtree Name : <valeur>" par Qtree decrite.
+    pattern = re.compile(r"^\s*Qtree Name\s*:\s*(.*?)\s*$",
+                         re.IGNORECASE | re.MULTILINE)
+    for m in pattern.finditer(stdout):
+        qtree_name = m.group(1).strip().strip('"')
         # On ignore la qtree racine (vide) representee par "" ou '-'.
         if qtree_name and qtree_name not in ('""', "-"):
             qtrees.append(qtree_name)
@@ -387,22 +383,25 @@ def parse_size_to_bytes(size_str: str) -> Optional[int]:
 def parse_cifs_shares_for_path(stdout: str, qtree_path_fragment: str) -> List[str]:
     """Retourne les noms de partages CIFS dont le path contient `qtree_path_fragment`.
 
-    Attendu : sortie de 'vserver cifs share show -fields share-name,path'.
+    Attendu : sortie de 'vserver cifs share show -instance', soit un bloc
+    clef/valeur par partage, p.ex.:
+
+                                  Vserver: svm1
+                               Share Name: finance_share
+                                     Path: /vol_prod_01/qtree_finance
+                                       ...
+
+    Les partages sont regroupes par bloc (separes par une ligne vide) afin
+    d'associer correctement chaque 'Share Name' a son 'Path'.
     """
     shares: List[str] = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith("-") or line.lower().startswith("vserver"):
-            continue
-        if "entries were displayed" in line.lower():
-            continue
-        cols = line.split()
-        if len(cols) < 2:
-            continue
-        # Heuristique : la derniere colonne est le path, l'avant-derniere le nom.
-        path = cols[-1]
-        share_name = cols[-2]
-        if qtree_path_fragment in path:
+    # Decoupage en blocs (un partage par bloc) sur les lignes vides.
+    for block in re.split(r"\n\s*\n", stdout):
+        share_name = parse_field_value(block, "Share Name") or \
+            parse_field_value(block, "share-name")
+        path = parse_field_value(block, "Path") or \
+            parse_field_value(block, "path")
+        if share_name and path and qtree_path_fragment in path:
             shares.append(share_name)
     return shares
 
@@ -607,7 +606,7 @@ class MigrationOrchestrator:
         """Recupere la taille provisionnee du volume (champ 'size')."""
         r = self.x.run(cluster,
                        f"volume show -vserver {svm} -volume {volume} "
-                       f"-fields size -instance")
+                       f"-instance")
         size = parse_field_value(r.stdout, "Volume Size") or \
             parse_field_value(r.stdout, "size")
         return size
@@ -617,7 +616,7 @@ class MigrationOrchestrator:
         """Recupere le security style du volume (unix / ntfs / mixed)."""
         r = self.x.run(cluster,
                        f"volume show -vserver {svm} -volume {volume} "
-                       f"-fields security-style -instance")
+                       f"-instance")
         style = parse_field_value(r.stdout, "Security Style") or \
             parse_field_value(r.stdout, "security-style")
         return style
@@ -628,7 +627,7 @@ class MigrationOrchestrator:
         self.log.info("Verification de l'espace sur %s / agregat %s.", cluster, aggr)
         r = self.x.run(cluster,
                        f"storage aggregate show -aggregate {aggr} "
-                       f"-fields availsize,size,usedsize -instance")
+                       f"-instance")
         avail_str = parse_field_value(r.stdout, "Available Size") or \
             parse_field_value(r.stdout, "availsize")
         avail_bytes = parse_size_to_bytes(avail_str) if avail_str else None
@@ -689,7 +688,7 @@ class MigrationOrchestrator:
         while True:
             r = self.x.run(cluster,
                            f"snapmirror show -destination-path {dest_path} "
-                           f"-fields state,status -instance")
+                           f"-instance")
             state = (parse_field_value(r.stdout, "Mirror State") or
                      parse_field_value(r.stdout, "Relationship Status") or
                      parse_field_value(r.stdout, "state") or "").lower()
@@ -715,7 +714,7 @@ class MigrationOrchestrator:
         while True:
             r = self.x.run(cluster,
                            f"snapmirror show -destination-path {dest_path} "
-                           f"-fields status -instance")
+                           f"-instance")
             status = (parse_field_value(r.stdout, "Relationship Status") or
                       parse_field_value(r.stdout, "status") or "").lower()
             self.log.info("Statut transfert %s : '%s'.", dest_path, status or "inconnu")
@@ -733,7 +732,7 @@ class MigrationOrchestrator:
         """Liste les Qtrees du volume source via 'volume qtree show'."""
         r = self.x.run(self.src_cluster,
                        f"volume qtree show -vserver {self.src_svm} "
-                       f"-volume {self.volume} -fields qtree")
+                       f"-volume {self.volume} -instance")
         return parse_qtree_list(r.stdout)
 
     def _verify_snapshot_present(self, cluster: str, svm: str, volume: str,
@@ -741,7 +740,7 @@ class MigrationOrchestrator:
         """Verifie sur la destination que le snapshot attendu est bien present."""
         r = self.x.run(cluster,
                        f"volume snapshot show -vserver {svm} -volume {volume} "
-                       f"-snapshot {snapshot} -fields snapshot")
+                       f"-snapshot {snapshot} -instance")
         if self.x.dry_run:
             self.log.info("[DRY-RUN] Snapshot '%s' suppose present sur %s.",
                           snapshot, cluster)
@@ -758,7 +757,7 @@ class MigrationOrchestrator:
         """Identifie les partages CIFS pointant vers la Qtree (via leur path)."""
         r = self.x.run(self.src_cluster,
                        f"vserver cifs share show -vserver {self.src_svm} "
-                       f"-fields share-name,path", allow_failure=True)
+                       f"-instance", allow_failure=True)
         # On recherche le fragment de path correspondant a la qtree, p.ex.
         # '/vol_prod_01/qtree_finance' ou simplement '/qtree'.
         fragment = f"/{qtree}"
