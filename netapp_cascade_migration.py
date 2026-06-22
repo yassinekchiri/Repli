@@ -657,6 +657,9 @@ class MigrationOrchestrator:
     def _wait_snapmirror_ready(self, cluster: str, dest_path: str):
         """Attend que la relation atteigne l'etat 'Snapmirrored' (init terminee)."""
         self.log.info("Attente de l'etat 'Snapmirrored' pour %s ...", dest_path)
+        if self.x.dry_run:
+            self.log.info("[DRY-RUN] Relation %s supposee 'Snapmirrored'.", dest_path)
+            return
         deadline = time.monotonic() + self.a.timeout
         while True:
             r = self.x.run(cluster,
@@ -680,6 +683,9 @@ class MigrationOrchestrator:
     def _wait_snapmirror_idle(self, cluster: str, dest_path: str):
         """Attend la fin d'un transfert (statut 'Idle') apres un snapmirror update."""
         self.log.info("Attente de la fin du transfert (Idle) pour %s ...", dest_path)
+        if self.x.dry_run:
+            self.log.info("[DRY-RUN] Transfert %s suppose 'Idle'.", dest_path)
+            return
         deadline = time.monotonic() + self.a.timeout
         while True:
             r = self.x.run(cluster,
@@ -711,6 +717,10 @@ class MigrationOrchestrator:
         r = self.x.run(cluster,
                        f"volume snapshot show -vserver {svm} -volume {volume} "
                        f"-snapshot {snapshot} -fields snapshot")
+        if self.x.dry_run:
+            self.log.info("[DRY-RUN] Snapshot '%s' suppose present sur %s.",
+                          snapshot, cluster)
+            return
         if snapshot not in r.stdout:
             raise OntapCliError(
                 cluster,
