@@ -445,16 +445,22 @@ class MigrationOrchestrator:
         self.log.info("Taille du volume source '%s' : %s", self.volume, src_size)
         src_bytes = parse_size_to_bytes(src_size) if src_size else None
 
+        src_style = self._get_volume_security_style(self.src_cluster,
+                                                    self.src_svm, self.volume)
+        self.log.info("Security style du volume source '%s' : %s",
+                      self.volume, src_style or "inconnu")
+
         # --- Etape 1 : verification de l'espace sur Pivot puis Destination -
         self._check_aggregate_space(self.pivot_cluster, self.a.pivot_aggr, src_bytes)
         self._check_aggregate_space(self.dest_cluster, self.a.dest_aggr, src_bytes)
 
         # --- Etape 2 : creation des volumes DP (Pivot puis Destination) ----
-        # Les volumes destinataires d'une relation SnapMirror sont de type 'DP'.
+        # Les volumes destinataires d'une relation SnapMirror sont de type 'DP',
+        # crees sans reservation d'espace et avec le security style de la source.
         self._create_dp_volume(self.pivot_cluster, self.pivot_svm, self.volume,
-                               self.a.pivot_aggr, src_size)
+                               self.a.pivot_aggr, src_size, src_style)
         self._create_dp_volume(self.dest_cluster, self.dest_svm, self.volume,
-                               self.a.dest_aggr, src_size)
+                               self.a.dest_aggr, src_size, src_style)
 
         # --- Etape 3 : configuration des relations SnapMirror en cascade ---
         # Relation 1 : Source -> Pivot (creee/initialisee SUR le Pivot).
@@ -606,6 +612,16 @@ class MigrationOrchestrator:
             parse_field_value(r.stdout, "size")
         return size
 
+    def _get_volume_security_style(self, cluster: str, svm: str,
+                                   volume: str) -> Optional[str]:
+        """Recupere le security style du volume (unix / ntfs / mixed)."""
+        r = self.x.run(cluster,
+                       f"volume show -vserver {svm} -volume {volume} "
+                       f"-fields security-style -instance")
+        style = parse_field_value(r.stdout, "Security Style") or \
+            parse_field_value(r.stdout, "security-style")
+        return style
+
     def _check_aggregate_space(self, cluster: str, aggr: str,
                                required_bytes: Optional[int]):
         """Verifie que l'agregat dispose d'assez d'espace pour le volume source."""
@@ -634,14 +650,23 @@ class MigrationOrchestrator:
         self.log.info("Espace suffisant sur l'agregat %s.", aggr)
 
     def _create_dp_volume(self, cluster: str, svm: str, volume: str,
-                          aggr: str, size: Optional[str]):
-        """Cree un volume de type DP (destinataire SnapMirror) calque sur la source."""
+                          aggr: str, size: Optional[str],
+                          security_style: Optional[str] = None):
+        """Cree un volume de type DP (destinataire SnapMirror) calque sur la source.
+
+        Le volume est cree sans reservation d'espace (-space-guarantee none) et,
+        si connu, avec le meme security style que le volume source.
+        """
         size_opt = f"-size {size} " if size else ""
+        style_opt = f"-security-style {security_style} " if security_style else ""
         self.x.run(cluster,
                    f"volume create -vserver {svm} -volume {volume} "
-                   f"-aggregate {aggr} {size_opt}-type DP")
-        self.log.info("Volume DP '%s' cree sur %s (agregat %s, taille %s).",
-                      volume, cluster, aggr, size or "auto")
+                   f"-aggregate {aggr} {size_opt}{style_opt}"
+                   f"-space-guarantee none -type DP")
+        self.log.info("Volume DP '%s' cree sur %s (agregat %s, taille %s, "
+                      "security-style %s, space-guarantee none).",
+                      volume, cluster, aggr, size or "auto",
+                      security_style or "defaut")
 
     def _snapmirror_create_init(self, run_on: str, source_path: str,
                                 dest_path: str):
