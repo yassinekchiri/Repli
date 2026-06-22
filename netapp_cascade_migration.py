@@ -83,18 +83,56 @@ Examples:
 
 import argparse
 import datetime
+import json
 import logging
+import os
 import re
 import shlex
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 
 # =============================================================================
-# 1. EXCEPTIONS AND DATA STRUCTURES
+# 1. JOB FILE UTILITIES
+# =============================================================================
+
+_JOB_FILE_PREFIX = "netapp_migration_"
+
+
+def _job_file_path(job_id: str) -> str:
+    return os.path.join(os.getcwd(), f"{_JOB_FILE_PREFIX}{job_id}.json")
+
+
+def _save_job(job_id: str, data: dict) -> str:
+    """Write job data to a JSON file in the current directory. Returns the path."""
+    path = _job_file_path(job_id)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return path
+
+
+def _load_job(job_id: str) -> dict:
+    """Load and return job data from its JSON file. Raises FileNotFoundError if missing."""
+    path = _job_file_path(job_id)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Job file not found: {path}\n"
+            f"Make sure you are running the script from the same directory as the original run."
+        )
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _generate_job_id() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+
+# =============================================================================
+# 2. EXCEPTIONS AND DATA STRUCTURES
 # =============================================================================
 
 class OntapCliError(Exception):
@@ -467,7 +505,43 @@ class MigrationOrchestrator:
     # ACTION 1 : 'create' -> Cascade initialisation
     # =====================================================================
     def action_create(self):
-        self.log.info("######## ACTION 'create': cascade initialisation ########")
+        create_mode = getattr(self.a, "create_mode", "full")
+        self.log.info("######## ACTION 'create' (mode=%s): cascade initialisation ########",
+                      create_mode)
+
+        # --- Generate job ID and persist all parameters -------------------
+        job_id = _generate_job_id()
+        pivot_dest_path = self._path(self.pivot_svm, self.volume)
+        dest_dest_path  = self._path(self.dest_svm,  self.volume)
+        job_data = {
+            "job_id":           job_id,
+            "created_at":       datetime.datetime.now().isoformat(timespec="seconds"),
+            "status":           "started",
+            "create_mode":      create_mode,
+            "pivot_dest_path":  pivot_dest_path,
+            "dest_dest_path":   dest_dest_path,
+            "params": {
+                "source_cluster":   self.a.source_cluster,
+                "pivot_cluster":    self.a.pivot_cluster,
+                "dest_cluster":     self.a.dest_cluster,
+                "volume":           self.a.volume,
+                "source_vserver":   self.a.source_vserver,
+                "pivot_vserver":    self.a.pivot_vserver,
+                "dest_vserver":     self.a.dest_vserver,
+                "pivot_aggr":       self.a.pivot_aggr,
+                "dest_aggr":        self.a.dest_aggr,
+                "noaccess_policy":  self.a.noaccess_policy,
+                "ssh_backend":      self.a.ssh_backend,
+                "ssh_user":         self.a.ssh_user,
+                "log_file":         self.a.log_file,
+                "timeout":          self.a.timeout,
+                "poll_interval":    self.a.poll_interval,
+                "dry_run":          self.x.dry_run,
+            },
+        }
+        job_path = _save_job(job_id, job_data)
+        self.log.info("Job file created: %s", job_path)
+        self.log.info("Job ID: %s", job_id)
 
         # --- Step 0: retrieve source volume characteristics ---------------
         # Single ONTAP call: the full object is cached in a dict; each needed
@@ -494,9 +568,6 @@ class MigrationOrchestrator:
         self._create_dp_volume(self.dest_cluster, self.dest_svm, self.volume,
                                self.a.dest_aggr, src_size, src_style)
 
-        pivot_dest_path = self._path(self.pivot_svm, self.volume)
-        dest_dest_path = self._path(self.dest_svm, self.volume)
-
         # --- Step 3a: declare both relationships (no transfer yet) --------
         # Both relationships are created upfront so that the Pivot->Dest
         # relationship already exists when its initialize is triggered.
@@ -512,19 +583,94 @@ class MigrationOrchestrator:
             dest_path=dest_dest_path,
         )
 
-        # --- Step 3b: initialize Pivot, wait idle, THEN initialize Destination
+        # --- Step 3b: initialize Pivot ------------------------------------
         # Strict rule: the destination transfer must not start until the pivot
         # is fully synchronized (idle). Running both initializes concurrently
         # could overload the pivot or start from an incomplete source.
         self._snapmirror_initialize(run_on=self.pivot_cluster,
                                     dest_path=pivot_dest_path)
+
+        if create_mode == "pivot-only":
+            # Save status and exit — the user will resume via --action resume.
+            job_data["status"] = "pivot_initialized"
+            _save_job(job_id, job_data)
+            self.log.info("Pivot SnapMirror initialize launched. Script exiting (pivot-only mode).")
+            self.log.info("=" * 64)
+            self.log.info("KEEP YOUR JOB ID TO RESUME LATER: %s", job_id)
+            self.log.info("Resume command:")
+            self.log.info("  python3 %s --action resume --job-id %s",
+                          os.path.basename(sys.argv[0]), job_id)
+            self.log.info("=" * 64)
+            return
+
+        # --- Step 3c (full mode): wait for Pivot then initialize Destination
         self._wait_snapmirror_ready(self.pivot_cluster, pivot_dest_path)
 
         self._snapmirror_initialize(run_on=self.dest_cluster,
                                     dest_path=dest_dest_path)
         self._wait_snapmirror_ready(self.dest_cluster, dest_dest_path)
 
+        job_data["status"] = "completed"
+        _save_job(job_id, job_data)
         self.log.info("ACTION 'create' complete: cascade initialised and synchronised.")
+
+    # =====================================================================
+    # ACTION 'resume' -> Check pivot status and optionally replicate to dest
+    # =====================================================================
+    def action_resume(self, job_data: dict):
+        job_id          = job_data["job_id"]
+        pivot_dest_path = job_data["pivot_dest_path"]
+        dest_dest_path  = job_data["dest_dest_path"]
+        created_at      = job_data.get("created_at", "unknown")
+        status          = job_data.get("status", "unknown")
+
+        self.log.info("######## ACTION 'resume': job %s ########", job_id)
+        self.log.info("Original job created at: %s | status: %s", created_at, status)
+        self.log.info("Pivot path: %s | Destination path: %s",
+                      pivot_dest_path, dest_dest_path)
+
+        if status == "completed":
+            self.log.info("Job %s is already marked as completed. Nothing to do.", job_id)
+            return
+
+        # --- Single status check on the pivot (no polling loop) -----------
+        r = self.x.run(self.pivot_cluster,
+                       f"snapmirror show -destination-path {pivot_dest_path} -instance")
+        sm_info = parse_instance(r.stdout)
+        state  = (get_instance_field(sm_info, "Mirror State",
+                                     "Relationship Status", "state") or "").lower()
+        transferred = get_instance_field(sm_info, "Last Transfer Size",
+                                         "Total Transfer Bytes") or "unknown"
+        self.log.info("Pivot replication status: '%s' | last transfer size: %s",
+                      state or "unknown", transferred)
+
+        if state not in ("snapmirrored", "idle"):
+            self.log.info("Pivot replication is not yet complete (state='%s').",
+                          state or "unknown")
+            self.log.info("Re-run this command later to check again:")
+            self.log.info("  python3 %s --action resume --job-id %s",
+                          os.path.basename(sys.argv[0]), job_id)
+            return
+
+        # --- Pivot is idle: ask the user whether to proceed ---------------
+        self.log.info("Pivot replication is complete.")
+        try:
+            answer = input("Proceed with destination replication? [y/N] ").strip().lower()
+        except EOFError:
+            answer = "n"
+
+        if answer != "y":
+            self.log.info("User chose not to proceed. Exiting. Job ID: %s", job_id)
+            return
+
+        # --- Initialize destination and wait ------------------------------
+        self._snapmirror_initialize(run_on=self.dest_cluster,
+                                    dest_path=dest_dest_path)
+        self._wait_snapmirror_ready(self.dest_cluster, dest_dest_path)
+
+        job_data["status"] = "completed"
+        _save_job(job_id, job_data)
+        self.log.info("Job %s completed: cascade fully synchronised.", job_id)
 
     # =====================================================================
     # ACTION 2 : 'clone' -> Qtree split & target volume creation
@@ -844,16 +990,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     # --- Required arguments ---
-    parser.add_argument("--source-cluster", required=True,
-                        help="Name/IP of the source cluster (upper tier).")
-    parser.add_argument("--pivot-cluster", required=True,
-                        help="Name/IP of the pivot cluster (CMOPARTIGBKP110).")
-    parser.add_argument("--dest-cluster", required=True,
-                        help="Name/IP of the destination cluster (lower tier).")
-    parser.add_argument("--volume", required=True,
-                        help="Name of the source volume.")
+    parser.add_argument("--source-cluster",
+                        help="Name/IP of the source cluster (upper tier). "
+                             "Not required for --action resume.")
+    parser.add_argument("--pivot-cluster",
+                        help="Name/IP of the pivot cluster (CMOPARTIGBKP110). "
+                             "Not required for --action resume.")
+    parser.add_argument("--dest-cluster",
+                        help="Name/IP of the destination cluster (lower tier). "
+                             "Not required for --action resume.")
+    parser.add_argument("--volume",
+                        help="Name of the source volume. "
+                             "Not required for --action resume.")
     parser.add_argument("--action", required=True,
-                        choices=["create", "clone", "cleanup"],
+                        choices=["create", "clone", "cleanup", "resume"],
                         help="Action to execute.")
 
     # --- Action-specific arguments ---
@@ -861,6 +1011,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="(clone) comma-separated list 'q1,q2' OR keyword 'all'.")
     parser.add_argument("--qtree",
                         help="(cleanup) single target Qtree.")
+    parser.add_argument("--create-mode", choices=["full", "pivot-only"], default="full",
+                        help="(create) 'full': initialize pivot, wait, then initialize "
+                             "destination. 'pivot-only': initialize pivot and exit "
+                             "immediately; use --action resume --job-id <ID> to continue "
+                             "(default: full).")
+    parser.add_argument("--job-id",
+                        help="(resume) Job ID returned by a previous --create-mode "
+                             "pivot-only run.")
 
     # --- Additional technical arguments (required for real ONTAP commands) ---
     parser.add_argument("--source-vserver", default="svm_source",
@@ -900,6 +1058,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
     """Validate argument consistency for the requested action."""
+    if args.action == "resume":
+        if not args.job_id:
+            parser.error("--job-id is required for --action resume.")
+        return  # all other params come from the job file
+
+    # All non-resume actions require cluster/volume identifiers.
+    for flag in ("source_cluster", "pivot_cluster", "dest_cluster", "volume"):
+        if not getattr(args, flag, None):
+            parser.error(f"--{flag.replace('_', '-')} is required for --action {args.action}.")
+
     if args.action == "clone" and not args.qtrees:
         parser.error("--qtrees is required for action 'clone' "
                      "(comma-separated list 'q1,q2' or 'all').")
@@ -916,7 +1084,66 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     validate_args(args, parser)
 
-    # Default log file: timestamped per action.
+    # ---- Resume: reconstruct everything from the job file ----------------
+    if args.action == "resume":
+        try:
+            job_data = _load_job(args.job_id)
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        # Reconstruct args namespace from the saved parameters.
+        saved = job_data["params"]
+        resume_args = argparse.Namespace(
+            source_cluster  = saved["source_cluster"],
+            pivot_cluster   = saved["pivot_cluster"],
+            dest_cluster    = saved["dest_cluster"],
+            volume          = saved["volume"],
+            source_vserver  = saved["source_vserver"],
+            pivot_vserver   = saved["pivot_vserver"],
+            dest_vserver    = saved["dest_vserver"],
+            pivot_aggr      = saved["pivot_aggr"],
+            dest_aggr       = saved["dest_aggr"],
+            noaccess_policy = saved["noaccess_policy"],
+            ssh_backend     = saved["ssh_backend"],
+            ssh_user        = saved["ssh_user"],
+            log_file        = saved.get("log_file"),
+            timeout         = saved["timeout"],
+            poll_interval   = saved["poll_interval"],
+            dry_run         = saved.get("dry_run", False),
+        )
+
+        if not resume_args.log_file:
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            resume_args.log_file = f"migration_resume_{args.job_id}_{stamp}.log"
+
+        logger = setup_logging(resume_args.log_file)
+        logger.info("================================================================")
+        logger.info("Resuming job %s", args.job_id)
+        logger.info("Log file: %s", resume_args.log_file)
+        logger.info("================================================================")
+
+        executor = OntapCliExecutor(
+            logger=logger,
+            ssh_backend=resume_args.ssh_backend,
+            ssh_user=resume_args.ssh_user,
+            dry_run=resume_args.dry_run,
+        )
+        orchestrator = MigrationOrchestrator(executor, resume_args)
+
+        try:
+            orchestrator.action_resume(job_data)
+            logger.info("SUCCESS: resume completed without error.")
+            return 0
+        except OntapCliError as exc:
+            logger.error("ONTAP FAILURE: %s", exc)
+            logger.error("Execution interrupted. Check the log: %s", resume_args.log_file)
+            return 2
+        except Exception as exc:
+            logger.exception("UNEXPECTED FAILURE: %s", exc)
+            return 3
+
+    # ---- Normal actions --------------------------------------------------
     if not args.log_file:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.log_file = f"migration_{args.action}_{stamp}.log"
