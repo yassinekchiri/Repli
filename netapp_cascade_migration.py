@@ -663,14 +663,88 @@ class MigrationOrchestrator:
             self.log.info("User chose not to proceed. Exiting. Job ID: %s", job_id)
             return
 
-        # --- Initialize destination and wait ------------------------------
+        # --- Initialize destination then EXIT immediately -----------------
+        # Same principle as pivot-only: we never block on a long transfer.
+        # The user monitors progress via --action check-status --job-id <ID>.
         self._snapmirror_initialize(run_on=self.dest_cluster,
                                     dest_path=dest_dest_path)
-        self._wait_snapmirror_ready(self.dest_cluster, dest_dest_path)
-
-        job_data["status"] = "completed"
+        job_data["status"] = "dest_initialized"
         _save_job(job_id, job_data)
-        self.log.info("Job %s completed: cascade fully synchronised.", job_id)
+        self.log.info("Destination SnapMirror initialize launched. Script exiting.")
+        self.log.info("=" * 64)
+        self.log.info("Check replication progress at any time:")
+        self.log.info("  python3 %s --action check-status --job-id %s",
+                      os.path.basename(sys.argv[0]), job_id)
+        self.log.info("=" * 64)
+
+    # =====================================================================
+    # ACTION 'check-status' -> Report current replication progress
+    # =====================================================================
+    def action_check_status(self, job_data: dict):
+        job_id          = job_data["job_id"]
+        pivot_dest_path = job_data["pivot_dest_path"]
+        dest_dest_path  = job_data["dest_dest_path"]
+        created_at      = job_data.get("created_at", "unknown")
+        status          = job_data.get("status", "unknown")
+        script          = os.path.basename(sys.argv[0])
+
+        self.log.info("######## ACTION 'check-status': job %s ########", job_id)
+        self.log.info("Created at: %s | Current status: %s", created_at, status)
+
+        if status == "completed":
+            self.log.info("Job %s is already completed. Nothing to do.", job_id)
+            return
+
+        if status in ("started", "pivot_initialized"):
+            # Check pivot replication.
+            self.log.info("Checking pivot replication (%s) ...", pivot_dest_path)
+            r = self.x.run(self.pivot_cluster,
+                           f"snapmirror show -destination-path {pivot_dest_path} -instance")
+            sm_info     = parse_instance(r.stdout)
+            state       = (get_instance_field(sm_info, "Mirror State",
+                                              "Relationship Status", "state") or "").lower()
+            transferred = get_instance_field(sm_info, "Last Transfer Size",
+                                             "Total Transfer Bytes") or "unknown"
+            progress    = get_instance_field(sm_info, "Last Transfer Duration",
+                                             "Transfer Progress") or "unknown"
+            self.log.info("Pivot state: '%s' | transferred: %s | progress: %s",
+                          state or "unknown", transferred, progress)
+
+            if state in ("snapmirrored", "idle"):
+                self.log.info("Pivot replication is complete.")
+                self.log.info("Run the following command to start destination replication:")
+                self.log.info("  python3 %s --action resume --job-id %s", script, job_id)
+            else:
+                self.log.info("Pivot replication still in progress. Check again later:")
+                self.log.info("  python3 %s --action check-status --job-id %s", script, job_id)
+            return
+
+        if status == "dest_initialized":
+            # Check destination replication.
+            self.log.info("Checking destination replication (%s) ...", dest_dest_path)
+            r = self.x.run(self.dest_cluster,
+                           f"snapmirror show -destination-path {dest_dest_path} -instance")
+            sm_info     = parse_instance(r.stdout)
+            state       = (get_instance_field(sm_info, "Mirror State",
+                                              "Relationship Status", "state") or "").lower()
+            transferred = get_instance_field(sm_info, "Last Transfer Size",
+                                             "Total Transfer Bytes") or "unknown"
+            progress    = get_instance_field(sm_info, "Last Transfer Duration",
+                                             "Transfer Progress") or "unknown"
+            self.log.info("Destination state: '%s' | transferred: %s | progress: %s",
+                          state or "unknown", transferred, progress)
+
+            if state in ("snapmirrored", "idle"):
+                # Replication finished: mark job completed.
+                job_data["status"] = "completed"
+                _save_job(job_id, job_data)
+                self.log.info("Destination replication complete. Job %s marked as completed.", job_id)
+            else:
+                self.log.info("Destination replication still in progress. Check again later:")
+                self.log.info("  python3 %s --action check-status --job-id %s", script, job_id)
+            return
+
+        self.log.warning("Unrecognised job status '%s'. Manual inspection required.", status)
 
     # =====================================================================
     # ACTION 2 : 'clone' -> Qtree split & target volume creation
@@ -1003,7 +1077,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Name of the source volume. "
                              "Not required for --action resume.")
     parser.add_argument("--action", required=True,
-                        choices=["create", "clone", "cleanup", "resume"],
+                        choices=["create", "clone", "cleanup", "resume", "check-status"],
                         help="Action to execute.")
 
     # --- Action-specific arguments ---
@@ -1058,9 +1132,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
     """Validate argument consistency for the requested action."""
-    if args.action == "resume":
+    if args.action in ("resume", "check-status"):
         if not args.job_id:
-            parser.error("--job-id is required for --action resume.")
+            parser.error(f"--job-id is required for --action {args.action}.")
         return  # all other params come from the job file
 
     # All non-resume actions require cluster/volume identifiers.
@@ -1084,8 +1158,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     validate_args(args, parser)
 
-    # ---- Resume: reconstruct everything from the job file ----------------
-    if args.action == "resume":
+    # ---- Resume / check-status: reconstruct everything from the job file --
+    if args.action in ("resume", "check-status"):
         try:
             job_data = _load_job(args.job_id)
         except FileNotFoundError as exc:
@@ -1119,7 +1193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         logger = setup_logging(resume_args.log_file)
         logger.info("================================================================")
-        logger.info("Resuming job %s", args.job_id)
+        logger.info("Action '%s' for job %s", args.action, args.job_id)
         logger.info("Log file: %s", resume_args.log_file)
         logger.info("================================================================")
 
@@ -1132,8 +1206,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         orchestrator = MigrationOrchestrator(executor, resume_args)
 
         try:
-            orchestrator.action_resume(job_data)
-            logger.info("SUCCESS: resume completed without error.")
+            if args.action == "resume":
+                orchestrator.action_resume(job_data)
+            else:
+                orchestrator.action_check_status(job_data)
+            logger.info("SUCCESS: action '%s' completed without error.", args.action)
             return 0
         except OntapCliError as exc:
             logger.error("ONTAP FAILURE: %s", exc)
