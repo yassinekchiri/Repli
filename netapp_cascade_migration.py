@@ -495,25 +495,36 @@ class MigrationOrchestrator:
         self._create_dp_volume(self.dest_cluster, self.dest_svm, self.volume,
                                self.a.dest_aggr, src_size, src_style)
 
-        # --- Etape 3 : configuration des relations SnapMirror en cascade ---
-        # Relation 1 : Source -> Pivot (creee/initialisee SUR le Pivot).
-        self._snapmirror_create_init(
+        pivot_dest_path = self._path(self.pivot_svm, self.volume)
+        dest_dest_path = self._path(self.dest_svm, self.volume)
+
+        # --- Etape 3a : declaration des deux relations (sans transfert) -----
+        # On cree les deux relations en amont pour que la relation Pivot->Dest
+        # existe deja au moment ou l'on lancera son initialize. Aucun transfert
+        # ne demarre a cette etape.
+        self._snapmirror_create(
             run_on=self.pivot_cluster,
             source_path=self._path(self.src_svm, self.volume),
-            dest_path=self._path(self.pivot_svm, self.volume),
+            dest_path=pivot_dest_path,
         )
-        # Relation 2 : Pivot -> Destination (creee/initialisee SUR la Destination).
-        self._snapmirror_create_init(
+        self._snapmirror_create(
             run_on=self.dest_cluster,
-            source_path=self._path(self.pivot_svm, self.volume),
-            dest_path=self._path(self.dest_svm, self.volume),
+            source_path=pivot_dest_path,
+            dest_path=dest_dest_path,
         )
 
-        # --- Etape 4 : suivi jusqu'a Snapmirrored / Idle -------------------
-        self._wait_snapmirror_ready(self.pivot_cluster,
-                                    self._path(self.pivot_svm, self.volume))
-        self._wait_snapmirror_ready(self.dest_cluster,
-                                    self._path(self.dest_svm, self.volume))
+        # --- Etape 3b : initialisation Pivot, attente idle, PUIS Destination -
+        # Regle stricte : le transfert vers la destination ne peut demarrer
+        # qu'une fois le pivot completement synchronise (idle). Lancer les deux
+        # initialize en parallele risquerait de saturer le pivot ou de partir
+        # sur une source incomplete.
+        self._snapmirror_initialize(run_on=self.pivot_cluster,
+                                    dest_path=pivot_dest_path)
+        self._wait_snapmirror_ready(self.pivot_cluster, pivot_dest_path)
+
+        self._snapmirror_initialize(run_on=self.dest_cluster,
+                                    dest_path=dest_dest_path)
+        self._wait_snapmirror_ready(self.dest_cluster, dest_dest_path)
 
         self.log.info("ACTION 'create' terminee : cascade initialisee et synchronisee.")
 
@@ -695,14 +706,17 @@ class MigrationOrchestrator:
                       volume, cluster, aggr, size or "auto",
                       security_style or "defaut")
 
-    def _snapmirror_create_init(self, run_on: str, source_path: str,
-                                dest_path: str):
-        """Cree puis initialise une relation SnapMirror (executee cote destination)."""
-        self.log.info("SnapMirror %s -> %s (commandes sur %s).",
+    def _snapmirror_create(self, run_on: str, source_path: str, dest_path: str):
+        """Declare une relation SnapMirror XDP (sans declencher le transfert)."""
+        self.log.info("SnapMirror create %s -> %s (sur %s).",
                       source_path, dest_path, run_on)
         self.x.run(run_on,
                    f"snapmirror create -source-path {source_path} "
                    f"-destination-path {dest_path} -type XDP")
+
+    def _snapmirror_initialize(self, run_on: str, dest_path: str):
+        """Lance l'initialisation (transfert de base) d'une relation SnapMirror."""
+        self.log.info("SnapMirror initialize %s (sur %s).", dest_path, run_on)
         self.x.run(run_on,
                    f"snapmirror initialize -destination-path {dest_path}")
 
