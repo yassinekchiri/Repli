@@ -1029,7 +1029,7 @@ class MigrationOrchestrator:
         self.x.run(run_on,
                    f"snapmirror create -source-path {source_path} "
                    f"-destination-path {dest_path} -type XDP "
-                   f"-policy XDP_SG -schedule hourly -throttle unlimited")
+                   f"-policy MirrorAllSnapshots -schedule hourly -throttle unlimited")
 
     def _snapmirror_initialize(self, run_on: str, dest_path: str):
         """Trigger the baseline transfer (initialize) for a SnapMirror relationship."""
