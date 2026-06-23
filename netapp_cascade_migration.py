@@ -235,6 +235,26 @@ ONTAP_BENIGN_PATTERNS = [
     re.compile(r"Last Transfer Error\s*:\s*-?\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
+# Pattern to detect "object already exists" responses from ONTAP, used by
+# idempotent create helpers so that a retry on a partially-completed run
+# treats existing objects as success rather than failure.
+_ALREADY_EXISTS_RE = re.compile(
+    r"already exists|duplicate entry|entry already exists",
+    re.IGNORECASE,
+)
+
+# Ordered checkpoints written to the job file by action_create.
+# action_retry uses this list to skip phases that already completed.
+_CREATE_STATUS_ORDER = [
+    "started",
+    "space_checked",
+    "volumes_created",
+    "relationships_created",
+    "pivot_initialized",
+    "dest_initialized",
+    "completed",
+]
+
 
 class OntapCliExecutor:
     """Wraps execution of an ONTAP CLI command on a cluster over SSH.
@@ -539,6 +559,10 @@ class MigrationOrchestrator:
         self.dest_svm = args.dest_vserver
         self.dr_svm = args.dr_vserver
 
+        # Set by action_create as soon as the job file is written so that
+        # the main() error handler can always print the job ID on failure.
+        self._job_id: Optional[str] = None
+
     # ----- SnapMirror path helpers ---------------------------------------- #
     def _path(self, svm: str, volume: str) -> str:
         """Build a SnapMirror path 'svm:volume'."""
@@ -554,6 +578,7 @@ class MigrationOrchestrator:
 
         # --- Generate job ID and persist all parameters -------------------
         job_id = _generate_job_id()
+        self._job_id = job_id   # exposed so main() can log it on any failure
         pivot_dest_path = self._path(self.pivot_svm, self.volume)
         dest_dest_path  = self._path(self.dest_svm,  self.volume)
         dr_dest_path    = self._path(self.dr_svm,    self.volume)
@@ -608,6 +633,8 @@ class MigrationOrchestrator:
         self._check_aggregate_space(self.pivot_cluster, self.a.pivot_aggr, src_bytes)
         self._check_aggregate_space(self.dest_cluster,  self.a.dest_aggr,  src_bytes)
         self._check_aggregate_space(self.dr_cluster,    self.a.dr_aggr,    src_bytes)
+        job_data["status"] = "space_checked"
+        _save_job(job_id, job_data)
 
         # --- Step 2: create DP volumes (Pivot, PROD, DR) ------------------
         # SnapMirror destination volumes are of type 'DP', created without
@@ -618,6 +645,8 @@ class MigrationOrchestrator:
                                self.a.dest_aggr, src_size, src_style)
         self._create_dp_volume(self.dr_cluster, self.dr_svm, self.volume,
                                self.a.dr_aggr, src_size, src_style)
+        job_data["status"] = "volumes_created"
+        _save_job(job_id, job_data)
 
         # --- Step 3a: declare all three relationships (no transfer yet) ---
         # Source->Pivot, Pivot->PROD and Pivot->DR are all declared upfront
@@ -638,6 +667,8 @@ class MigrationOrchestrator:
             source_path=pivot_dest_path,
             dest_path=dr_dest_path,
         )
+        job_data["status"] = "relationships_created"
+        _save_job(job_id, job_data)
 
         # --- Step 3b: initialize Pivot ------------------------------------
         # Strict rule: the destination transfer must not start until the pivot
@@ -645,11 +676,12 @@ class MigrationOrchestrator:
         # could overload the pivot or start from an incomplete source.
         self._snapmirror_initialize(run_on=self.pivot_cluster,
                                     dest_path=pivot_dest_path)
+        # Save immediately after firing so a failure during the subsequent
+        # wait (step 3c) is recoverable via --action retry.
+        job_data["status"] = "pivot_initialized"
+        _save_job(job_id, job_data)
 
         if create_mode == "pivot-only":
-            # Save status and exit — the user will resume via --action resume.
-            job_data["status"] = "pivot_initialized"
-            _save_job(job_id, job_data)
             self.log.info("Pivot SnapMirror initialize launched. Script exiting (pivot-only mode).")
             self.log.info("=" * 64)
             self.log.info("KEEP YOUR JOB ID TO RESUME LATER: %s", job_id)
@@ -668,6 +700,11 @@ class MigrationOrchestrator:
                                     dest_path=dest_dest_path)
         self._snapmirror_initialize(run_on=self.dr_cluster,
                                     dest_path=dr_dest_path)
+        # Save before waiting so a failure during the dest/DR wait is
+        # recoverable: --action retry will delegate to check-status.
+        job_data["status"] = "dest_initialized"
+        _save_job(job_id, job_data)
+
         self._wait_snapmirror_ready(self.dest_cluster, dest_dest_path)
         self._wait_snapmirror_ready(self.dr_cluster,   dr_dest_path)
 
@@ -847,6 +884,139 @@ class MigrationOrchestrator:
         self.log.warning("Unrecognised job status '%s'. Manual inspection required.", status)
 
     # =====================================================================
+    # ACTION 'retry' -> Re-enter action_create at the last checkpoint
+    # =====================================================================
+    def action_retry(self, job_data: dict):
+        """Re-run action_create from the last successful checkpoint.
+
+        Completed phases are skipped entirely. Volume and relationship
+        creates use idempotent mode so that objects partially created
+        within a phase do not cause a failure on the retry run.
+
+        Status routing:
+          started / space_checked / volumes_created / relationships_created
+              -> re-run incomplete phases then launch pivot initialize
+          pivot_initialized
+              -> delegate to action_resume (check pivot, launch PROD+DR)
+          dest_initialized
+              -> delegate to action_check_status (report live state)
+          completed
+              -> nothing to do
+        """
+        job_id      = job_data["job_id"]
+        status      = job_data.get("status", "started")
+        create_mode = job_data.get("create_mode", "full")
+        script      = os.path.basename(sys.argv[0])
+
+        self.log.info("######## ACTION 'retry': job %s (status=%s) ########",
+                      job_id, status)
+        self._job_id = job_id
+
+        if status == "completed":
+            self.log.info("Job %s is already completed. Nothing to do.", job_id)
+            return
+
+        if status == "dest_initialized":
+            self.log.info("PROD and DR initializes already launched. "
+                          "Delegating to check-status.")
+            self.action_check_status(job_data)
+            return
+
+        if status == "pivot_initialized":
+            if create_mode == "pivot-only":
+                self.log.info("Pivot already initialized (pivot-only mode).")
+                self.log.info("Use --action resume when the pivot transfer is idle:")
+                self.log.info("  python3 %s --action resume --job-id %s", script, job_id)
+            else:
+                self.log.info("Pivot already initialized. Delegating to resume.")
+                self.action_resume(job_data)
+            return
+
+        # ---- Phases to re-run: anything before pivot_initialized ----------
+        pivot_dest_path = job_data["pivot_dest_path"]
+        dest_dest_path  = job_data["dest_dest_path"]
+        dr_dest_path    = job_data.get("dr_dest_path", "")
+
+        idx = _CREATE_STATUS_ORDER.index(status)
+        need_space_check   = idx < _CREATE_STATUS_ORDER.index("space_checked")
+        need_volumes       = idx < _CREATE_STATUS_ORDER.index("volumes_created")
+        need_relationships = idx < _CREATE_STATUS_ORDER.index("relationships_created")
+
+        # Source volume info is needed for space check and/or volume creation.
+        if need_space_check or need_volumes:
+            src_info  = self._get_volume_info(self.src_cluster, self.src_svm, self.volume)
+            src_size  = get_instance_field(src_info, "Volume Size", "size")
+            src_bytes = parse_size_to_bytes(src_size) if src_size else None
+            src_style = get_instance_field(src_info, "Security Style", "security-style")
+            self.log.info("Source volume '%s': size=%s, security-style=%s",
+                          self.volume, src_size, src_style or "unknown")
+        else:
+            src_size = src_style = src_bytes = None
+
+        if need_space_check:
+            self.log.info("--- Phase: aggregate space check ---")
+            self._check_aggregate_space(self.pivot_cluster, self.a.pivot_aggr, src_bytes)
+            self._check_aggregate_space(self.dest_cluster,  self.a.dest_aggr,  src_bytes)
+            if dr_dest_path:
+                self._check_aggregate_space(self.dr_cluster, self.a.dr_aggr, src_bytes)
+            job_data["status"] = "space_checked"
+            _save_job(job_id, job_data)
+        else:
+            self.log.info("Skipping space check (already completed).")
+
+        if need_volumes:
+            self.log.info("--- Phase: DP volume creation (idempotent) ---")
+            self._create_dp_volume(self.pivot_cluster, self.pivot_svm, self.volume,
+                                   self.a.pivot_aggr, src_size, src_style, idempotent=True)
+            self._create_dp_volume(self.dest_cluster, self.dest_svm, self.volume,
+                                   self.a.dest_aggr, src_size, src_style, idempotent=True)
+            if dr_dest_path:
+                self._create_dp_volume(self.dr_cluster, self.dr_svm, self.volume,
+                                       self.a.dr_aggr, src_size, src_style, idempotent=True)
+            job_data["status"] = "volumes_created"
+            _save_job(job_id, job_data)
+        else:
+            self.log.info("Skipping DP volume creation (already completed).")
+
+        if need_relationships:
+            self.log.info("--- Phase: SnapMirror relationship creation (idempotent) ---")
+            self._snapmirror_create(
+                run_on=self.pivot_cluster,
+                source_path=self._path(self.src_svm, self.volume),
+                dest_path=pivot_dest_path, idempotent=True)
+            self._snapmirror_create(
+                run_on=self.dest_cluster,
+                source_path=pivot_dest_path,
+                dest_path=dest_dest_path, idempotent=True)
+            if dr_dest_path:
+                self._snapmirror_create(
+                    run_on=self.dr_cluster,
+                    source_path=pivot_dest_path,
+                    dest_path=dr_dest_path, idempotent=True)
+            job_data["status"] = "relationships_created"
+            _save_job(job_id, job_data)
+        else:
+            self.log.info("Skipping relationship creation (already completed).")
+
+        # All pre-requisites are now in place: fire the pivot initialize.
+        self.log.info("--- Phase: pivot SnapMirror initialize ---")
+        self._snapmirror_initialize(run_on=self.pivot_cluster, dest_path=pivot_dest_path)
+        job_data["status"] = "pivot_initialized"
+        _save_job(job_id, job_data)
+
+        self.log.info("Pivot SnapMirror initialize launched.")
+        self.log.info("=" * 64)
+        self.log.info("KEEP YOUR JOB ID: %s", job_id)
+        if create_mode == "pivot-only":
+            self.log.info("Resume command when pivot is idle:")
+            self.log.info("  python3 %s --action resume --job-id %s", script, job_id)
+        else:
+            self.log.info("Check pivot progress, then resume when ready:")
+            self.log.info("  python3 %s --action check-status --job-id %s", script, job_id)
+            self.log.info("  python3 %s --action resume      --job-id %s", script, job_id)
+        self.log.info("=" * 64)
+
+    # =====================================================================
     # ACTION 2 : 'clone' -> Qtree split & target volume creation
     # =====================================================================
     def action_clone(self):
@@ -1005,31 +1175,57 @@ class MigrationOrchestrator:
 
     def _create_dp_volume(self, cluster: str, svm: str, volume: str,
                           aggr: str, size: Optional[str],
-                          security_style: Optional[str] = None):
+                          security_style: Optional[str] = None,
+                          idempotent: bool = False):
         """Create a DP-type volume (SnapMirror destination) mirroring the source.
 
         The volume is created without space reservation (-space-guarantee none)
         and, if known, with the same security style as the source volume.
+        When idempotent=True an "already exists" response is treated as success
+        so that a retry after a partial failure is safe.
         """
-        size_opt = f"-size {size} " if size else ""
+        size_opt  = f"-size {size} " if size else ""
         style_opt = f"-security-style {security_style} " if security_style else ""
-        self.x.run(cluster,
-                   f"volume create -vserver {svm} -volume {volume} "
-                   f"-aggregate {aggr} {size_opt}{style_opt}"
-                   f"-space-guarantee none -type DP")
+        cmd = (f"volume create -vserver {svm} -volume {volume} "
+               f"-aggregate {aggr} {size_opt}{style_opt}"
+               f"-space-guarantee none -type DP")
+        if idempotent:
+            r = self.x.run(cluster, cmd, allow_failure=True)
+            if _ALREADY_EXISTS_RE.search(f"{r.stdout}\n{r.stderr}"):
+                self.log.warning("DP volume '%s' already exists on %s — skipping.", volume, cluster)
+                return
+            err = self.x._detect_error(r)
+            if err:
+                raise OntapCliError(cluster, cmd, r.exit_code, r.stdout, r.stderr, reason=err)
+        else:
+            self.x.run(cluster, cmd)
         self.log.info("DP volume '%s' created on %s (aggregate %s, size %s, "
                       "security-style %s, space-guarantee none).",
                       volume, cluster, aggr, size or "auto",
                       security_style or "default")
 
-    def _snapmirror_create(self, run_on: str, source_path: str, dest_path: str):
-        """Declare an XDP SnapMirror relationship (no transfer triggered)."""
+    def _snapmirror_create(self, run_on: str, source_path: str, dest_path: str,
+                           idempotent: bool = False):
+        """Declare an XDP SnapMirror relationship (no transfer triggered).
+
+        When idempotent=True an "already exists" response is treated as success.
+        """
         self.log.info("SnapMirror create %s -> %s (on %s).",
                       source_path, dest_path, run_on)
-        self.x.run(run_on,
-                   f"snapmirror create -source-path {source_path} "
-                   f"-destination-path {dest_path} -type XDP "
-                   f"-policy MirrorAllSnapshots -schedule hourly -throttle unlimited")
+        cmd = (f"snapmirror create -source-path {source_path} "
+               f"-destination-path {dest_path} -type XDP "
+               f"-policy MirrorAllSnapshots -schedule hourly -throttle unlimited")
+        if idempotent:
+            r = self.x.run(run_on, cmd, allow_failure=True)
+            if _ALREADY_EXISTS_RE.search(f"{r.stdout}\n{r.stderr}"):
+                self.log.warning("SnapMirror relationship %s -> %s already exists — skipping.",
+                                 source_path, dest_path)
+                return
+            err = self.x._detect_error(r)
+            if err:
+                raise OntapCliError(run_on, cmd, r.exit_code, r.stdout, r.stderr, reason=err)
+        else:
+            self.x.run(run_on, cmd)
 
     def _snapmirror_initialize(self, run_on: str, dest_path: str):
         """Trigger the baseline transfer (initialize) for a SnapMirror relationship."""
@@ -1177,7 +1373,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Name of the source volume. "
                              "Not required for --action resume.")
     parser.add_argument("--action", required=True,
-                        choices=["create", "clone", "cleanup", "resume", "check-status"],
+                        choices=["create", "clone", "cleanup", "resume",
+                                 "check-status", "retry"],
                         help="Action to execute.")
 
     # --- Action-specific arguments ---
@@ -1246,7 +1443,7 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
     create: requires source/pivot/dest/dr clusters, volume, and
     --dr-cluster (mandatory for the Y fan-out topology).
     """
-    if args.action in ("resume", "check-status"):
+    if args.action in ("resume", "check-status", "retry"):
         if not args.job_id:
             parser.error(f"--job-id is required for --action {args.action}.")
         return  # all other params come from the job file
@@ -1270,13 +1467,29 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
 # 7. ENTRY POINT
 # =============================================================================
 
+def _log_job_id_on_failure(orchestrator: "MigrationOrchestrator",
+                            args: argparse.Namespace,
+                            logger: logging.Logger) -> None:
+    """Print the job ID and retry command after any failure in action_create."""
+    job_id = getattr(orchestrator, "_job_id", None)
+    if not job_id:
+        return
+    script = os.path.basename(sys.argv[0])
+    logger.error("=" * 64)
+    logger.error("SCRIPT INTERRUPTED — job file preserved.")
+    logger.error("Job ID : %s", job_id)
+    logger.error("Retry command:")
+    logger.error("  python3 %s --action retry --job-id %s", script, job_id)
+    logger.error("=" * 64)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     validate_args(args, parser)
 
-    # ---- Resume / check-status: reconstruct everything from the job file --
-    if args.action in ("resume", "check-status"):
+    # ---- Resume / check-status / retry: reconstruct from the job file ------
+    if args.action in ("resume", "check-status", "retry"):
         try:
             job_data = _load_job(args.job_id)
         except FileNotFoundError as exc:
@@ -1330,16 +1543,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             if args.action == "resume":
                 orchestrator.action_resume(job_data)
+            elif args.action == "retry":
+                orchestrator.action_retry(job_data)
             else:
                 orchestrator.action_check_status(job_data)
             logger.info("SUCCESS: action '%s' completed without error.", args.action)
             return 0
         except OntapCliError as exc:
             logger.error("ONTAP FAILURE: %s", exc)
+            logger.error("Job ID for later retry: %s", args.job_id)
             logger.error("Execution interrupted. Check the log: %s", resume_args.log_file)
             return 2
         except Exception as exc:
             logger.exception("UNEXPECTED FAILURE: %s", exc)
+            logger.error("Job ID for later retry: %s", args.job_id)
             return 3
 
     # ---- Normal actions --------------------------------------------------
@@ -1377,12 +1594,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     except OntapCliError as exc:
-        # ONTAP business error: already logged exhaustively by the executor.
         logger.error("ONTAP FAILURE: %s", exc)
+        _log_job_id_on_failure(orchestrator, args, logger)
         logger.error("Execution interrupted. Check the log: %s", args.log_file)
         return 2
-    except Exception as exc:  # safety net: any other error is still logged.
+    except Exception as exc:
         logger.exception("UNEXPECTED FAILURE: %s", exc)
+        _log_job_id_on_failure(orchestrator, args, logger)
         return 3
 
 
