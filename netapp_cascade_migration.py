@@ -5,24 +5,53 @@ netapp_cascade_migration.py
 ===========================
 
 Orchestration tool for NetApp ONTAP storage migration using a cascading
-topology ("pass-through" / cascading) across 3 tiers:
+Y-topology: one source fans out through a pivot to two simultaneous
+destinations (PROD and DR).
 
-    Upper Tier (Sources)          ->  High-end production clusters
-                                      (e.g. CMOPARPA4MUT100, CMOPARTIGMUT100)
+    Upper Tier (Source)            ->  Production source cluster
+                                       (e.g. CMOPARPA4MUT100, CMOPARTIGMUT100)
                 |
                 |  SnapMirror (relationship 1)
                 v
-    Middle Tier (Pivot)           ->  Transit / staging cluster
-                                      (CMOPARTIGBKP110)
-                |
-                |  SnapMirror (relationship 2)
-                v
-    Lower Tier (Destinations)     ->  Low-end target clusters
-                                      (e.g. CMOPARPA4SFS100, CMOPARDC5SFS100)
+    Middle Tier (Pivot)            ->  Transit / staging cluster
+                                       (e.g. CMOPARTIGBKP110)
+               / \\
+              /   \\
+    rel. 2   /     \\  rel. 3
+            v       v
+    PROD Dest       DR Dest        ->  Low-end target clusters
+    (--dest-cluster)  (--dr-cluster)   (e.g. CMOPARPA4SFS100 / CMOPARDC5SFS100)
 
 Goal: migrate data while SPLITTING the storage structure. Source volumes
 contain multiple Qtrees; at the final destination each Qtree must be
 isolated in its own dedicated volume (rule: 1 Volume = 1 Qtree).
+
+------------------------------------------------------------------------------
+REPLICATION SEQUENCING RULES
+------------------------------------------------------------------------------
+* Pivot initialise MUST complete before PROD and DR initialise are triggered.
+* PROD and DR initialise are launched back-to-back (Y fan-out) so the pivot
+  streams to both destinations simultaneously.
+* Long-running transfers are never waited on inline: the script exits after
+  firing the initialize command and saves state to a JSON job file. Use
+  --action resume / check-status to monitor and continue.
+
+------------------------------------------------------------------------------
+JOB FILE LIFECYCLE
+------------------------------------------------------------------------------
+Every --action create generates a JSON job file in the working directory:
+
+    netapp_migration_<YYYYMMDD_HHMMSS_6hex>.json
+
+The file stores all parameters and the current status:
+
+    started           -> pivot initialize launched (pivot-only mode)
+    pivot_initialized -> pivot done, ready to start PROD + DR
+    dest_initialized  -> PROD + DR initializes launched, transfers in progress
+    completed         -> both PROD and DR transfers confirmed idle/snapmirrored
+
+Use --action check-status --job-id <ID> at any time to query live ONTAP state.
+Use --action resume    --job-id <ID> when pivot is done to launch PROD + DR.
 
 ------------------------------------------------------------------------------
 STRICT CONSTRAINTS IMPLEMENTED
@@ -35,6 +64,9 @@ STRICT CONSTRAINTS IMPLEMENTED
   ~/.ssh/config and the SSH agent. A paramiko backend is also available
   (--ssh-backend paramiko) if paramiko is installed; it also uses system keys
   (no password).
+* SINGLE CONNECTION PER OBJECT : volume/aggregate info is fetched in one call
+  (-instance), cached in a dict, and all fields are read from the dict —
+  no redundant SSH connections.
 * FULL TRACEABILITY     : every command sent to a cluster is logged exhaustively
   (date/time, target cluster, raw command, exit code, full stdout and stderr)
   in a dedicated log file.
@@ -46,36 +78,45 @@ STRICT CONSTRAINTS IMPLEMENTED
 ------------------------------------------------------------------------------
 CLI INTERFACE
 ------------------------------------------------------------------------------
-Required arguments:
-    --source-cluster   Name/IP of the source cluster (upper tier)
-    --pivot-cluster    Name/IP of the pivot cluster (CMOPARTIGBKP110)
-    --dest-cluster     Name/IP of the destination cluster (lower tier)
+Required arguments (--action create):
+    --source-cluster   Name/IP of the source cluster
+    --pivot-cluster    Name/IP of the pivot cluster
+    --dest-cluster     Name/IP of the PROD destination cluster
+    --dr-cluster       Name/IP of the DR destination cluster (Y fan-out)
     --volume           Name of the source volume
-    --action           'create' | 'clone' | 'cleanup'
+    --action           'create' | 'clone' | 'cleanup' | 'resume' | 'check-status'
 
 Action-specific arguments:
-    --qtrees           (clone)   comma-separated list 'q1,q2' OR keyword 'all'
-    --qtree            (cleanup) single target Qtree
+    --create-mode      (create)       'full' (default) or 'pivot-only'
+    --job-id           (resume / check-status) job ID from a previous create run
+    --qtrees           (clone)        comma-separated list 'q1,q2' OR keyword 'all'
+    --qtree            (cleanup)      single target Qtree
 
-Additional technical arguments (required for real ONTAP commands,
-provided with sensible defaults; adapt to your environment):
-    --source-vserver / --pivot-vserver / --dest-vserver   SVM per tier
-    --pivot-aggr / --dest-aggr                            Target aggregates
-    --noaccess-policy                                     Restrictive export-policy
-    --ssh-backend {subprocess,paramiko}                   SSH transport
-    --ssh-user                                            optional user@host
-    --log-file                                            log file path
-    --dry-run                                             simulation (nothing executed)
-    --timeout / --poll-interval                           SnapMirror polling
+Additional technical arguments (provided with sensible defaults):
+    --source-vserver / --pivot-vserver / --dest-vserver / --dr-vserver
+    --pivot-aggr / --dest-aggr / --dr-aggr
+    --noaccess-policy                 Restrictive export-policy
+    --ssh-backend {subprocess,paramiko}
+    --ssh-user                        optional user@host
+    --log-file                        log file path
+    --dry-run                         simulation (nothing executed)
+    --timeout / --poll-interval       SnapMirror polling parameters
 
 Examples:
+    # Full cascade (pivot + PROD + DR in one shot):
     python3 netapp_cascade_migration.py \\
         --source-cluster CMOPARTIGMUT100 \\
         --pivot-cluster  CMOPARTIGBKP110 \\
         --dest-cluster   CMOPARPA4SFS100 \\
+        --dr-cluster     CMOPARDC5SFS100 \\
         --volume vol_prod_01 \\
         --action create \\
-        --pivot-aggr aggr1_pivot --dest-aggr aggr1_dest
+        --pivot-aggr aggr1_pivot --dest-aggr aggr1_dest --dr-aggr aggr1_dr
+
+    # Two-phase: start pivot only, resume later when pivot is idle:
+    python3 netapp_cascade_migration.py ... --action create --create-mode pivot-only
+    python3 netapp_cascade_migration.py --action resume       --job-id <ID>
+    python3 netapp_cascade_migration.py --action check-status --job-id <ID>
 
     python3 netapp_cascade_migration.py ... --action clone  --qtrees all
     python3 netapp_cascade_migration.py ... --action cleanup --qtree qtree_finance
@@ -636,7 +677,7 @@ class MigrationOrchestrator:
                       "(PROD + DR).")
 
     # =====================================================================
-    # ACTION 'resume' -> Check pivot status and optionally replicate to dest
+    # ACTION 'resume' -> Verify pivot is idle then fan-out to PROD + DR
     # =====================================================================
     def action_resume(self, job_data: dict):
         job_id          = job_data["job_id"]
@@ -656,7 +697,7 @@ class MigrationOrchestrator:
             return
 
         if status == "dest_initialized":
-            self.log.info("Destination replication was already initialized for this job.")
+            self.log.info("PROD and DR replication were already initialized for this job.")
             self.log.info("Use check-status to monitor progress:")
             self.log.info("  python3 %s --action check-status --job-id %s",
                           os.path.basename(sys.argv[0]), job_id)
@@ -711,7 +752,7 @@ class MigrationOrchestrator:
         self.log.info("=" * 64)
 
     # =====================================================================
-    # ACTION 'check-status' -> Report current replication progress
+    # ACTION 'check-status' -> Report progress for pivot, PROD, and DR
     # =====================================================================
     def action_check_status(self, job_data: dict):
         job_id          = job_data["job_id"]
@@ -1197,13 +1238,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
-    """Validate argument consistency for the requested action."""
+    """Validate argument consistency for the requested action.
+
+    resume / check-status: only --job-id needed; all other params are
+    loaded from the job file written during the original create run.
+
+    create: requires source/pivot/dest/dr clusters, volume, and
+    --dr-cluster (mandatory for the Y fan-out topology).
+    """
     if args.action in ("resume", "check-status"):
         if not args.job_id:
             parser.error(f"--job-id is required for --action {args.action}.")
         return  # all other params come from the job file
 
-    # All non-resume actions require cluster/volume identifiers.
+    # All non-resume/check-status actions require cluster/volume identifiers.
     for flag in ("source_cluster", "pivot_cluster", "dest_cluster", "volume"):
         if not getattr(args, flag, None):
             parser.error(f"--{flag.replace('_', '-')} is required for --action {args.action}.")
@@ -1235,7 +1283,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
 
-        # Reconstruct args namespace from the saved parameters.
+        # Reconstruct args namespace from the saved job parameters so that
+        # MigrationOrchestrator has the same context as the original create run,
+        # including dr_cluster / dr_vserver / dr_aggr for the Y fan-out.
         saved = job_data["params"]
         resume_args = argparse.Namespace(
             source_cluster  = saved["source_cluster"],
