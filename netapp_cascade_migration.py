@@ -1394,6 +1394,68 @@ class MigrationOrchestrator:
                 reason=f"snapshot '{snapshot}' not found on destination")
         self.log.info("Snapshot '%s' confirmed present on %s.", snapshot, cluster)
 
+    def _check_clone_prerequisites(self):
+        """Pre-flight check before running action_clone without a job file.
+
+        Verifies that the full cascade is in a healthy, idle state:
+        - The DP volume exists on pivot, PROD, and DR.
+        - The three SnapMirror relationships exist (src→pivot, pivot→PROD, pivot→DR).
+        - All three relationships report status 'Idle' or state 'Snapmirrored'.
+
+        Raises OntapCliError on the first problem found.
+        """
+        self.log.info("--- Pre-flight: checking cascade health before clone ---")
+        checks = [
+            (self.pivot_cluster, self.pivot_svm,  self.volume,
+             self._path(self.pivot_svm, self.volume)),
+            (self.dest_cluster,  self.dest_svm,   self.volume,
+             self._path(self.dest_svm,  self.volume)),
+            (self.dr_cluster,    self.dr_svm,     self.volume,
+             self._path(self.dr_svm,    self.volume)),
+        ]
+        for cluster, svm, volume, dest_path in checks:
+            # 1. DP volume must exist.
+            if not self.x.dry_run:
+                r_vol = self.x.run(cluster,
+                                   f"volume show -vserver {svm} -volume {volume} "
+                                   f"-instance", allow_failure=True)
+                if volume not in r_vol.stdout:
+                    raise OntapCliError(
+                        cluster, f"volume show -volume {volume}", r_vol.exit_code,
+                        r_vol.stdout, r_vol.stderr,
+                        reason=f"DP volume '{volume}' not found on {cluster}/{svm}")
+            self.log.info("DP volume '%s' confirmed on %s.", volume, cluster)
+
+            # 2. SnapMirror relationship must exist and be idle/snapmirrored.
+            r_sm = self.x.run(cluster,
+                              f"snapmirror show -destination-path {dest_path} -instance",
+                              allow_failure=True)
+            if self.x.dry_run:
+                self.log.info("[DRY-RUN] SnapMirror %s assumed healthy.", dest_path)
+                continue
+            sm_info = parse_instance(r_sm.stdout)
+            if not sm_info:
+                raise OntapCliError(
+                    cluster, f"snapmirror show -destination-path {dest_path}", 0,
+                    r_sm.stdout, r_sm.stderr,
+                    reason=f"no SnapMirror relationship found for {dest_path}")
+            state  = (get_instance_field(sm_info, "Mirror State",
+                                         "Relationship Status", "state") or "").lower()
+            status = (get_instance_field(sm_info, "Relationship Status",
+                                         "status") or "").lower()
+            healthy = state in ("snapmirrored", "idle") or status == "idle"
+            if not healthy:
+                raise OntapCliError(
+                    cluster, f"snapmirror show -destination-path {dest_path}", 0,
+                    r_sm.stdout, r_sm.stderr,
+                    reason=(f"SnapMirror {dest_path} is not ready for clone "
+                            f"(state='{state}', status='{status}'). "
+                            f"Wait for 'Idle'/'Snapmirrored' before cloning."))
+            self.log.info("SnapMirror %s: state='%s', status='%s' — OK.",
+                          dest_path, state, status)
+
+        self.log.info("Pre-flight checks passed. Cascade is healthy and idle.")
+
     def _find_best_aggregate(self, cluster: str,
                              exclude_aggr: Optional[str] = None) -> str:
         """Return the aggregate name with the most available space on *cluster*.
@@ -1506,8 +1568,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "immediately; use --action resume --job-id <ID> to continue "
                              "(default: full).")
     parser.add_argument("--job-id",
-                        help="(resume) Job ID returned by a previous --create-mode "
-                             "pivot-only run.")
+                        help="(resume / check-status / retry / clone) Job ID returned "
+                             "by a previous --action create run. When used with "
+                             "--action clone, all cluster/volume parameters are loaded "
+                             "from the job file; only --qtrees is still required.")
 
     # --- Additional technical arguments (required for real ONTAP commands) ---
     parser.add_argument("--source-vserver", default="svm_source",
@@ -1555,8 +1619,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
     """Validate argument consistency for the requested action.
 
-    resume / check-status: only --job-id needed; all other params are
-    loaded from the job file written during the original create run.
+    resume / check-status / retry: only --job-id needed; all other params
+    are loaded from the job file written during the original create run.
+
+    clone + --job-id: cluster/volume params loaded from job file; only
+    --qtrees is required on the command line.
+
+    clone (no --job-id): all cluster/volume params required on the command
+    line; a pre-flight health check is run before cloning.
 
     create: requires source/pivot/dest/dr clusters, volume, and
     --dr-cluster (mandatory for the Y fan-out topology).
@@ -1566,7 +1636,14 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
             parser.error(f"--job-id is required for --action {args.action}.")
         return  # all other params come from the job file
 
-    # All non-resume/check-status actions require cluster/volume identifiers.
+    if args.action == "clone" and args.job_id:
+        # Job-file mode: only --qtrees needed from the CLI.
+        if not args.qtrees:
+            parser.error("--qtrees is required for --action clone "
+                         "(comma-separated list 'q1,q2' or 'all').")
+        return  # everything else comes from the job file
+
+    # All actions that provide parameters explicitly require cluster/volume ids.
     for flag in ("source_cluster", "pivot_cluster", "dest_cluster", "volume"):
         if not getattr(args, flag, None):
             parser.error(f"--{flag.replace('_', '-')} is required for --action {args.action}.")
@@ -1677,6 +1754,70 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger.error("Job ID for later retry: %s", args.job_id)
             return 3
 
+    # ---- clone + --job-id: load context from job file ----------------------
+    if args.action == "clone" and args.job_id:
+        try:
+            job_data = _load_job(args.job_id)
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        saved = job_data["params"]
+        clone_args = argparse.Namespace(
+            source_cluster  = saved["source_cluster"],
+            pivot_cluster   = saved["pivot_cluster"],
+            dest_cluster    = saved["dest_cluster"],
+            dr_cluster      = saved.get("dr_cluster"),
+            volume          = saved["volume"],
+            source_vserver  = saved["source_vserver"],
+            pivot_vserver   = saved["pivot_vserver"],
+            dest_vserver    = saved["dest_vserver"],
+            dr_vserver      = saved.get("dr_vserver", "svm_dr"),
+            pivot_aggr      = saved["pivot_aggr"],
+            dest_aggr       = saved["dest_aggr"],
+            dr_aggr         = saved.get("dr_aggr", "aggr1_dr"),
+            noaccess_policy = saved["noaccess_policy"],
+            ssh_backend     = saved["ssh_backend"],
+            ssh_user        = saved["ssh_user"],
+            log_file        = saved.get("log_file"),
+            timeout         = saved["timeout"],
+            poll_interval   = saved["poll_interval"],
+            dry_run         = saved.get("dry_run", False),
+            # qtrees comes from the CLI, not the job file
+            qtrees          = args.qtrees,
+        )
+
+        if not clone_args.log_file:
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            clone_args.log_file = f"migration_clone_{args.job_id}_{stamp}.log"
+
+        logger = setup_logging(clone_args.log_file)
+        logger.info("================================================================")
+        logger.info("Action 'clone' for job %s (parameters from job file).", args.job_id)
+        logger.info("Qtrees: %s", clone_args.qtrees)
+        logger.info("Log file: %s", clone_args.log_file)
+        logger.info("================================================================")
+
+        executor = OntapCliExecutor(
+            logger=logger,
+            ssh_backend=clone_args.ssh_backend,
+            ssh_user=clone_args.ssh_user,
+            dry_run=clone_args.dry_run,
+        )
+        orchestrator = MigrationOrchestrator(executor, clone_args)
+
+        try:
+            orchestrator.action_clone()
+            logger.info("SUCCESS: action 'clone' completed without error.")
+            return 0
+        except OntapCliError as exc:
+            logger.error("ONTAP FAILURE: %s", exc)
+            logger.error("Execution interrupted. Check the log: %s", clone_args.log_file)
+            return 2
+        except Exception as exc:
+            logger.exception("UNEXPECTED FAILURE: %s", exc)
+            return 3
+
     # ---- Normal actions --------------------------------------------------
     if not args.log_file:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1705,6 +1846,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.action == "create":
             orchestrator.action_create()
         elif args.action == "clone":
+            orchestrator._check_clone_prerequisites()
             orchestrator.action_clone()
         elif args.action == "cleanup":
             orchestrator.action_cleanup()
