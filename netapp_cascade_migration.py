@@ -682,13 +682,15 @@ class MigrationOrchestrator:
         _save_job(job_id, job_data)
 
         if create_mode == "pivot-only":
-            self.log.info("Pivot SnapMirror initialize launched. Script exiting (pivot-only mode).")
-            self.log.info("=" * 64)
-            self.log.info("KEEP YOUR JOB ID TO RESUME LATER: %s", job_id)
-            self.log.info("Resume command:")
-            self.log.info("  python3 %s --action resume --job-id %s",
-                          os.path.basename(sys.argv[0]), job_id)
-            self.log.info("=" * 64)
+            script = os.path.basename(sys.argv[0])
+            self.log.info("=" * 60)
+            self.log.info("  Pivot SnapMirror initialize launched  [pivot-only mode]")
+            self._log_arch(pivot_note=">>> initializing ...",
+                           prod_note="(waiting)", dr_note="(waiting)")
+            self.log.info("  Job ID : %s", job_id)
+            self.log.info("  Resume : python3 %s --action resume --job-id %s",
+                          script, job_id)
+            self.log.info("=" * 60)
             return
 
         # --- Step 3c (full mode): wait for Pivot then initialize PROD + DR --
@@ -710,8 +712,10 @@ class MigrationOrchestrator:
 
         job_data["status"] = "completed"
         _save_job(job_id, job_data)
-        self.log.info("ACTION 'create' complete: cascade initialised and synchronised "
-                      "(PROD + DR).")
+        self.log.info("=" * 60)
+        self.log.info("  ACTION 'create' complete  —  cascade initialized and synchronized")
+        self._log_arch(pivot_note="idle", prod_note="idle", dr_note="idle")
+        self.log.info("=" * 60)
 
     # =====================================================================
     # ACTION 'resume' -> Verify pivot is idle then fan-out to PROD + DR
@@ -724,21 +728,19 @@ class MigrationOrchestrator:
         created_at      = job_data.get("created_at", "unknown")
         status          = job_data.get("status", "unknown")
 
-        self.log.info("######## ACTION 'resume': job %s ########", job_id)
-        self.log.info("Original job created at: %s | status: %s", created_at, status)
-        self.log.info("Pivot: %s | PROD dest: %s | DR dest: %s",
-                      pivot_dest_path, dest_dest_path, dr_dest_path)
+        script = os.path.basename(sys.argv[0])
+        self.log.info("=" * 60)
+        self.log.info("  ACTION: resume  |  Job %s  [%s]", job_id, status)
+        self.log.info("  Created: %s", created_at)
+        self.log.info("=" * 60)
 
         if status == "completed":
-            self.log.info("Job %s is already marked as completed. Nothing to do.", job_id)
+            self._log_arch(pivot_note="idle", prod_note="idle", dr_note="idle")
+            self.log.info("  Job %s already completed. Nothing to do.", job_id)
             return
 
         if status == "dest_initialized":
-            self.log.info("PROD and DR replication were already initialized for this job.")
-            self.log.info("Use check-status to monitor progress:")
-            self.log.info("  python3 %s --action check-status --job-id %s",
-                          os.path.basename(sys.argv[0]), job_id)
-            # Delegate to check-status so the user also gets the live ONTAP state.
+            self.log.info("PROD and DR replication already initialized. Live state:")
             self.action_check_status(job_data)
             return
 
@@ -746,47 +748,50 @@ class MigrationOrchestrator:
         r = self.x.run(self.pivot_cluster,
                        f"snapmirror show -destination-path {pivot_dest_path} -instance")
         sm_info = parse_instance(r.stdout)
-        state  = (get_instance_field(sm_info, "Mirror State",
-                                     "Relationship Status", "state") or "").lower()
+        state       = (get_instance_field(sm_info, "Mirror State",
+                                          "Relationship Status", "state") or "").lower()
         transferred = get_instance_field(sm_info, "Last Transfer Size",
                                          "Total Transfer Bytes") or "unknown"
-        self.log.info("Pivot replication status: '%s' | last transfer size: %s",
-                      state or "unknown", transferred)
+
+        self._log_table(
+            ["Role", "Cluster", "Path", "State", "Transferred"],
+            [["PIVOT", self.pivot_cluster, pivot_dest_path,
+              state or "unknown", transferred]],
+        )
 
         if state not in ("snapmirrored", "idle"):
-            self.log.info("Pivot replication is not yet complete (state='%s').",
+            self.log.info("  Pivot not yet idle (state='%s'). Check again later:",
                           state or "unknown")
-            self.log.info("Re-run this command later to check again:")
-            self.log.info("  python3 %s --action resume --job-id %s",
-                          os.path.basename(sys.argv[0]), job_id)
+            self.log.info("  python3 %s --action resume --job-id %s", script, job_id)
             return
 
-        # --- Pivot is idle: ask the user whether to proceed ---------------
-        self.log.info("Pivot replication is complete.")
+        # --- Pivot is idle: confirm then fan-out to PROD + DR -------------
+        self.log.info("  Pivot replication complete.")
         try:
-            answer = input("Proceed with destination replication? [y/N] ").strip().lower()
+            answer = input("  Proceed with destination replication? [y/N] ").strip().lower()
         except EOFError:
             answer = "n"
 
         if answer != "y":
-            self.log.info("User chose not to proceed. Exiting. Job ID: %s", job_id)
+            self.log.info("  Not proceeding. Job ID: %s", job_id)
             return
 
         # --- Initialize PROD and DR simultaneously then EXIT immediately ---
-        # Both initialize are launched back-to-back (Y fan-out from pivot).
-        # We never block on long transfers: use check-status to monitor.
         self._snapmirror_initialize(run_on=self.dest_cluster,
                                     dest_path=dest_dest_path)
         self._snapmirror_initialize(run_on=self.dr_cluster,
                                     dest_path=dr_dest_path)
         job_data["status"] = "dest_initialized"
         _save_job(job_id, job_data)
-        self.log.info("PROD and DR SnapMirror initializes launched. Script exiting.")
-        self.log.info("=" * 64)
-        self.log.info("Check replication progress at any time:")
-        self.log.info("  python3 %s --action check-status --job-id %s",
-                      os.path.basename(sys.argv[0]), job_id)
-        self.log.info("=" * 64)
+
+        self.log.info("=" * 60)
+        self.log.info("  PROD and DR SnapMirror initializes launched.")
+        self._log_arch(pivot_note="idle",
+                       prod_note=">>> initializing", dr_note=">>> initializing")
+        self.log.info("  Job ID : %s", job_id)
+        self.log.info("  Monitor: python3 %s --action check-status --job-id %s",
+                      script, job_id)
+        self.log.info("=" * 60)
 
     # =====================================================================
     # ACTION 'check-status' -> Report progress for pivot, PROD, and DR
@@ -799,69 +804,75 @@ class MigrationOrchestrator:
         status          = job_data.get("status", "unknown")
         script          = os.path.basename(sys.argv[0])
 
-        self.log.info("######## ACTION 'check-status': job %s ########", job_id)
-        self.log.info("Created at: %s | Current status: %s", created_at, status)
+        self.log.info("=" * 60)
+        self.log.info("  ACTION: check-status  |  Job %s", job_id)
+        self.log.info("  Created: %s  |  Status: %s", created_at, status)
+        self.log.info("=" * 60)
 
         if status == "completed":
-            self.log.info("Job %s is already completed. Nothing to do.", job_id)
+            self._log_arch(pivot_note="idle", prod_note="idle", dr_note="idle")
+            self.log.info("  Job %s already completed.", job_id)
             return
 
         if status in ("started", "pivot_initialized"):
-            # Check pivot replication.
-            self.log.info("Checking pivot replication (%s) ...", pivot_dest_path)
             r = self.x.run(self.pivot_cluster,
                            f"snapmirror show -destination-path {pivot_dest_path} -instance")
             sm_info     = parse_instance(r.stdout)
             state       = (get_instance_field(sm_info, "Mirror State",
                                               "Relationship Status", "state") or "").lower()
             transferred = get_instance_field(sm_info, "Last Transfer Size",
-                                             "Total Transfer Bytes") or "unknown"
+                                             "Total Transfer Bytes") or "-"
             progress    = get_instance_field(sm_info, "Last Transfer Duration",
-                                             "Transfer Progress") or "unknown"
-            self.log.info("Pivot state: '%s' | transferred: %s | progress: %s",
-                          state or "unknown", transferred, progress)
+                                             "Transfer Progress") or "-"
+
+            self._log_table(
+                ["Role", "Cluster", "Path", "State", "Transferred", "Progress"],
+                [["PIVOT", self.pivot_cluster, pivot_dest_path,
+                  state or "unknown", transferred, progress]],
+            )
 
             if state in ("snapmirrored", "idle"):
-                self.log.info("Pivot replication is complete.")
-                self.log.info("Run the following command to start destination replication:")
+                self.log.info("  Pivot idle. Start PROD + DR:")
                 self.log.info("  python3 %s --action resume --job-id %s", script, job_id)
             else:
-                self.log.info("Pivot replication still in progress. Check again later:")
+                self.log.info("  Pivot still in progress. Check again later:")
                 self.log.info("  python3 %s --action check-status --job-id %s", script, job_id)
             return
 
         if status == "dest_initialized":
             dr_dest_path = job_data.get("dr_dest_path", "")
+            rows: List[List[str]] = []
 
-            # --- Check PROD destination ---
-            self.log.info("Checking PROD destination replication (%s) ...", dest_dest_path)
-            r_prod = self.x.run(self.dest_cluster,
-                                f"snapmirror show -destination-path {dest_dest_path} -instance")
-            prod_info = parse_instance(r_prod.stdout)
+            r_prod     = self.x.run(self.dest_cluster,
+                                    f"snapmirror show -destination-path {dest_dest_path} -instance")
+            prod_info  = parse_instance(r_prod.stdout)
             prod_state = (get_instance_field(prod_info, "Mirror State",
                                              "Relationship Status", "state") or "").lower()
             prod_xfer  = get_instance_field(prod_info, "Last Transfer Size",
-                                            "Total Transfer Bytes") or "unknown"
+                                            "Total Transfer Bytes") or "-"
             prod_prog  = get_instance_field(prod_info, "Last Transfer Duration",
-                                            "Transfer Progress") or "unknown"
-            self.log.info("PROD state: '%s' | transferred: %s | progress: %s",
-                          prod_state or "unknown", prod_xfer, prod_prog)
+                                            "Transfer Progress") or "-"
+            rows.append(["PROD", self.dest_cluster, dest_dest_path,
+                         prod_state or "unknown", prod_xfer, prod_prog])
 
-            # --- Check DR destination ---
             dr_state = "unknown"
             if dr_dest_path:
-                self.log.info("Checking DR destination replication (%s) ...", dr_dest_path)
-                r_dr = self.x.run(self.dr_cluster,
-                                  f"snapmirror show -destination-path {dr_dest_path} -instance")
+                r_dr     = self.x.run(self.dr_cluster,
+                                      f"snapmirror show -destination-path {dr_dest_path} -instance")
                 dr_info  = parse_instance(r_dr.stdout)
                 dr_state = (get_instance_field(dr_info, "Mirror State",
                                                "Relationship Status", "state") or "").lower()
                 dr_xfer  = get_instance_field(dr_info, "Last Transfer Size",
-                                              "Total Transfer Bytes") or "unknown"
+                                              "Total Transfer Bytes") or "-"
                 dr_prog  = get_instance_field(dr_info, "Last Transfer Duration",
-                                              "Transfer Progress") or "unknown"
-                self.log.info("DR state: '%s' | transferred: %s | progress: %s",
-                              dr_state or "unknown", dr_xfer, dr_prog)
+                                              "Transfer Progress") or "-"
+                rows.append(["DR", self.dr_cluster, dr_dest_path,
+                             dr_state or "unknown", dr_xfer, dr_prog])
+
+            self._log_table(
+                ["Role", "Cluster", "Path", "State", "Transferred", "Progress"],
+                rows,
+            )
 
             prod_done = prod_state in ("snapmirrored", "idle")
             dr_done   = (not dr_dest_path) or dr_state in ("snapmirrored", "idle")
@@ -869,16 +880,17 @@ class MigrationOrchestrator:
             if prod_done and dr_done:
                 job_data["status"] = "completed"
                 _save_job(job_id, job_data)
-                self.log.info("Both PROD and DR replication complete. Job %s marked as completed.", job_id)
+                self._log_arch(pivot_note="idle", prod_note="idle", dr_note="idle")
+                self.log.info("  Both PROD and DR complete. Job %s marked as completed.", job_id)
             else:
                 pending = []
                 if not prod_done:
                     pending.append(f"PROD ({prod_state or 'unknown'})")
                 if not dr_done:
                     pending.append(f"DR ({dr_state or 'unknown'})")
-                self.log.info("Replication still in progress: %s. Check again later:",
-                              ", ".join(pending))
-                self.log.info("  python3 %s --action check-status --job-id %s", script, job_id)
+                self.log.info("  Pending: %s", ", ".join(pending))
+                self.log.info("  Check again: python3 %s --action check-status --job-id %s",
+                              script, job_id)
             return
 
         self.log.warning("Unrecognised job status '%s'. Manual inspection required.", status)
@@ -1004,17 +1016,17 @@ class MigrationOrchestrator:
         job_data["status"] = "pivot_initialized"
         _save_job(job_id, job_data)
 
-        self.log.info("Pivot SnapMirror initialize launched.")
-        self.log.info("=" * 64)
-        self.log.info("KEEP YOUR JOB ID: %s", job_id)
+        self.log.info("=" * 60)
+        self.log.info("  Pivot SnapMirror initialize launched  [retry]")
+        self._log_arch(pivot_note=">>> initializing ...",
+                       prod_note="(waiting)", dr_note="(waiting)")
+        self.log.info("  Job ID : %s", job_id)
         if create_mode == "pivot-only":
-            self.log.info("Resume command when pivot is idle:")
-            self.log.info("  python3 %s --action resume --job-id %s", script, job_id)
+            self.log.info("  Resume : python3 %s --action resume --job-id %s", script, job_id)
         else:
-            self.log.info("Check pivot progress, then resume when ready:")
-            self.log.info("  python3 %s --action check-status --job-id %s", script, job_id)
-            self.log.info("  python3 %s --action resume      --job-id %s", script, job_id)
-        self.log.info("=" * 64)
+            self.log.info("  Monitor: python3 %s --action check-status --job-id %s", script, job_id)
+            self.log.info("  Resume : python3 %s --action resume      --job-id %s", script, job_id)
+        self.log.info("=" * 60)
 
     # =====================================================================
     # ACTION 2 : 'clone' -> Snapshot propagation, FlexClone, resync, vol move
@@ -1168,11 +1180,17 @@ class MigrationOrchestrator:
         # Exit immediately — volume moves run asynchronously in ONTAP.
         self.log.info("=" * 60)
         self.log.info("  Volume moves launched for %d clone(s). Script exiting.", len(qtrees))
+        self.log.info("")
+        self._log_table(
+            ["Clone volume", "PROD aggregate", "DR aggregate"],
+            [[f"v_{q}", prod_best_aggr, dr_best_aggr] for q in qtrees],
+        )
+        self.log.info("")
         self.log.info("  Monitor progress:")
-        self.log.info("    PROD (%s):  volume move show -vserver %s",
-                      self.dest_cluster, self.dest_svm)
-        self.log.info("    DR   (%s):  volume move show -vserver %s",
-                      self.dr_cluster, self.dr_svm)
+        self.log.info("    PROD (%s):", self.dest_cluster)
+        self.log.info("      volume move show -vserver %s", self.dest_svm)
+        self.log.info("    DR   (%s):", self.dr_cluster)
+        self.log.info("      volume move show -vserver %s", self.dr_svm)
         self.log.info("=" * 60)
 
     # =====================================================================
@@ -1214,6 +1232,69 @@ class MigrationOrchestrator:
     # =====================================================================
     # REUSABLE ONTAP PRIMITIVES
     # =====================================================================
+    # ---- Output formatting helpers --------------------------------------- #
+
+    @staticmethod
+    def _table_lines(headers: List[str], rows: List[List[str]]) -> List[str]:
+        """Return lines of a plain ASCII table (+--+--+) from headers and rows."""
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                if i < len(widths):
+                    widths[i] = max(widths[i], len(str(cell)))
+        sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+        def fmt(cells: List[str]) -> str:
+            parts = [f" {str(cells[i]).ljust(widths[i])} " if i < len(cells)
+                     else " " * (widths[i] + 2)
+                     for i in range(len(widths))]
+            return "|" + "|".join(parts) + "|"
+        lines = [sep, fmt(headers), sep]
+        for row in rows:
+            lines.append(fmt(row))
+        lines.append(sep)
+        return lines
+
+    def _log_table(self, headers: List[str], rows: List[List[str]]) -> None:
+        """Log an ASCII table one line at a time at INFO level."""
+        for line in self._table_lines(headers, rows):
+            self.log.info(line)
+
+    def _log_arch(self, pivot_note: str = "", prod_note: str = "",
+                  dr_note: str = "") -> None:
+        """Log the Y-topology cascade diagram with optional per-leg status notes.
+
+        Example output:
+            [ SOURCE ]  src_cluster
+                 |
+                 |  idle
+                 v
+            [ PIVOT  ]  pivot_cluster
+                /  \\
+               /    \\
+              v      v
+          [ PROD  ]    [ DR    ]
+          dest_cluster   dr_cluster
+          idle           idle
+        """
+        prod_w = max(len(self.dest_cluster), len(prod_note), 14)
+        self.log.info("")
+        self.log.info("  [ SOURCE ]  %s", self.src_cluster)
+        self.log.info("       |")
+        if pivot_note:
+            self.log.info("       |  %s", pivot_note)
+        self.log.info("       v")
+        self.log.info("  [ PIVOT  ]  %s", self.pivot_cluster)
+        self.log.info("      /  \\")
+        self.log.info("     /    \\")
+        self.log.info("    v      v")
+        self.log.info("  [ PROD  ]    [ DR    ]")
+        self.log.info("  %-*s  %s", prod_w, self.dest_cluster, self.dr_cluster)
+        if prod_note or dr_note:
+            self.log.info("  %-*s  %s", prod_w, prod_note, dr_note)
+        self.log.info("")
+
+    # ---- Volume / aggregate info ----------------------------------------- #
+
     def _get_volume_info(self, cluster: str, svm: str, volume: str) -> dict:
         """Retrieve ALL volume attributes in a single ONTAP call.
 
