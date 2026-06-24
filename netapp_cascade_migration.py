@@ -1017,12 +1017,27 @@ class MigrationOrchestrator:
         self.log.info("=" * 64)
 
     # =====================================================================
-    # ACTION 2 : 'clone' -> Qtree split & target volume creation
+    # ACTION 2 : 'clone' -> Snapshot propagation, FlexClone, resync, vol move
     # =====================================================================
     def action_clone(self):
-        self.log.info("######## ACTION 'clone': Qtree split ########")
+        """Clone workflow (7 phases):
 
-        # --- Step 1: determine the list of Qtrees to process --------------
+        1. Determine qtree list.
+        2. Create a single shared snapshot on the source.
+        3. Propagate through cascade: update Pivot → wait idle, then update
+           PROD + DR simultaneously → wait both idle.
+        4. Verify snapshot arrived on PROD and DR DP volumes.
+        5. Create FlexClone v_<qtree> on PROD and DR for every qtree.
+        6. Create SnapMirror relationships (PROD clone → DR clone) and resync.
+        7. Wait all resync operations idle, find best aggregates, launch
+           volume move on PROD and DR for every clone, then EXIT immediately.
+        """
+        self.log.info("######## ACTION 'clone': snapshot propagation + FlexClone + vol move ########")
+        script = os.path.basename(sys.argv[0])
+
+        # ------------------------------------------------------------------
+        # Phase 1: Qtree list
+        # ------------------------------------------------------------------
         if self.a.qtrees.strip().lower() == "all":
             self.log.info("Mode 'all': discovering Qtrees from source volume.")
             qtrees = self._list_source_qtrees()
@@ -1032,68 +1047,137 @@ class MigrationOrchestrator:
         if not qtrees:
             raise OntapCliError(self.src_cluster, "volume qtree show", 0, "", "",
                                 reason="no Qtree to process")
-        self.log.info("Qtrees to migrate (%d): %s", len(qtrees), ", ".join(qtrees))
+        self.log.info("Qtrees to clone (%d): %s", len(qtrees), ", ".join(qtrees))
 
-        # The full Qtree list is needed for the split operation (deleting all
-        # other Qtrees from each cloned volume).
-        all_qtrees = self._list_source_qtrees()
+        pivot_dest_path = self._path(self.pivot_svm, self.volume)
+        prod_dest_path  = self._path(self.dest_svm,  self.volume)
+        dr_dest_path    = self._path(self.dr_svm,    self.volume)
 
-        # --- Step 2: process each Qtree individually ----------------------
-        for qtree in qtrees:
-            self._clone_single_qtree(qtree, all_qtrees)
-
-        self.log.info("ACTION 'clone' complete: %d target volume(s) created.",
-                      len(qtrees))
-
-    def _clone_single_qtree(self, qtree: str, all_qtrees: List[str]):
-        """Process a single Qtree: snapshot, cascade update, verify, clone, split."""
-        self.log.info("---- Processing Qtree '%s' ----", qtree)
-
-        # Timestamped snapshot name for traceability and uniqueness.
+        # ------------------------------------------------------------------
+        # Phase 2: Create a single shared snapshot on the source
+        # ------------------------------------------------------------------
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        snap_name = f"migr_{qtree}_{stamp}"
-        clone_volume = f"v_{qtree}"  # naming rule: v_[qtree_name]
-
-        # a. Create a snapshot on the SOURCE cluster.
+        snap_name = f"clone_migr_{stamp}"
+        self.log.info("--- Phase 2: create snapshot '%s' on source ---", snap_name)
         self.x.run(self.src_cluster,
                    f"volume snapshot create -vserver {self.src_svm} "
                    f"-volume {self.volume} -snapshot {snap_name}")
+        self.log.info("Snapshot '%s' created on source.", snap_name)
 
-        # b. Propagate the snapshot through the cascade (Source->Pivot, then Pivot->Dest).
+        # ------------------------------------------------------------------
+        # Phase 3: Propagate through the cascade
+        # ------------------------------------------------------------------
+        self.log.info("--- Phase 3a: snapmirror update on pivot ---")
         self.x.run(self.pivot_cluster,
-                   f"snapmirror update "
-                   f"-destination-path {self._path(self.pivot_svm, self.volume)}")
-        self._wait_snapmirror_idle(self.pivot_cluster,
-                                   self._path(self.pivot_svm, self.volume))
+                   f"snapmirror update -destination-path {pivot_dest_path}")
+        self._wait_snapmirror_idle(self.pivot_cluster, pivot_dest_path)
+        self.log.info("Pivot transfer complete.")
 
+        self.log.info("--- Phase 3b: snapmirror update on PROD + DR simultaneously ---")
         self.x.run(self.dest_cluster,
-                   f"snapmirror update "
-                   f"-destination-path {self._path(self.dest_svm, self.volume)}")
-        self._wait_snapmirror_idle(self.dest_cluster,
-                                   self._path(self.dest_svm, self.volume))
+                   f"snapmirror update -destination-path {prod_dest_path}")
+        self.x.run(self.dr_cluster,
+                   f"snapmirror update -destination-path {dr_dest_path}")
+        self._wait_snapmirror_idle(self.dest_cluster, prod_dest_path)
+        self._wait_snapmirror_idle(self.dr_cluster,   dr_dest_path)
+        self.log.info("PROD and DR transfers complete.")
 
-        # c. Verify the snapshot has reached the DESTINATION.
+        # ------------------------------------------------------------------
+        # Phase 4: Verify snapshot arrived on PROD and DR
+        # ------------------------------------------------------------------
+        self.log.info("--- Phase 4: verify snapshot on PROD and DR ---")
         self._verify_snapshot_present(self.dest_cluster, self.dest_svm,
                                       self.volume, snap_name)
+        self._verify_snapshot_present(self.dr_cluster,   self.dr_svm,
+                                      self.volume, snap_name)
 
-        # d. Create the FlexClone on the DESTINATION targeting this exact snapshot.
-        self.x.run(self.dest_cluster,
-                   f"volume clone create -vserver {self.dest_svm} "
-                   f"-flexclone {clone_volume} -parent-volume {self.volume} "
-                   f"-parent-snapshot {snap_name} -junction-active true")
-        self.log.info("FlexClone '%s' created from snapshot '%s'.",
-                      clone_volume, snap_name)
-
-        # e. SPLIT operation: delete all OTHER Qtrees from the clone so that
-        #    only the target Qtree remains (1 Volume = 1 Qtree rule).
-        others = [q for q in all_qtrees if q != qtree]
-        for other in others:
+        # ------------------------------------------------------------------
+        # Phase 5: Create FlexClone v_<qtree> on PROD and DR
+        # ------------------------------------------------------------------
+        self.log.info("--- Phase 5: create FlexClone volumes on PROD and DR ---")
+        for qtree in qtrees:
+            clone_vol = f"v_{qtree}"
+            self.log.info("Creating FlexClone '%s' on PROD (%s).", clone_vol, self.dest_cluster)
             self.x.run(self.dest_cluster,
-                       f"volume qtree delete -vserver {self.dest_svm} "
-                       f"-volume {clone_volume} -qtree {other} -force true")
-            self.log.info("Qtree '%s' deleted from clone '%s'.", other, clone_volume)
+                       f"volume clone create -vserver {self.dest_svm} "
+                       f"-flexclone {clone_vol} -parent-volume {self.volume} "
+                       f"-parent-snapshot {snap_name} -junction-active true")
+            self.log.info("Creating FlexClone '%s' on DR (%s).", clone_vol, self.dr_cluster)
+            self.x.run(self.dr_cluster,
+                       f"volume clone create -vserver {self.dr_svm} "
+                       f"-flexclone {clone_vol} -parent-volume {self.volume} "
+                       f"-parent-snapshot {snap_name} -junction-active true")
+        self.log.info("All FlexClone volumes created.")
 
-        self.log.info("Qtree '%s' isolated in volume '%s'.", qtree, clone_volume)
+        # ------------------------------------------------------------------
+        # Phase 6: SnapMirror PROD clone -> DR clone + resync
+        # ------------------------------------------------------------------
+        self.log.info("--- Phase 6: create SnapMirror relationships between clones and resync ---")
+        for qtree in qtrees:
+            clone_vol        = f"v_{qtree}"
+            prod_clone_path  = self._path(self.dest_svm, clone_vol)
+            dr_clone_path    = self._path(self.dr_svm,   clone_vol)
+
+            self._snapmirror_create(run_on=self.dr_cluster,
+                                    source_path=prod_clone_path,
+                                    dest_path=dr_clone_path)
+            self.log.info("SnapMirror relationship created: %s -> %s.",
+                          prod_clone_path, dr_clone_path)
+
+            self.log.info("Resyncing %s -> %s ...", prod_clone_path, dr_clone_path)
+            self.x.run(self.dr_cluster,
+                       f"snapmirror resync -destination-path {dr_clone_path}")
+
+        # ------------------------------------------------------------------
+        # Phase 7: Wait resync idle, find best aggregates, launch vol moves
+        # ------------------------------------------------------------------
+        self.log.info("--- Phase 7: wait resync idle, then launch volume moves ---")
+        for qtree in qtrees:
+            clone_vol     = f"v_{qtree}"
+            dr_clone_path = self._path(self.dr_svm, clone_vol)
+            self._wait_snapmirror_idle(self.dr_cluster, dr_clone_path)
+            self.log.info("Resync idle for clone '%s'.", clone_vol)
+
+        # Determine best aggregate on PROD (exclude parent DP volume's aggregate).
+        prod_vol_info  = self._get_volume_info(self.dest_cluster, self.dest_svm, self.volume)
+        prod_parent_aggr = get_instance_field(prod_vol_info, "Aggregate", "aggregate") or ""
+        prod_best_aggr   = self._find_best_aggregate(self.dest_cluster,
+                                                      exclude_aggr=prod_parent_aggr or None)
+        self.log.info("Best aggregate on PROD: %s (excluding parent: %s).",
+                      prod_best_aggr, prod_parent_aggr or "none")
+
+        # Determine best aggregate on DR (exclude parent DP volume's aggregate).
+        dr_vol_info    = self._get_volume_info(self.dr_cluster, self.dr_svm, self.volume)
+        dr_parent_aggr = get_instance_field(dr_vol_info, "Aggregate", "aggregate") or ""
+        dr_best_aggr   = self._find_best_aggregate(self.dr_cluster,
+                                                    exclude_aggr=dr_parent_aggr or None)
+        self.log.info("Best aggregate on DR: %s (excluding parent: %s).",
+                      dr_best_aggr, dr_parent_aggr or "none")
+
+        # Launch volume moves (fire and forget — do NOT wait).
+        for qtree in qtrees:
+            clone_vol = f"v_{qtree}"
+            self.log.info("Launching volume move for '%s' on PROD -> aggr %s.",
+                          clone_vol, prod_best_aggr)
+            self.x.run(self.dest_cluster,
+                       f"volume move start -vserver {self.dest_svm} "
+                       f"-volume {clone_vol} -destination-aggregate {prod_best_aggr}")
+            self.log.info("Launching volume move for '%s' on DR -> aggr %s.",
+                          clone_vol, dr_best_aggr)
+            self.x.run(self.dr_cluster,
+                       f"volume move start -vserver {self.dr_svm} "
+                       f"-volume {clone_vol} -destination-aggregate {dr_best_aggr}")
+
+        # Exit immediately — volume moves run asynchronously in ONTAP.
+        self.log.info("=" * 64)
+        self.log.info("Volume moves launched for %d clone(s) on PROD and DR.", len(qtrees))
+        self.log.info("Monitor move progress with:")
+        self.log.info("  On PROD (%s):", self.dest_cluster)
+        self.log.info("    volume move show -vserver %s", self.dest_svm)
+        self.log.info("  On DR (%s):", self.dr_cluster)
+        self.log.info("    volume move show -vserver %s", self.dr_svm)
+        self.log.info("ACTION 'clone' complete — script exiting now.")
+        self.log.info("=" * 64)
 
     # =====================================================================
     # ACTION 3 : 'cleanup' -> Source access cut-off
@@ -1309,6 +1393,40 @@ class MigrationOrchestrator:
                 r.stdout, r.stderr,
                 reason=f"snapshot '{snapshot}' not found on destination")
         self.log.info("Snapshot '%s' confirmed present on %s.", snapshot, cluster)
+
+    def _find_best_aggregate(self, cluster: str,
+                             exclude_aggr: Optional[str] = None) -> str:
+        """Return the aggregate name with the most available space on *cluster*.
+
+        Parses all aggregate instances in one call and selects the one with the
+        greatest available capacity, optionally excluding *exclude_aggr* (used to
+        prevent moving a clone back onto the same aggregate as its parent DP volume).
+        """
+        if self.x.dry_run:
+            self.log.info("[DRY-RUN] Best aggregate on %s assumed 'aggr_dryrun'.", cluster)
+            return "aggr_dryrun"
+        r = self.x.run(cluster, "storage aggregate show -instance")
+        best_name: Optional[str] = None
+        best_bytes: int = -1
+        for block in re.split(r"\n\s*\n", r.stdout):
+            fields = parse_instance(block)
+            name = get_instance_field(fields, "Aggregate", "aggregate")
+            if not name:
+                continue
+            if exclude_aggr and name.lower() == exclude_aggr.lower():
+                continue
+            avail_str  = get_instance_field(fields, "Available Size", "availsize")
+            avail_bytes = parse_size_to_bytes(avail_str) or 0
+            if avail_bytes > best_bytes:
+                best_bytes = avail_bytes
+                best_name  = name
+        if not best_name:
+            raise OntapCliError(
+                cluster, "storage aggregate show", 0, r.stdout, r.stderr,
+                reason=f"no suitable aggregate found (excluded: {exclude_aggr})")
+        self.log.info("Best aggregate on %s: '%s' (%d bytes available).",
+                      cluster, best_name, best_bytes)
+        return best_name
 
     def _find_cifs_shares_for_qtree(self, qtree: str) -> List[str]:
         """Identify CIFS shares pointing to the Qtree (matched by path)."""
