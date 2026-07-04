@@ -1047,7 +1047,7 @@ class MigrationOrchestrator:
     # =====================================================================
     # ACTION 2 : 'clone' -> Snapshot propagation, FlexClone, resync, vol move
     # =====================================================================
-    def action_clone(self):
+    def action_clone(self, job_data: Optional[dict] = None):
         """Clone workflow (7 phases):
 
         1. Determine qtree list.
@@ -1055,10 +1055,14 @@ class MigrationOrchestrator:
         3. Propagate through cascade: update Pivot → wait idle, then update
            PROD + DR simultaneously → wait both idle.
         4. Verify snapshot arrived on PROD and DR DP volumes.
-        5. Create FlexClone v_<qtree> on PROD and DR for every qtree.
+        5. Create FlexClone v_<qtree>_<uid> on PROD and DR for every qtree
+           (uid = unique 6-hex id per run, avoids any name collision).
         6. Create SnapMirror relationships (PROD clone → DR clone) and resync.
         7. Wait all resync operations idle, find best aggregates, launch
            volume move on PROD and DR for every clone, then EXIT immediately.
+
+        When run with --job-id, the uid and clone volume names are saved into
+        the job file so that --action acl can resolve the exact paths later.
         """
         self.log.info("=" * 60)
         self.log.info("  ACTION: clone")
@@ -1082,6 +1086,10 @@ class MigrationOrchestrator:
         # ------------------------------------------------------------------
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         snap_name = f"clone_migr_{stamp}"
+        # Unique id appended to every clone name: v_<qtree>_<uid>.
+        clone_uid = uuid.uuid4().hex[:6]
+        self.log.info("Clone UID for this run: %s  (volumes will be named v_<qtree>_%s)",
+                      clone_uid, clone_uid)
         self.log.info(">> [1/7]  Creating snapshot '%s' on source", snap_name)
         self.x.run(self.src_cluster,
                    f"volume snapshot create -vserver {self.src_svm} "
@@ -1117,11 +1125,11 @@ class MigrationOrchestrator:
         self.log.info("         Snapshot confirmed on both destinations.")
 
         # ------------------------------------------------------------------
-        # Phase 5: Create FlexClone v_<qtree> on PROD and DR
+        # Phase 5: Create FlexClone v_<qtree>_<uid> on PROD and DR
         # ------------------------------------------------------------------
         self.log.info(">> [5/7]  Creating FlexClone volumes on PROD and DR")
         for qtree in qtrees:
-            clone_vol = f"v_{qtree}"
+            clone_vol = f"v_{qtree}_{clone_uid}"
             self.x.run(self.dest_cluster,
                        f"volume clone create -vserver {self.dest_svm} "
                        f"-flexclone {clone_vol} -parent-volume {self.volume} "
@@ -1137,7 +1145,7 @@ class MigrationOrchestrator:
         # ------------------------------------------------------------------
         self.log.info(">> [6/7]  SnapMirror (clone PROD -> clone DR) + resync")
         for qtree in qtrees:
-            clone_vol        = f"v_{qtree}"
+            clone_vol        = f"v_{qtree}_{clone_uid}"
             prod_clone_path  = self._path(self.dest_svm, clone_vol)
             dr_clone_path    = self._path(self.dr_svm,   clone_vol)
 
@@ -1153,7 +1161,7 @@ class MigrationOrchestrator:
         # ------------------------------------------------------------------
         self.log.info(">> [7/7]  Waiting for resync, selecting aggregates, launching moves")
         for qtree in qtrees:
-            clone_vol     = f"v_{qtree}"
+            clone_vol     = f"v_{qtree}_{clone_uid}"
             dr_clone_path = self._path(self.dr_svm, clone_vol)
             self._wait_snapmirror_idle(self.dr_cluster, dr_clone_path)
             self.log.info("         '%s'  resync complete.", clone_vol)
@@ -1176,7 +1184,7 @@ class MigrationOrchestrator:
 
         # Launch volume moves (fire and forget — do NOT wait).
         for qtree in qtrees:
-            clone_vol = f"v_{qtree}"
+            clone_vol = f"v_{qtree}_{clone_uid}"
             self.x.run(self.dest_cluster,
                        f"volume move start -vserver {self.dest_svm} "
                        f"-volume {clone_vol} -destination-aggregate {prod_best_aggr}")
@@ -1186,13 +1194,21 @@ class MigrationOrchestrator:
             self.log.info("         '%s'  move launched  PROD -> %s  /  DR -> %s.",
                           clone_vol, prod_best_aggr, dr_best_aggr)
 
+        # Persist the uid and clone names so --action acl can resolve the
+        # exact paths later from the job file alone.
+        if job_data is not None:
+            job_data["clone_uid"]     = clone_uid
+            job_data["clone_volumes"] = [f"v_{q}_{clone_uid}" for q in qtrees]
+            _save_job(job_data["job_id"], job_data)
+
         # Exit immediately — volume moves run asynchronously in ONTAP.
         self.log.info("=" * 60)
         self.log.info("  Volume moves launched for %d clone(s). Script exiting.", len(qtrees))
+        self.log.info("  Clone UID: %s", clone_uid)
         self.log.info("")
         self._log_table(
             ["Clone volume", "PROD aggregate", "DR aggregate"],
-            [[f"v_{q}", prod_best_aggr, dr_best_aggr] for q in qtrees],
+            [[f"v_{q}_{clone_uid}", prod_best_aggr, dr_best_aggr] for q in qtrees],
         )
         self.log.info("")
         self.log.info("  Monitor progress:")
@@ -1205,7 +1221,7 @@ class MigrationOrchestrator:
     # =====================================================================
     # ACTION 'test' -> Thin FlexClones for client-side validation
     # =====================================================================
-    def action_test(self):
+    def action_test(self, job_data: Optional[dict] = None):
         """Create THIN FlexClones on PROD and DR for client testing.
 
         Same snapshot-propagation + FlexClone logic as action_clone, but the
@@ -1213,13 +1229,15 @@ class MigrationOrchestrator:
           - NO SnapMirror relationship between the clones,
           - NO volume move (no split from the parent DP volume).
 
-        The clones stay attached to their parent volume and share its blocks,
-        so they consume no additional disk space. The client can then validate
-        file access, permissions and every related mechanism before asking for
-        the real 'clone' action.
+        Clones are named v_<qtree>_<uid> (unique 6-hex id per run). They stay
+        attached to their parent volume and share its blocks, so they consume
+        no additional disk space. The client can then validate file access,
+        permissions and every related mechanism before asking for the real
+        'clone' action.
 
-        The test clones MUST be deleted before running --action clone (same
-        v_<qtree> names): the exit message prints the delete commands.
+        The uid and clone names are saved into the job file so that
+        --action acl can target the test clones. The exit message prints the
+        delete commands to run once the tests are done.
         """
         self.log.info("=" * 60)
         self.log.info("  ACTION: test  (thin FlexClones — no split, no move)")
@@ -1242,6 +1260,10 @@ class MigrationOrchestrator:
         # ------------------------------------------------------------------
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         snap_name = f"test_migr_{stamp}"
+        # Unique id appended to every clone name: v_<qtree>_<uid>.
+        clone_uid = uuid.uuid4().hex[:6]
+        self.log.info("Clone UID for this run: %s  (volumes will be named v_<qtree>_%s)",
+                      clone_uid, clone_uid)
         self.log.info(">> [1/4]  Creating snapshot '%s' on source", snap_name)
         self.x.run(self.src_cluster,
                    f"volume snapshot create -vserver {self.src_svm} "
@@ -1275,7 +1297,7 @@ class MigrationOrchestrator:
         # ------------------------------------------------------------------
         self.log.info(">> [4/4]  Creating thin FlexClone volumes on PROD and DR")
         for qtree in qtrees:
-            clone_vol = f"v_{qtree}"
+            clone_vol = f"v_{qtree}_{clone_uid}"
             self.x.run(self.dest_cluster,
                        f"volume clone create -vserver {self.dest_svm} "
                        f"-flexclone {clone_vol} -parent-volume {self.volume} "
@@ -1286,32 +1308,39 @@ class MigrationOrchestrator:
                        f"-parent-snapshot {snap_name} -junction-active true")
             self.log.info("         '%s'  created on PROD and DR.", clone_vol)
 
+        # Persist the uid and clone names so --action acl can target the
+        # test clones from the job file alone.
+        if job_data is not None:
+            job_data["clone_uid"]     = clone_uid
+            job_data["clone_volumes"] = [f"v_{q}_{clone_uid}" for q in qtrees]
+            _save_job(job_data["job_id"], job_data)
+
         # No split, no move: exit here so no extra disk space is consumed.
         self.log.info("=" * 60)
         self.log.info("  %d test clone(s) ready — THIN clones, no disk space consumed.",
                       len(qtrees))
+        self.log.info("  Clone UID: %s", clone_uid)
         self.log.info("")
         self._log_table(
             ["Test clone", "PROD (%s)" % self.dest_cluster, "DR (%s)" % self.dr_cluster],
-            [[f"v_{q}", "created", "created"] for q in qtrees],
+            [[f"v_{q}_{clone_uid}", "created", "created"] for q in qtrees],
         )
         self.log.info("")
         self.log.info("  The client can now validate access and permissions.")
-        self.log.info("  IMPORTANT: delete the test clones BEFORE running --action clone")
-        self.log.info("  (the real clones reuse the same v_<qtree> names):")
+        self.log.info("  Delete the test clones once the tests are done:")
         for cluster, svm in ((self.dest_cluster, self.dest_svm),
                              (self.dr_cluster,   self.dr_svm)):
             self.log.info("    On %s:", cluster)
             for qtree in qtrees:
-                self.log.info("      volume offline -vserver %s -volume v_%s ; "
-                              "volume delete -vserver %s -volume v_%s",
-                              svm, qtree, svm, qtree)
+                self.log.info("      volume offline -vserver %s -volume v_%s_%s ; "
+                              "volume delete -vserver %s -volume v_%s_%s",
+                              svm, qtree, clone_uid, svm, qtree, clone_uid)
         self.log.info("=" * 60)
 
     # =====================================================================
     # ACTION 'acl' -> Force AD groups on destination shares (NTFS DACL)
     # =====================================================================
-    def action_acl(self):
+    def action_acl(self, job_data: Optional[dict] = None):
         """Force AD-group ACLs on the destination volumes from the NetApp side.
 
         Uses the ONTAP 'vserver security file-directory' engine, which pushes
@@ -1324,10 +1353,12 @@ class MigrationOrchestrator:
           4. policy task add  : one task per target path (full-tree propagation)
           5. policy apply     : fire the forcing job on the cluster
 
-        Targets are the clone volumes v_<qtree> derived from --qtrees, or the
-        exact --acl-path given by the client (a specific directory on one of
-        his shares). Runs on the PROD destination cluster; the DR side
-        receives the same ACLs through the clone SnapMirror replication.
+        Targets are the clone volumes v_<qtree>_<uid> derived from --qtrees
+        (the uid is read from the job file, saved there by the last clone or
+        test run), or the exact --acl-path given by the client (a specific
+        directory on one of his shares). Runs on the PROD destination
+        cluster; the DR side receives the same ACLs through the clone
+        SnapMirror replication.
         """
         groups = [g.strip() for g in self.a.ad_groups.split(",") if g.strip()]
         if not groups:
@@ -1339,8 +1370,17 @@ class MigrationOrchestrator:
         if self.a.acl_path:
             paths = [self.a.acl_path]
         else:
+            # Clone names carry the unique uid of the run that created them;
+            # it is persisted in the job file by action_clone / action_test.
+            clone_uid = (job_data or {}).get("clone_uid")
+            if not clone_uid:
+                raise OntapCliError(
+                    self.dest_cluster, "acl", 0, "", "",
+                    reason=("no clone UID found in the job file — run "
+                            "--action test or --action clone (with --job-id) "
+                            "first, or target an explicit --acl-path"))
             qtrees = self._resolve_qtrees()
-            paths = [f"/v_{q}" for q in qtrees]
+            paths = [f"/v_{q}_{clone_uid}" for q in qtrees]
 
         self.log.info("=" * 60)
         self.log.info("  ACTION: acl  (force AD groups via NTFS DACL)")
@@ -1969,7 +2009,8 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
     test: --job-id and --qtrees required; everything else from the job file.
 
     acl: --job-id and --ad-groups required; targets come from --qtrees
-    (clone volumes v_<qtree>) or from an explicit --acl-path.
+    (clone volumes v_<qtree>_<uid>, uid read from the job file) or from an
+    explicit --acl-path.
 
     create: requires source/pivot/dest/dr clusters, volume, and
     --dr-cluster (mandatory for the Y fan-out topology).
@@ -2175,11 +2216,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         try:
             if args.action == "clone":
-                orchestrator.action_clone()
+                orchestrator.action_clone(job_data)
             elif args.action == "test":
-                orchestrator.action_test()
+                orchestrator.action_test(job_data)
             else:
-                orchestrator.action_acl()
+                orchestrator.action_acl(job_data)
             logger.info("SUCCESS: action '%s' completed without error.", args.action)
             return 0
         except OntapCliError as exc:
