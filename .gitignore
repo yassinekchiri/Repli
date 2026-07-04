@@ -8,3 +8,6 @@ venv/
 # Logs de migration generes a l'execution
 migration_*.log
 *.log
+
+# Fichiers de job generes a l'execution
+netapp_migration_*.json

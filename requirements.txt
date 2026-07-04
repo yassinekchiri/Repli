@@ -1,0 +1,10 @@
+# --- ONTAP REST transport (default) ---
+requests>=2.31
+
+# --- REST API interface ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# --- Optional: SSH transport with the paramiko backend ---
+# Only needed for:  --transport ssh --ssh-backend paramiko
+# paramiko>=2.11
