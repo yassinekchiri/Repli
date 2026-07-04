@@ -84,13 +84,18 @@ Required arguments (--action create):
     --dest-cluster     Name/IP of the PROD destination cluster
     --dr-cluster       Name/IP of the DR destination cluster (Y fan-out)
     --volume           Name of the source volume
-    --action           'create' | 'clone' | 'cleanup' | 'resume' | 'check-status'
+    --action           'create' | 'clone' | 'test' | 'acl' | 'cleanup' |
+                       'resume' | 'check-status' | 'retry'
 
 Action-specific arguments:
     --create-mode      (create)       'full' (default) or 'pivot-only'
-    --job-id           (resume / check-status) job ID from a previous create run
-    --qtrees           (clone)        comma-separated list 'q1,q2' OR keyword 'all'
+    --job-id           (resume / check-status / retry / clone / test / acl)
+                                      job ID from a previous create run
+    --qtrees           (clone / test / acl) comma-separated list 'q1,q2' OR 'all'
     --qtree            (cleanup)      single target Qtree
+    --ad-groups        (acl)          AD groups to force, e.g. 'DOM\\grp1,DOM\\grp2'
+    --acl-path         (acl)          optional specific path on a destination share
+    --acl-rights       (acl)          rights per group (default: full-control)
 
 Additional technical arguments (provided with sensible defaults):
     --source-vserver / --pivot-vserver / --dest-vserver / --dr-vserver
@@ -119,6 +124,17 @@ Examples:
     python3 netapp_cascade_migration.py --action check-status --job-id <ID>
 
     python3 netapp_cascade_migration.py ... --action clone  --qtrees all
+
+    # Thin test clones (no split, no move — zero extra disk space):
+    python3 netapp_cascade_migration.py --action test --job-id <ID> --qtrees all
+
+    # Force AD groups on the destination clones (server-side DACL forcing):
+    python3 netapp_cascade_migration.py --action acl --job-id <ID> \\
+        --qtrees all --ad-groups 'DOM\\grp_rw,DOM\\grp_ro'
+    # ... or on one specific path of a client share:
+    python3 netapp_cascade_migration.py --action acl --job-id <ID> \\
+        --acl-path /v_qtree_finance/projects --ad-groups 'DOM\\grp_rw'
+
     python3 netapp_cascade_migration.py ... --action cleanup --qtree qtree_finance
 """
 
@@ -1054,14 +1070,7 @@ class MigrationOrchestrator:
         # ------------------------------------------------------------------
         # Phase 1: Qtree list
         # ------------------------------------------------------------------
-        if self.a.qtrees.strip().lower() == "all":
-            qtrees = self._list_source_qtrees()
-        else:
-            qtrees = [q.strip() for q in self.a.qtrees.split(",") if q.strip()]
-
-        if not qtrees:
-            raise OntapCliError(self.src_cluster, "volume qtree show", 0, "", "",
-                                reason="no Qtree to process")
+        qtrees = self._resolve_qtrees()
         self.log.info("Qtrees (%d): %s", len(qtrees), ", ".join(qtrees))
 
         pivot_dest_path = self._path(self.pivot_svm, self.volume)
@@ -1191,6 +1200,212 @@ class MigrationOrchestrator:
         self.log.info("      volume move show -vserver %s", self.dest_svm)
         self.log.info("    DR   (%s):", self.dr_cluster)
         self.log.info("      volume move show -vserver %s", self.dr_svm)
+        self.log.info("=" * 60)
+
+    # =====================================================================
+    # ACTION 'test' -> Thin FlexClones for client-side validation
+    # =====================================================================
+    def action_test(self):
+        """Create THIN FlexClones on PROD and DR for client testing.
+
+        Same snapshot-propagation + FlexClone logic as action_clone, but the
+        workflow stops right after the clones are created:
+          - NO SnapMirror relationship between the clones,
+          - NO volume move (no split from the parent DP volume).
+
+        The clones stay attached to their parent volume and share its blocks,
+        so they consume no additional disk space. The client can then validate
+        file access, permissions and every related mechanism before asking for
+        the real 'clone' action.
+
+        The test clones MUST be deleted before running --action clone (same
+        v_<qtree> names): the exit message prints the delete commands.
+        """
+        self.log.info("=" * 60)
+        self.log.info("  ACTION: test  (thin FlexClones — no split, no move)")
+        self.log.info("  %s  >>  %s  +  %s",
+                      self.src_cluster, self.dest_cluster, self.dr_cluster)
+        self.log.info("=" * 60)
+
+        # ------------------------------------------------------------------
+        # Phase 1: Qtree list
+        # ------------------------------------------------------------------
+        qtrees = self._resolve_qtrees()
+        self.log.info("Qtrees (%d): %s", len(qtrees), ", ".join(qtrees))
+
+        pivot_dest_path = self._path(self.pivot_svm, self.volume)
+        prod_dest_path  = self._path(self.dest_svm,  self.volume)
+        dr_dest_path    = self._path(self.dr_svm,    self.volume)
+
+        # ------------------------------------------------------------------
+        # Phase 2: Create a dedicated snapshot on the source
+        # ------------------------------------------------------------------
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        snap_name = f"test_migr_{stamp}"
+        self.log.info(">> [1/4]  Creating snapshot '%s' on source", snap_name)
+        self.x.run(self.src_cluster,
+                   f"volume snapshot create -vserver {self.src_svm} "
+                   f"-volume {self.volume} -snapshot {snap_name}")
+        self.log.info("         Snapshot created.")
+
+        # ------------------------------------------------------------------
+        # Phase 3: Propagate through the cascade (pivot, then PROD + DR)
+        # ------------------------------------------------------------------
+        self.log.info(">> [2/4]  Propagating snapshot — Pivot")
+        self.x.run(self.pivot_cluster,
+                   f"snapmirror update -destination-path {pivot_dest_path}")
+        self._wait_snapmirror_idle(self.pivot_cluster, pivot_dest_path)
+        self.log.info("         Pivot: transfer complete.")
+
+        self.log.info(">> [3/4]  Propagating snapshot — PROD + DR")
+        self.x.run(self.dest_cluster,
+                   f"snapmirror update -destination-path {prod_dest_path}")
+        self.x.run(self.dr_cluster,
+                   f"snapmirror update -destination-path {dr_dest_path}")
+        self._wait_snapmirror_idle(self.dest_cluster, prod_dest_path)
+        self._wait_snapmirror_idle(self.dr_cluster,   dr_dest_path)
+        self._verify_snapshot_present(self.dest_cluster, self.dest_svm,
+                                      self.volume, snap_name)
+        self._verify_snapshot_present(self.dr_cluster,   self.dr_svm,
+                                      self.volume, snap_name)
+        self.log.info("         Snapshot confirmed on both destinations.")
+
+        # ------------------------------------------------------------------
+        # Phase 4: Create the thin FlexClones on PROD and DR — then STOP.
+        # ------------------------------------------------------------------
+        self.log.info(">> [4/4]  Creating thin FlexClone volumes on PROD and DR")
+        for qtree in qtrees:
+            clone_vol = f"v_{qtree}"
+            self.x.run(self.dest_cluster,
+                       f"volume clone create -vserver {self.dest_svm} "
+                       f"-flexclone {clone_vol} -parent-volume {self.volume} "
+                       f"-parent-snapshot {snap_name} -junction-active true")
+            self.x.run(self.dr_cluster,
+                       f"volume clone create -vserver {self.dr_svm} "
+                       f"-flexclone {clone_vol} -parent-volume {self.volume} "
+                       f"-parent-snapshot {snap_name} -junction-active true")
+            self.log.info("         '%s'  created on PROD and DR.", clone_vol)
+
+        # No split, no move: exit here so no extra disk space is consumed.
+        self.log.info("=" * 60)
+        self.log.info("  %d test clone(s) ready — THIN clones, no disk space consumed.",
+                      len(qtrees))
+        self.log.info("")
+        self._log_table(
+            ["Test clone", "PROD (%s)" % self.dest_cluster, "DR (%s)" % self.dr_cluster],
+            [[f"v_{q}", "created", "created"] for q in qtrees],
+        )
+        self.log.info("")
+        self.log.info("  The client can now validate access and permissions.")
+        self.log.info("  IMPORTANT: delete the test clones BEFORE running --action clone")
+        self.log.info("  (the real clones reuse the same v_<qtree> names):")
+        for cluster, svm in ((self.dest_cluster, self.dest_svm),
+                             (self.dr_cluster,   self.dr_svm)):
+            self.log.info("    On %s:", cluster)
+            for qtree in qtrees:
+                self.log.info("      volume offline -vserver %s -volume v_%s ; "
+                              "volume delete -vserver %s -volume v_%s",
+                              svm, qtree, svm, qtree)
+        self.log.info("=" * 60)
+
+    # =====================================================================
+    # ACTION 'acl' -> Force AD groups on destination shares (NTFS DACL)
+    # =====================================================================
+    def action_acl(self):
+        """Force AD-group ACLs on the destination volumes from the NetApp side.
+
+        Uses the ONTAP 'vserver security file-directory' engine, which pushes
+        an NTFS security descriptor (DACL) onto a whole tree server-side
+        (propagation-mode propagate) — no client mount needed:
+
+          1. ntfs create      : declare the security descriptor
+          2. ntfs dacl add    : one ACE per AD group provided by the client
+          3. policy create    : declare the apply policy
+          4. policy task add  : one task per target path (full-tree propagation)
+          5. policy apply     : fire the forcing job on the cluster
+
+        Targets are the clone volumes v_<qtree> derived from --qtrees, or the
+        exact --acl-path given by the client (a specific directory on one of
+        his shares). Runs on the PROD destination cluster; the DR side
+        receives the same ACLs through the clone SnapMirror replication.
+        """
+        groups = [g.strip() for g in self.a.ad_groups.split(",") if g.strip()]
+        if not groups:
+            raise OntapCliError(self.dest_cluster, "acl", 0, "", "",
+                                reason="no AD group provided in --ad-groups")
+        rights = self.a.acl_rights
+
+        # --- Determine target paths ---------------------------------------
+        if self.a.acl_path:
+            paths = [self.a.acl_path]
+        else:
+            qtrees = self._resolve_qtrees()
+            paths = [f"/v_{q}" for q in qtrees]
+
+        self.log.info("=" * 60)
+        self.log.info("  ACTION: acl  (force AD groups via NTFS DACL)")
+        self.log.info("  Target cluster: %s / vserver %s", self.dest_cluster, self.dest_svm)
+        self.log.info("=" * 60)
+        self._log_table(
+            ["AD group", "Rights"],
+            [[g, rights] for g in groups],
+        )
+        self._log_table(
+            ["Target path", "Propagation"],
+            [[p, "this-folder, sub-folders, files"] for p in paths],
+        )
+
+        stamp       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sd_name     = f"sd_migr_{stamp}"
+        policy_name = f"pol_migr_{stamp}"
+
+        # --- 1. Security descriptor ---------------------------------------
+        self.log.info(">> [1/4]  Creating NTFS security descriptor '%s'", sd_name)
+        self.x.run(self.dest_cluster,
+                   f"vserver security file-directory ntfs create "
+                   f"-vserver {self.dest_svm} -ntfs-sd {sd_name}")
+
+        # --- 2. One DACL entry (ACE) per AD group -------------------------
+        self.log.info(">> [2/4]  Adding DACL entries (%d group(s))", len(groups))
+        for group in groups:
+            self.x.run(self.dest_cluster,
+                       f"vserver security file-directory ntfs dacl add "
+                       f"-vserver {self.dest_svm} -ntfs-sd {sd_name} "
+                       f"-access-type allow -account \"{group}\" "
+                       f"-rights {rights} "
+                       f"-apply-to this-folder,sub-folders,files")
+            self.log.info("         '%s'  ->  %s", group, rights)
+
+        # --- 3. Policy + one task per target path -------------------------
+        self.log.info(">> [3/4]  Creating policy '%s' with %d task(s)",
+                      policy_name, len(paths))
+        self.x.run(self.dest_cluster,
+                   f"vserver security file-directory policy create "
+                   f"-vserver {self.dest_svm} -policy-name {policy_name}")
+        for path in paths:
+            self.x.run(self.dest_cluster,
+                       f"vserver security file-directory policy task add "
+                       f"-vserver {self.dest_svm} -policy-name {policy_name} "
+                       f"-path \"{path}\" -ntfs-sd {sd_name} "
+                       f"-security-type ntfs -propagation-mode propagate")
+            self.log.info("         task added for '%s'", path)
+
+        # --- 4. Apply: fire the server-side forcing job --------------------
+        self.log.info(">> [4/4]  Applying policy (server-side DACL forcing)")
+        self.x.run(self.dest_cluster,
+                   f"vserver security file-directory policy apply "
+                   f"-vserver {self.dest_svm} -policy-name {policy_name}")
+
+        self.log.info("=" * 60)
+        self.log.info("  DACL forcing launched on %d path(s).", len(paths))
+        self.log.info("")
+        self.log.info("  Verify the applied security at any time:")
+        for path in paths:
+            self.log.info("    vserver security file-directory show "
+                          "-vserver %s -path \"%s\"", self.dest_svm, path)
+        self.log.info("")
+        self.log.info("  Note: DR receives the same ACLs through the clone")
+        self.log.info("  SnapMirror replication (next update/resync).")
         self.log.info("=" * 60)
 
     # =====================================================================
@@ -1453,6 +1668,17 @@ class MigrationOrchestrator:
                        f"-volume {self.volume} -instance")
         return parse_qtree_list(r.stdout)
 
+    def _resolve_qtrees(self) -> List[str]:
+        """Resolve --qtrees into a concrete list ('all' -> source discovery)."""
+        if self.a.qtrees.strip().lower() == "all":
+            qtrees = self._list_source_qtrees()
+        else:
+            qtrees = [q.strip() for q in self.a.qtrees.split(",") if q.strip()]
+        if not qtrees:
+            raise OntapCliError(self.src_cluster, "volume qtree show", 0, "", "",
+                                reason="no Qtree to process")
+        return qtrees
+
     def _verify_snapshot_present(self, cluster: str, svm: str, volume: str,
                                  snapshot: str):
         """Verify that the expected snapshot is present on the destination."""
@@ -1651,15 +1877,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Name of the source volume. "
                              "Not required for --action resume.")
     parser.add_argument("--action", required=True,
-                        choices=["create", "clone", "cleanup", "resume",
-                                 "check-status", "retry"],
+                        choices=["create", "clone", "test", "acl", "cleanup",
+                                 "resume", "check-status", "retry"],
                         help="Action to execute.")
 
     # --- Action-specific arguments ---
     parser.add_argument("--qtrees",
-                        help="(clone) comma-separated list 'q1,q2' OR keyword 'all'.")
+                        help="(clone / test / acl) comma-separated list 'q1,q2' "
+                             "OR keyword 'all'.")
     parser.add_argument("--qtree",
                         help="(cleanup) single target Qtree.")
+    parser.add_argument("--ad-groups",
+                        help="(acl) comma-separated AD groups to force on the "
+                             "destination shares, e.g. 'DOM\\\\grp_rw,DOM\\\\grp_ro'.")
+    parser.add_argument("--acl-path",
+                        help="(acl) optional specific path on a destination share "
+                             "(e.g. '/v_qtree_finance/projects'). When omitted, the "
+                             "ACLs are applied to the root of every clone volume "
+                             "derived from --qtrees.")
+    parser.add_argument("--acl-rights",
+                        choices=["no-access", "read", "write", "modify", "full-control"],
+                        default="full-control",
+                        help="(acl) rights granted to every AD group "
+                             "(default: full-control).")
     parser.add_argument("--create-mode", choices=["full", "pivot-only"], default="full",
                         help="(create) 'full': initialize pivot, wait, then initialize "
                              "destination. 'pivot-only': initialize pivot and exit "
@@ -1726,6 +1966,11 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
     clone (no --job-id): all cluster/volume params required on the command
     line; a pre-flight health check is run before cloning.
 
+    test: --job-id and --qtrees required; everything else from the job file.
+
+    acl: --job-id and --ad-groups required; targets come from --qtrees
+    (clone volumes v_<qtree>) or from an explicit --acl-path.
+
     create: requires source/pivot/dest/dr clusters, volume, and
     --dr-cluster (mandatory for the Y fan-out topology).
     """
@@ -1733,6 +1978,25 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser):
         if not args.job_id:
             parser.error(f"--job-id is required for --action {args.action}.")
         return  # all other params come from the job file
+
+    if args.action == "test":
+        if not args.job_id:
+            parser.error("--job-id is required for --action test.")
+        if not args.qtrees:
+            parser.error("--qtrees is required for --action test "
+                         "(comma-separated list 'q1,q2' or 'all').")
+        return  # everything else comes from the job file
+
+    if args.action == "acl":
+        if not args.job_id:
+            parser.error("--job-id is required for --action acl.")
+        if not args.ad_groups:
+            parser.error("--ad-groups is required for --action acl "
+                         "(e.g. 'DOM\\\\grp_rw,DOM\\\\grp_ro').")
+        if not args.acl_path and not args.qtrees:
+            parser.error("--qtrees or --acl-path is required for --action acl "
+                         "(targets to apply the ACLs on).")
+        return  # everything else comes from the job file
 
     if args.action == "clone" and args.job_id:
         # Job-file mode: only --qtrees needed from the CLI.
@@ -1852,8 +2116,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger.error("Job ID for later retry: %s", args.job_id)
             return 3
 
-    # ---- clone + --job-id: load context from job file ----------------------
-    if args.action == "clone" and args.job_id:
+    # ---- clone / test / acl + --job-id: load context from job file ---------
+    if args.action in ("clone", "test", "acl") and args.job_id:
         try:
             job_data = _load_job(args.job_id)
         except FileNotFoundError as exc:
@@ -1881,18 +2145,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             timeout         = saved["timeout"],
             poll_interval   = saved["poll_interval"],
             dry_run         = saved.get("dry_run", False),
-            # qtrees comes from the CLI, not the job file
+            # Action-specific parameters come from the CLI, not the job file.
             qtrees          = args.qtrees,
+            ad_groups       = getattr(args, "ad_groups", None),
+            acl_path        = getattr(args, "acl_path", None),
+            acl_rights      = getattr(args, "acl_rights", "full-control"),
         )
 
         if not clone_args.log_file:
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            clone_args.log_file = f"migration_clone_{args.job_id}_{stamp}.log"
+            clone_args.log_file = f"migration_{args.action}_{args.job_id}_{stamp}.log"
 
         logger = setup_logging(clone_args.log_file)
         logger.info("================================================================")
-        logger.info("Action 'clone' for job %s (parameters from job file).", args.job_id)
-        logger.info("Qtrees: %s", clone_args.qtrees)
+        logger.info("Action '%s' for job %s (parameters from job file).",
+                    args.action, args.job_id)
+        if clone_args.qtrees:
+            logger.info("Qtrees: %s", clone_args.qtrees)
         logger.info("Log file: %s", clone_args.log_file)
         logger.info("================================================================")
 
@@ -1905,8 +2174,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         orchestrator = MigrationOrchestrator(executor, clone_args)
 
         try:
-            orchestrator.action_clone()
-            logger.info("SUCCESS: action 'clone' completed without error.")
+            if args.action == "clone":
+                orchestrator.action_clone()
+            elif args.action == "test":
+                orchestrator.action_test()
+            else:
+                orchestrator.action_acl()
+            logger.info("SUCCESS: action '%s' completed without error.", args.action)
             return 0
         except OntapCliError as exc:
             logger.error("ONTAP FAILURE: %s", exc)
