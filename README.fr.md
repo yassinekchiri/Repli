@@ -143,6 +143,64 @@ export NETAPP_MIGRATION_JOB_DIR=/var/lib/netapp-migration/jobs
 mkdir -p "$NETAPP_MIGRATION_JOB_DIR"
 ```
 
+### 2.5 Créer le compte de service ONTAP `mutrepli` (moindre privilège)
+
+À exécuter **sur chaque cluster de la topologie** (source, pivot, PROD,
+DR), depuis la CLI admin du cluster. Le rôle n'autorise que les commandes
+/ endpoints réellement utilisés par l'outil ; tout le reste est refusé.
+
+**Rôle REST (utilisé par le transport `rest` par défaut) :**
+
+```
+security login rest-role create -role mutrepli_rest -api /api/storage/volumes -access all
+security login rest-role create -role mutrepli_rest -api /api/storage/qtrees -access all
+security login rest-role create -role mutrepli_rest -api /api/storage/aggregates -access readonly
+security login rest-role create -role mutrepli_rest -api /api/snapmirror/relationships -access all
+security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/shares -access all
+security login rest-role create -role mutrepli_rest -api /api/protocols/file-security/permissions -access all
+security login rest-role create -role mutrepli_rest -api /api/svm/svms -access readonly
+security login rest-role create -role mutrepli_rest -api /api/cluster/jobs -access readonly
+```
+
+**Rôle CLI (utilisé par le transport `ssh` de secours) :**
+
+```
+security login role create -role mutrepli_cli -cmddirname "volume" -access all
+security login role create -role mutrepli_cli -cmddirname "snapmirror" -access all
+security login role create -role mutrepli_cli -cmddirname "storage aggregate" -access readonly
+security login role create -role mutrepli_cli -cmddirname "vserver cifs share" -access all
+security login role create -role mutrepli_cli -cmddirname "vserver security file-directory" -access all
+```
+
+**Utilisateur `mutrepli` avec authentification par mot de passe :**
+
+```
+# Accès API REST (basic auth — c'est ce compte que creds.json référence) :
+security login create -user-or-group-name mutrepli -application http \
+    -authentication-method password -role mutrepli_rest
+
+# Accès SSH (mot de passe interactif) :
+security login create -user-or-group-name mutrepli -application ssh \
+    -authentication-method password -role mutrepli_cli
+```
+
+Le mot de passe est demandé à la création. Référencer ensuite le compte
+dans `creds.json` (section 2.3) : `"username": "mutrepli"`.
+
+> Note pour le transport SSH : l'outil se connecte en non-interactif
+> (`BatchMode=yes`), ce qui nécessite une clé en plus de la méthode
+> mot de passe :
+>
+> ```
+> security login create -user-or-group-name mutrepli -application ssh \
+>     -authentication-method publickey -role mutrepli_cli
+> security login publickey create -username mutrepli -publickey "ssh-ed25519 AAAA... migration@serveur"
+> ```
+
+Vérification : `security login show -user-or-group-name mutrepli` puis,
+depuis le serveur,
+`curl -sk -u mutrepli https://<cluster>/api/storage/volumes?max_records=1`.
+
 ---
 
 ## 3. Utilisation en ligne de commande
