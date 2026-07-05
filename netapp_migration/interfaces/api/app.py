@@ -39,7 +39,8 @@ from ...core.jobs import JobStore, JobNotFound
 from ...models import MigrationParams, OntapError, ConfirmationRequired
 from ...transport import build_client
 from .schemas import (CreateMigrationRequest, ResumeRequest, QtreesRequest,
-                      AclRequest, CleanupRequest, ActionAccepted, ActionResult)
+                      TestRequest, AclRequest, CleanupRequest,
+                      ActionAccepted, ActionResult)
 
 _MAX_CAPTURED_LOG_LINES = 4000
 
@@ -262,14 +263,18 @@ def retry_migration(job_id: str):
 
 @app.post("/api/v1/migrations/{job_id}/test", status_code=202,
           response_model=ActionAccepted)
-def test_migration(job_id: str, req: QtreesRequest):
-    """Thin FlexClones for client validation (no split, no move)."""
+def test_migration(job_id: str, req: TestRequest):
+    """Full TEST environment: clones + PROD->DR mirror, no split/move.
+
+    Time-limited (validity_days); promote it with POST .../clone before
+    expiry, or delete the clones after it.
+    """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
 
     def target(logger):
         engine = _engine_for(params, logger)
-        engine.test(req.qtrees_csv, job=job)
+        engine.test(req.qtrees_csv, job=job, validity_days=req.validity_days)
 
     _run_in_background(job_id, "test", target)
     return ActionAccepted(job_id=job_id, action="test",
@@ -279,7 +284,12 @@ def test_migration(job_id: str, req: QtreesRequest):
 @app.post("/api/v1/migrations/{job_id}/clone", status_code=202,
           response_model=ActionAccepted)
 def clone_migration(job_id: str, req: QtreesRequest):
-    """Real clones: propagation, FlexClones, clone mirror, volume moves."""
+    """Definitive clones.
+
+    If a test environment exists for this job, it is PROMOTED (volume moves
+    only); otherwise the full flow runs (propagation, FlexClones, clone
+    mirror, volume moves).
+    """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
 
@@ -294,15 +304,17 @@ def clone_migration(job_id: str, req: QtreesRequest):
 
 @app.post("/api/v1/migrations/{job_id}/acl", response_model=ActionResult)
 def acl_migration(job_id: str, req: AclRequest):
-    """Force AD-group DACLs on the destination clones (server-side)."""
+    """Force AD-group DACLs on ONE destination path (server-side).
+
+    Decoupled from test/clone: the caller provides the exact path.
+    """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
 
     def target(logger) -> dict:
         engine = _engine_for(params, logger)
         return engine.acl(req.ad_groups_csv, acl_path=req.acl_path,
-                          acl_rights=req.acl_rights,
-                          qtrees_arg=req.qtrees_csv, job=job)
+                          acl_rights=req.acl_rights, job=job)
 
     return _run_sync(job_id, "acl", target)
 

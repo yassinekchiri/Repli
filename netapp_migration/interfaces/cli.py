@@ -104,10 +104,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ad-groups",
                         help="(acl) CSV AD groups, e.g. 'DOM\\\\grp1,DOM\\\\grp2'.")
     parser.add_argument("--acl-path",
-                        help="(acl) explicit path on a destination share.")
+                        help="(acl) target path on the destination vserver, "
+                             "e.g. '/v_q_fin_8072b8/projects'. Required.")
     parser.add_argument("--acl-rights", default="full-control",
                         choices=["no-access", "read", "write", "modify",
                                  "full-control"])
+    parser.add_argument("--test-validity-days", type=int, default=7,
+                        help="(test) validity of the test environment in "
+                             "days (default: 7).")
     parser.add_argument("--yes", action="store_true",
                         help="(resume) skip the interactive confirmation.")
 
@@ -146,8 +150,9 @@ def validate_args(args, parser):
     if args.action == "acl":
         if not args.ad_groups:
             parser.error("--ad-groups is required for --action acl.")
-        if not args.acl_path and not args.qtrees:
-            parser.error("--qtrees or --acl-path is required for --action acl.")
+        if not args.acl_path:
+            parser.error("--acl-path is required for --action acl "
+                         "(target path on the destination vserver).")
     if args.action == "clone":
         if not args.qtrees:
             parser.error("--qtrees is required for --action clone.")
@@ -249,11 +254,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 engine.check_clone_prerequisites()
             engine.clone(args.qtrees, job=job)
         elif args.action == "test":
-            engine.test(args.qtrees, job=job)
+            engine.test(args.qtrees, job=job,
+                        validity_days=args.test_validity_days)
         elif args.action == "acl":
             engine.acl(args.ad_groups, acl_path=args.acl_path,
-                       acl_rights=args.acl_rights, qtrees_arg=args.qtrees,
-                       job=job)
+                       acl_rights=args.acl_rights, job=job)
         elif args.action == "cleanup":
             engine.cleanup(args.qtree)
         logger.info("SUCCESS: action '%s' completed without error.", args.action)

@@ -548,15 +548,121 @@ class MigrationEngine:
         if job is not None:
             job["clone_uid"] = clone_uid
             job["clone_volumes"] = [f"v_{q}_{clone_uid}" for q in qtrees]
+            job["test_env"] = False    # definitive clones, not a test env
             self.jobs.save(job)
+
+    def _promote_test_env(self, qtrees_arg: str, job: dict) -> dict:
+        """Promote the existing TEST environment to the definitive one.
+
+        The test clones already carry the client data and the PROD->DR
+        mirror: nothing is rebuilt. After a final idle check on the clone
+        relationships, only the volume moves are launched to detach the
+        clones from their parent DP volumes.
+        """
+        p = self.p
+        clone_uid = job["clone_uid"]
+        existing = set(job.get("clone_volumes", []))
+        qtrees = self._resolve_qtrees(qtrees_arg)
+        wanted = {q: f"v_{q}_{clone_uid}" for q in qtrees}
+        missing = [v for v in wanted.values() if v not in existing]
+        if missing:
+            raise OntapError(
+                p.dest_cluster, "clone promotion",
+                f"the test environment (uid {clone_uid}) has no clone(s) "
+                f"{missing}. Promote with the same qtrees as the test run "
+                f"({sorted(existing)}), or delete the test environment and "
+                f"run a full clone")
+
+        self.log.info("=" * 60)
+        self.log.info("  ACTION: clone  — PROMOTION of test environment %s",
+                      clone_uid)
+        self.log.info("  Test created: %s  |  valid until: %s",
+                      job.get("test_created_at", "unknown"),
+                      job.get("test_expires_at", "unknown"))
+        self.log.info("=" * 60)
+
+        expires_at = job.get("test_expires_at")
+        if expires_at:
+            try:
+                expired = (datetime.datetime.fromisoformat(expires_at)
+                           < datetime.datetime.now())
+            except ValueError:
+                expired = False
+            if expired:
+                self.log.warning("Test environment expired on %s — the clones "
+                                 "should have been deleted. Promoting anyway.",
+                                 expires_at)
+
+        # [1/3] Final health check: every clone mirror must be idle.
+        self.log.info(">> [1/3]  Verifying clone mirrors (PROD -> DR)")
+        for qtree in qtrees:
+            dr_clone = p.path(p.dr_vserver, wanted[qtree])
+            self._wait_snapmirror(p.dr_cluster, dr_clone, want="idle")
+            self.log.info("         '%s'  mirror idle.", wanted[qtree])
+
+        # [2/3] Best aggregates (parents excluded).
+        self.log.info(">> [2/3]  Selecting target aggregates")
+        prod_parent = self.c.get_volume(p.dest_cluster, p.dest_vserver,
+                                        p.volume).aggregate
+        prod_aggr = self._find_best_aggregate(p.dest_cluster,
+                                              exclude=prod_parent)
+        self.log.info("         PROD  best aggregate : %s  (parent excluded: %s)",
+                      prod_aggr, prod_parent or "none")
+        dr_parent = self.c.get_volume(p.dr_cluster, p.dr_vserver,
+                                      p.volume).aggregate
+        dr_aggr = self._find_best_aggregate(p.dr_cluster, exclude=dr_parent)
+        self.log.info("         DR    best aggregate : %s  (parent excluded: %s)",
+                      dr_aggr, dr_parent or "none")
+
+        # [3/3] Volume moves (fire-and-forget) — the actual promotion.
+        self.log.info(">> [3/3]  Launching volume moves (detach from parents)")
+        for qtree in qtrees:
+            clone_vol = wanted[qtree]
+            self.c.start_volume_move(p.dest_cluster, p.dest_vserver,
+                                     clone_vol, prod_aggr)
+            self.c.start_volume_move(p.dr_cluster, p.dr_vserver,
+                                     clone_vol, dr_aggr)
+            self.log.info("         '%s'  move launched  PROD -> %s  /  "
+                          "DR -> %s.", clone_vol, prod_aggr, dr_aggr)
+
+        job["test_env"] = False
+        job.pop("test_expires_at", None)
+        job["clone_promoted_at"] = datetime.datetime.now().isoformat(
+            timespec="seconds")
+        self.jobs.save(job)
+
+        self.log.info("=" * 60)
+        self.log.info("  Test environment %s PROMOTED — volume moves launched "
+                      "for %d clone(s).", clone_uid, len(qtrees))
+        self.log.info("")
+        self._log_table(["Clone volume", "PROD aggregate", "DR aggregate"],
+                        [[wanted[q], prod_aggr, dr_aggr] for q in qtrees])
+        self.log.info("")
+        self.log.info("  Monitor moves: volume move show -vserver %s / %s",
+                      p.dest_vserver, p.dr_vserver)
+        self.log.info("=" * 60)
+        return {"promoted": True, "clone_uid": clone_uid,
+                "clone_volumes": sorted(wanted.values()),
+                "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr}
 
     # =====================================================================
     # ACTION 'clone'
     # =====================================================================
     def clone(self, qtrees_arg: str, job: Optional[dict] = None) -> dict:
+        """Definitive clones.
+
+        Two modes:
+          - a TEST environment exists in the job file -> PROMOTION: the test
+            clones already carry the data and the PROD->DR mirror; only the
+            volume moves (detach from parents) are launched;
+          - no test environment -> full flow (snapshot, propagation,
+            FlexClones, clone mirror + resync, volume moves).
+        """
         p = self.p
         if job is not None:
             self.job_id = job["job_id"]
+            if job.get("test_env") and job.get("clone_uid"):
+                return self._promote_test_env(qtrees_arg, job)
 
         self.log.info("=" * 60)
         self.log.info("  ACTION: clone")
@@ -641,14 +747,38 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'test'
     # =====================================================================
-    def test(self, qtrees_arg: str, job: Optional[dict] = None) -> dict:
-        """Thin FlexClones for client validation — no split, no move."""
+    def test(self, qtrees_arg: str, job: Optional[dict] = None,
+             validity_days: int = 7) -> dict:
+        """Full TEST environment: everything except the split / volume move.
+
+        Builds the exact future production layout so the client can validate
+        access, permissions and replication:
+
+          - FlexClones v_<qtree>_<uid> on future PROD and future DR,
+          - SnapMirror relationships between the PROD and DR clones,
+            resynced and waited to idle.
+
+        The clones stay attached to their parent DP volumes (thin, no disk
+        space consumed). The environment is TIME-LIMITED (validity_days,
+        expiry stored in the job file):
+
+          - before expiry, action 'clone' PROMOTES this environment to the
+            definitive one (volume moves only — nothing is rebuilt);
+          - past expiry, the clones must be deleted (commands printed below).
+        """
         p = self.p
         if job is not None:
             self.job_id = job["job_id"]
+            if job.get("test_env"):
+                raise OntapError(
+                    p.dest_cluster, "test",
+                    f"a test environment already exists for this job "
+                    f"(uid {job.get('clone_uid')}, created "
+                    f"{job.get('test_created_at')}); promote it with action "
+                    f"'clone' or delete its clones first")
 
         self.log.info("=" * 60)
-        self.log.info("  ACTION: test  (thin FlexClones — no split, no move)")
+        self.log.info("  ACTION: test  (full environment — no split, no move)")
         self.log.info("  %s  >>  %s  +  %s",
                       p.source_cluster, p.dest_cluster, p.dr_cluster)
         self.log.info("=" * 60)
@@ -662,44 +792,92 @@ class MigrationEngine:
         self.log.info("Clone UID for this run: %s  (volumes: v_<qtree>_%s)",
                       clone_uid, clone_uid)
 
-        self._propagate_snapshot(snap_name, step_offset=1, total_steps=4)
+        # Steps 1-3: snapshot + cascade propagation + verification.
+        self._propagate_snapshot(snap_name, step_offset=1, total_steps=6)
 
-        self.log.info(">> [4/4]  Creating thin FlexClone volumes on PROD and DR")
+        # Step 4: FlexClones on future PROD and future DR.
+        self.log.info(">> [4/6]  Creating thin FlexClone volumes on PROD and DR")
         self._create_clones_on_both(qtrees, snap_name, clone_uid)
-        self._save_clone_metadata(job, clone_uid, qtrees)
+
+        # Step 5: SnapMirror between the clones + resync (like production).
+        self.log.info(">> [5/6]  SnapMirror (clone PROD -> clone DR) + resync")
+        for qtree in qtrees:
+            clone_vol = f"v_{qtree}_{clone_uid}"
+            prod_clone = p.path(p.dest_vserver, clone_vol)
+            dr_clone = p.path(p.dr_vserver, clone_vol)
+            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone)
+            self.c.snapmirror_resync(p.dr_cluster, dr_clone)
+            self.log.info("         '%s'  relationship created, resync "
+                          "launched.", clone_vol)
+
+        # Step 6: wait all clone resyncs idle.
+        self.log.info(">> [6/6]  Waiting for clone resyncs")
+        for qtree in qtrees:
+            dr_clone = p.path(p.dr_vserver, f"v_{qtree}_{clone_uid}")
+            self._wait_snapmirror(p.dr_cluster, dr_clone, want="idle")
+            self.log.info("         'v_%s_%s'  resync complete.",
+                          qtree, clone_uid)
+
+        # Persist the test environment metadata (with its expiry date).
+        created = datetime.datetime.now()
+        expires = created + datetime.timedelta(days=validity_days)
+        if job is not None:
+            job["clone_uid"] = clone_uid
+            job["clone_volumes"] = [f"v_{q}_{clone_uid}" for q in qtrees]
+            job["test_env"] = True
+            job["test_qtrees"] = qtrees
+            job["test_created_at"] = created.isoformat(timespec="seconds")
+            job["test_expires_at"] = expires.isoformat(timespec="seconds")
+            self.jobs.save(job)
 
         self.log.info("=" * 60)
-        self.log.info("  %d test clone(s) ready — THIN clones, no disk space "
-                      "consumed.", len(qtrees))
-        self.log.info("  Clone UID: %s", clone_uid)
+        self.log.info("  TEST environment ready — %d clone(s), mirrored "
+                      "PROD -> DR, no disk space consumed.", len(qtrees))
+        self.log.info("  Clone UID  : %s", clone_uid)
+        self.log.info("  Valid until: %s  (%d day(s))",
+                      expires.strftime("%Y-%m-%d %H:%M"), validity_days)
         self.log.info("")
         self._log_table(["Test clone",
-                         f"PROD ({p.dest_cluster})", f"DR ({p.dr_cluster})"],
-                        [[f"v_{q}_{clone_uid}", "created", "created"]
+                         f"PROD ({p.dest_cluster})", f"DR ({p.dr_cluster})",
+                         "Mirror"],
+                        [[f"v_{q}_{clone_uid}", "created", "created", "idle"]
                          for q in qtrees])
         self.log.info("")
         self.log.info("  The client can now validate access and permissions.")
-        self.log.info("  Delete the test clones once the tests are done:")
+        self.log.info("  BEFORE %s:", expires.strftime("%Y-%m-%d"))
+        self.log.info("    - promote to the definitive environment with "
+                      "action 'clone' (volume moves only), OR")
+        self.log.info("    - delete the test environment:")
+        for qtree in qtrees:
+            self.log.info("      snapmirror delete -destination-path %s",
+                          p.path(p.dr_vserver, f"v_{qtree}_{clone_uid}"))
         for cluster, svm in ((p.dest_cluster, p.dest_vserver),
                              (p.dr_cluster,   p.dr_vserver)):
-            self.log.info("    On %s:", cluster)
+            self.log.info("      On %s:", cluster)
             for qtree in qtrees:
-                self.log.info("      volume offline -vserver %s -volume "
+                self.log.info("        volume offline -vserver %s -volume "
                               "v_%s_%s ; volume delete -vserver %s -volume "
                               "v_%s_%s", svm, qtree, clone_uid,
                               svm, qtree, clone_uid)
         self.log.info("=" * 60)
         return {"clone_uid": clone_uid,
-                "clone_volumes": [f"v_{q}_{clone_uid}" for q in qtrees]}
+                "clone_volumes": [f"v_{q}_{clone_uid}" for q in qtrees],
+                "expires_at": expires.isoformat(timespec="seconds")}
 
     # =====================================================================
     # ACTION 'acl'
     # =====================================================================
-    def acl(self, ad_groups: str, acl_path: Optional[str] = None,
+    def acl(self, ad_groups: str, acl_path: str,
             acl_rights: str = "full-control",
-            qtrees_arg: Optional[str] = None,
             job: Optional[dict] = None) -> dict:
-        """Force AD-group DACLs server-side on the PROD destination."""
+        """Force AD-group DACLs server-side on ONE destination path.
+
+        Fully decoupled from the 'test' and 'clone' actions: the client
+        provides the exact path (any path on his destination volumes, e.g.
+        '/v_q_fin_8072b8' or '/v_q_fin_8072b8/projects') and the groups to
+        force. Runs on the PROD destination cluster; the DR side receives
+        the same ACLs through the clone SnapMirror replication.
+        """
         p = self.p
         if job is not None:
             self.job_id = job["job_id"]
@@ -708,41 +886,30 @@ class MigrationEngine:
         if not groups:
             raise OntapError(p.dest_cluster, "acl",
                              "no AD group provided in ad_groups")
-
-        if acl_path:
-            paths = [acl_path]
-        else:
-            clone_uid = (job or {}).get("clone_uid")
-            if not clone_uid:
-                raise OntapError(
-                    p.dest_cluster, "acl",
-                    "no clone UID found in the job file — run action 'test' "
-                    "or 'clone' (with a job id) first, or target an explicit "
-                    "acl_path")
-            qtrees = self._resolve_qtrees(qtrees_arg or "all")
-            paths = [f"/v_{q}_{clone_uid}" for q in qtrees]
+        if not acl_path or not acl_path.startswith("/"):
+            raise OntapError(p.dest_cluster, "acl",
+                             f"acl_path must be an absolute path on the "
+                             f"destination vserver (got: {acl_path!r})")
 
         self.log.info("=" * 60)
         self.log.info("  ACTION: acl  (force AD groups via NTFS DACL)")
-        self.log.info("  Target cluster: %s / vserver %s",
-                      p.dest_cluster, p.dest_vserver)
+        self.log.info("  Target: %s / vserver %s / path '%s'",
+                      p.dest_cluster, p.dest_vserver, acl_path)
         self.log.info("=" * 60)
-        self._log_table(["AD group", "Rights"], [[g, acl_rights] for g in groups])
-        self._log_table(["Target path", "Propagation"],
-                        [[path, "this-folder, sub-folders, files"]
-                         for path in paths])
+        self._log_table(["AD group", "Rights", "Propagation"],
+                        [[g, acl_rights, "this-folder, sub-folders, files"]
+                         for g in groups])
 
-        for i, path in enumerate(paths, 1):
-            self.log.info(">> [%d/%d]  Forcing DACL on '%s'", i, len(paths), path)
-            self.c.apply_file_security(p.dest_cluster, p.dest_vserver,
-                                       path, groups, acl_rights)
+        self.log.info(">> Forcing DACL on '%s'", acl_path)
+        self.c.apply_file_security(p.dest_cluster, p.dest_vserver,
+                                   acl_path, groups, acl_rights)
 
         self.log.info("=" * 60)
-        self.log.info("  DACL forcing launched on %d path(s).", len(paths))
+        self.log.info("  DACL forcing launched on '%s'.", acl_path)
         self.log.info("  Note: DR receives the same ACLs through the clone")
         self.log.info("  SnapMirror replication (next update/resync).")
         self.log.info("=" * 60)
-        return {"paths": paths, "groups": groups, "rights": acl_rights}
+        return {"path": acl_path, "groups": groups, "rights": acl_rights}
 
     # =====================================================================
     # ACTION 'cleanup'

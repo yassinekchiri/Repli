@@ -40,7 +40,7 @@ class ResumeRequest(BaseModel):
 
 
 class QtreesRequest(BaseModel):
-    """clone / test payload."""
+    """clone payload."""
     qtrees: Union[str, List[str]]
 
     @property
@@ -48,20 +48,21 @@ class QtreesRequest(BaseModel):
         return _csv(self.qtrees) or ""
 
 
+class TestRequest(QtreesRequest):
+    """test payload: qtrees + validity of the test environment."""
+    validity_days: int = Field(7, ge=1, le=365)
+
+
 class AclRequest(BaseModel):
+    """acl payload: decoupled from test/clone — one explicit path."""
     ad_groups: Union[str, List[str]]
-    acl_path: Optional[str] = None
+    acl_path: str
     acl_rights: str = Field("full-control",
                             pattern="^(no-access|read|write|modify|full-control)$")
-    qtrees: Union[str, List[str], None] = None
 
     @property
     def ad_groups_csv(self) -> str:
         return _csv(self.ad_groups) or ""
-
-    @property
-    def qtrees_csv(self) -> Optional[str]:
-        return _csv(self.qtrees)
 
 
 class CleanupRequest(BaseModel):

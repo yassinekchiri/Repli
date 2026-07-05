@@ -161,27 +161,47 @@ python3 netapp_cascade_migration.py --action retry --job-id <ID>
 Reprend au dernier checkpoint (`space_checked`, `volumes_created`, ...) ;
 les créations déjà faites sont ignorées (idempotence).
 
-### 3.3 test — clones fins de validation (aucun espace consommé)
+### 3.3 test — environnement de test complet (aucun espace consommé)
 
 ```bash
-python3 netapp_cascade_migration.py --action test --job-id <ID> --qtrees all
+python3 netapp_cascade_migration.py --action test --job-id <ID> \
+    --qtrees all --test-validity-days 7
 ```
 
-Crée des FlexClones `v_<qtree>_<uid>` sur PROD et DR **sans** split ni
-volume move : le client valide ses accès/permissions, puis les clones sont
-supprimés (les commandes exactes sont affichées en fin d'action).
+Construit l'environnement cible **complet, sauf le split / volume move** :
+FlexClones `v_<qtree>_<uid>` sur la future PROD **et** la future DR, avec
+les **relations SnapMirror entre les clones** (resync attendu idle). Les
+clones restent attachés à leur volume DP parent : zéro espace consommé.
 
-### 3.4 acl — forcer des groupes AD (DACL côté NetApp)
+L'environnement est **limité dans le temps** (`--test-validity-days`,
+défaut 7 jours ; la date d'expiration est stockée dans le fichier de job).
+Avant cette date :
+
+* le client valide accès et permissions ;
+* `--action clone` **promeut** cet environnement en définitif (seuls les
+  volume moves sont lancés — rien n'est reconstruit) ;
+* sinon, passé la date, les clones doivent être **supprimés** (les
+  commandes exactes sont affichées en fin d'action).
+
+Une seule invocation `test` par job : relancer `test` alors qu'un
+environnement existe est refusé (le promouvoir ou le supprimer d'abord).
+
+### 3.4 acl — forcer des groupes AD sur un path (DACL côté NetApp)
+
+Action **totalement découplée** de `test` et `clone` : elle n'agit que sur
+**un path** fourni par le client, invocable sur n'importe quel path de ses
+volumes de destination.
 
 ```bash
-# Sur tous les volumes clones du dernier test/clone :
 python3 netapp_cascade_migration.py --action acl --job-id <ID> \
-    --qtrees all --ad-groups 'CORP\grp_rw,CORP\grp_ro' --acl-rights modify
-
-# Ou sur un chemin précis d'un share du client :
-python3 netapp_cascade_migration.py --action acl --job-id <ID> \
-    --acl-path /v_q_fin_8072b8/projects --ad-groups 'CORP\grp_rw'
+    --acl-path /v_q_fin_8072b8/projects \
+    --ad-groups 'CORP\grp_rw,CORP\grp_ro' --acl-rights modify
 ```
+
+`--acl-path` est obligatoire (chemin absolu sur le vserver de destination).
+Le forçage est propagé sur toute l'arborescence (dossier, sous-dossiers,
+fichiers) côté PROD ; la DR reçoit les ACLs via la réplication SnapMirror
+des clones.
 
 ### 3.5 clone — clones définitifs + détachement
 
@@ -189,9 +209,16 @@ python3 netapp_cascade_migration.py --action acl --job-id <ID> \
 python3 netapp_cascade_migration.py --action clone --job-id <ID> --qtrees q_fin,q_hr
 ```
 
-Snapshot dédié → propagation cascade → FlexClones sur PROD et DR →
-SnapMirror entre clones + resync → sélection automatique du meilleur
-aggregate → `volume move` (détachement du parent) → sortie immédiate.
+Deux modes automatiques :
+
+* **Promotion** — un environnement `test` existe dans le job : vérification
+  que les miroirs de clones sont idle, puis `volume move` (détachement des
+  parents). Rien n'est reconstruit ; les qtrees demandés doivent
+  correspondre à ceux du test.
+* **Flux complet** — pas d'environnement de test : snapshot dédié →
+  propagation cascade → FlexClones sur PROD et DR → SnapMirror entre
+  clones + resync → sélection automatique du meilleur aggregate →
+  `volume move` → sortie immédiate.
 
 ### 3.6 cleanup — coupure d'accès source
 
@@ -288,16 +315,19 @@ curl -s $BASE/migrations/$JOB/status
 curl -s -X POST $BASE/migrations/$JOB/resume \
      -H 'Content-Type: application/json' -d '{"confirm": true}'
 
-# Clones de test (fins, aucun espace consommé)
+# Environnement de test complet (clones + miroir PROD->DR, limité à 7 jours)
 curl -s -X POST $BASE/migrations/$JOB/test \
-     -H 'Content-Type: application/json' -d '{"qtrees": ["q_fin", "q_hr"]}'
+     -H 'Content-Type: application/json' \
+     -d '{"qtrees": ["q_fin", "q_hr"], "validity_days": 7}'
 
-# Forcer les groupes AD sur les clones du test
+# Forcer des groupes AD sur UN path précis (découplé de test/clone)
 curl -s -X POST $BASE/migrations/$JOB/acl \
      -H 'Content-Type: application/json' \
-     -d '{"ad_groups": ["CORP\\grp_rw"], "acl_rights": "modify", "qtrees": "all"}'
+     -d '{"ad_groups": ["CORP\\grp_rw"], "acl_path": "/v_q_fin_8072b8/projects",
+          "acl_rights": "modify"}'
 
-# Clones définitifs + volume moves
+# Clones définitifs : promeut l'environnement de test s'il existe
+# (volume moves uniquement), sinon flux complet
 curl -s -X POST $BASE/migrations/$JOB/clone \
      -H 'Content-Type: application/json' -d '{"qtrees": "all"}'
 
@@ -341,10 +371,18 @@ create (pivot-only) ──> check-status ──> resume ──> check-status ...
         │                                                    │
         └── retry (si échec, reprend au dernier checkpoint)  │
                                                              v
-                       test (clones fins) ──> validation client ──> acl
+              test (env complet : clones + miroir, sans move, limité N jours)
+                                                             │
+                     validation client (accès, permissions)  │
+                                                             v
+              ┌─ avant expiration : clone = PROMOTION (vol moves seulement)
+              └─ après expiration : suppression des clones de test,
+                                    puis clone = flux complet
                                                              │
                                                              v
-                                    clone (définitif + vol move) ──> cleanup
+                                                          cleanup
+
+acl (indépendante) : à tout moment, sur n'importe quel path de destination
 ```
 
 Checkpoints du fichier de job (`--action retry` reprend au dernier atteint) :
@@ -354,9 +392,9 @@ started → space_checked → volumes_created → relationships_created
         → pivot_initialized → dest_initialized → completed
 ```
 
-Après `test` ou `clone`, le fichier de job contient aussi `clone_uid` et
-`clone_volumes` (noms `v_<qtree>_<uid>`) — utilisés par l'action `acl` pour
-retrouver les chemins exacts.
+Après `test`, le fichier de job contient `clone_uid`, `clone_volumes`,
+`test_env`, `test_created_at` et `test_expires_at` ; la promotion par
+`clone` bascule `test_env` à `false` et enregistre `clone_promoted_at`.
 
 ---
 
