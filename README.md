@@ -285,9 +285,9 @@ Documentation interactive (Swagger UI) : `http://<serveur>:8000/docs`
 | `GET`  | `/api/v1/migrations/{id}/status` | état réplication live (interroge ONTAP) | `200` |
 | `POST` | `/api/v1/migrations/{id}/resume` | fan-out PROD + DR | `200` / `409` |
 | `POST` | `/api/v1/migrations/{id}/retry` | reprise après échec | `202` (fond) |
-| `POST` | `/api/v1/migrations/{id}/test` | clones fins de validation | `202` (fond) |
-| `POST` | `/api/v1/migrations/{id}/clone` | clones définitifs + vol move | `202` (fond) |
-| `POST` | `/api/v1/migrations/{id}/acl` | forçage DACL groupes AD | `200` |
+| `POST` | `/api/v1/migrations/{id}/test` | env de test complet (clones + miroir, limité dans le temps) | `202` (fond) |
+| `POST` | `/api/v1/migrations/{id}/clone` | clones définitifs (promotion du test, ou `fresh` / flux complet) | `202` (fond) |
+| `POST` | `/api/v1/migrations/{id}/acl` | forçage DACL groupes AD sur un path | `200` |
 | `POST` | `/api/v1/migrations/{id}/cleanup` | coupure accès source | `200` |
 | `GET`  | `/api/v1/health` | disponibilité du service | `200` |
 
@@ -391,6 +391,8 @@ create (pivot-only) ──> check-status ──> resume ──> check-status ...
                      validation client (accès, permissions)  │
                                                              v
               ┌─ avant expiration : clone = PROMOTION (vol moves seulement)
+              ├─ à tout moment    : clone --fresh = flux complet sur base
+              │                     propre (anciens clones de test à supprimer)
               └─ après expiration : suppression des clones de test,
                                     puis clone = flux complet
                                                              │
@@ -410,6 +412,9 @@ started → space_checked → volumes_created → relationships_created
 Après `test`, le fichier de job contient `clone_uid`, `clone_volumes`,
 `test_env`, `test_created_at` et `test_expires_at` ; la promotion par
 `clone` bascule `test_env` à `false` et enregistre `clone_promoted_at`.
+Un `clone --fresh` remplace `clone_uid`/`clone_volumes` par ceux du
+nouveau run — les anciens clones de test restent sur les clusters et sont
+listés en fin de run pour suppression manuelle.
 
 ---
 
