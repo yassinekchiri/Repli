@@ -505,5 +505,8 @@ end of the run for manual deletion.
   original run.
 * **`409 action already running`** (API): another action is already
   running for this job; wait for it to finish (`GET /migrations/{id}`).
+* **Blank `/docs` page**: the Swagger UI assets are served locally by the
+  API (`/static/`) precisely for offline servers — if the page is blank,
+  make sure you pulled the latest code and restarted uvicorn.
 * **Full trace**: the `migration_<action>_<date>.log` file contains every
   REST/SSH call at DEBUG level.

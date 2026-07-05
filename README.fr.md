@@ -506,5 +506,9 @@ listés en fin de run pour suppression manuelle.
   d'origine.
 * **`409 action already running`** (API) : une action est déjà en cours sur
   ce job ; attendre sa fin (`GET /migrations/{id}`).
+* **Page `/docs` vide** : les assets Swagger UI sont servis en local par
+  l'API (`/static/`) précisément pour les serveurs sans Internet — si la
+  page est vide, vérifier que le code est à jour (`git pull`) et relancer
+  uvicorn.
 * **Trace complète** : le fichier `migration_<action>_<date>.log` contient
   chaque appel REST/SSH en DEBUG.

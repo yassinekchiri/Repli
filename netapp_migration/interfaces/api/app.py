@@ -26,12 +26,15 @@ follow their console output and final state. One action at a time per job
 """
 
 import logging
+import os
 import threading
 import uuid
 from typing import Callable, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from ...config import CredentialsResolver, job_dir
 from ...core.engine import MigrationEngine
@@ -44,12 +47,31 @@ from .schemas import (CreateMigrationRequest, ResumeRequest, CloneRequest,
 
 _MAX_CAPTURED_LOG_LINES = 4000
 
+# Swagger UI assets are served locally (static/) because the target
+# servers have no Internet access: the default FastAPI /docs page pulls
+# its JS/CSS from a public CDN and renders blank offline.
 app = FastAPI(
     title="NetApp Cascade Migration API",
     description="Y fan-out migration orchestration "
                 "(Source -> Pivot -> PROD + DR) over the ONTAP REST API.",
     version="2.0.0",
+    docs_url=None,
+    redoc_url=None,
 )
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+def swagger_ui():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} — Swagger UI",
+        swagger_js_url="/static/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-ui.css",
+        swagger_favicon_url="/static/favicon-32x32.png",
+    )
 
 _store = JobStore(job_dir())
 _registry_lock = threading.Lock()
