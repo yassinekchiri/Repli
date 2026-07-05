@@ -86,12 +86,14 @@ pip install -r requirements.txt
 ### 2.2b Offline installation (server without repository access)
 
 The repository ships a `wheels/` directory with every required package
-pre-downloaded (CPython 3.11 / Linux x86_64). On a server that cannot
-reach any PyPI mirror:
+pre-downloaded (CPython 3.9 to 3.12 / Linux x86_64). On a server that
+cannot reach any PyPI mirror:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+# upgrade pip first (old pip versions reject recent manylinux wheels):
+pip install --no-index --find-links wheels/ --upgrade pip setuptools wheel
 pip install --no-index --find-links wheels/ -r requirements.txt
 ```
 

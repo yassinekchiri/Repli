@@ -11,20 +11,40 @@ pip install --no-index --find-links wheels/ -r requirements.txt
 
 Pure-Python wheels (`*-py3-none-any.whl`) work everywhere. The compiled
 ones (`pydantic_core`, `uvloop`, `httptools`, `pyyaml`, `watchfiles`,
-`websockets`, `charset_normalizer`) are built for:
+`websockets`, `charset_normalizer`) are provided for:
 
-    CPython 3.11 / Linux x86_64 (manylinux)
+    CPython 3.9, 3.10, 3.11 and 3.12  /  Linux x86_64 (manylinux)
 
-If the target server runs another Python version or architecture,
-regenerate this directory from any machine that has repository access:
+pip picks the right variant automatically for the server's Python.
+
+## "No matching distribution found" on an old pip
+
+An outdated pip may not recognise recent manylinux tags and reject every
+compiled wheel (`from versions: none`). Upgrade pip FIRST, offline, from
+this same directory (pip/setuptools/wheel are included):
 
 ```bash
-# from a machine matching the server's Python/arch:
+python3 -m pip install --no-index --find-links wheels/ --upgrade pip setuptools wheel
+python3 -m pip install --no-index --find-links wheels/ -r requirements.txt
+```
+
+If it still fails, check `python3 --version`: below 3.9 the pinned
+versions of fastapi/pydantic cannot run — report it so the requirements
+can be re-pinned.
+
+## Regenerating
+
+From any machine WITH repository access:
+
+```bash
+# current interpreter/arch:
 pip download -r requirements.txt -d wheels/
 
-# or cross-download for a specific version (wheels only):
+# specific version (wheels only), e.g. 3.10:
 pip download -r requirements.txt -d wheels/ \
-    --only-binary :all: --python-version 3.9 --platform manylinux2014_x86_64
+    --only-binary :all: --python-version 3.10 \
+    --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+    --platform manylinux1_x86_64 --platform any
 ```
 
 Then commit the refreshed directory.

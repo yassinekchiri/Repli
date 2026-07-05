@@ -85,12 +85,14 @@ pip install -r requirements.txt
 ### 2.2b Installation hors-ligne (serveur sans accès aux dépôts)
 
 Le dépôt embarque un répertoire `wheels/` avec tous les paquets requis
-pré-téléchargés (CPython 3.11 / Linux x86_64). Sur un serveur qui n'a
-accès à aucun miroir PyPI :
+pré-téléchargés (CPython 3.9 à 3.12 / Linux x86_64). Sur un serveur qui
+n'a accès à aucun miroir PyPI :
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+# mettre pip à jour d'abord (les vieux pip rejettent les wheels manylinux récents) :
+pip install --no-index --find-links wheels/ --upgrade pip setuptools wheel
 pip install --no-index --find-links wheels/ -r requirements.txt
 ```
 
