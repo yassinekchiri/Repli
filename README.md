@@ -83,6 +83,21 @@ pip install -r requirements.txt
 # pip install paramiko
 ```
 
+### 2.2b Offline installation (server without repository access)
+
+The repository ships a `wheels/` directory with every required package
+pre-downloaded (CPython 3.11 / Linux x86_64). On a server that cannot
+reach any PyPI mirror:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --no-index --find-links wheels/ -r requirements.txt
+```
+
+To regenerate the wheels for another Python version or architecture, see
+[wheels/README.md](wheels/README.md).
+
 ### 2.3 REST credentials configuration
 
 Create a `creds.json` file (protect it: `chmod 600 creds.json`):

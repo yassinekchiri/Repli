@@ -82,6 +82,21 @@ pip install -r requirements.txt
 # pip install paramiko
 ```
 
+### 2.2b Installation hors-ligne (serveur sans accès aux dépôts)
+
+Le dépôt embarque un répertoire `wheels/` avec tous les paquets requis
+pré-téléchargés (CPython 3.11 / Linux x86_64). Sur un serveur qui n'a
+accès à aucun miroir PyPI :
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --no-index --find-links wheels/ -r requirements.txt
+```
+
+Pour régénérer les wheels pour une autre version de Python ou une autre
+architecture, voir [wheels/README.md](wheels/README.md).
+
 ### 2.3 Configuration des credentials REST
 
 Créer un fichier `creds.json` (à protéger : `chmod 600 creds.json`) :
