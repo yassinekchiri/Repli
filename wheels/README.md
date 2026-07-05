@@ -9,28 +9,32 @@ pip install --no-index --find-links wheels/ -r requirements.txt
 
 ## Platform compatibility
 
-Pure-Python wheels (`*-py3-none-any.whl`) work everywhere. The compiled
-ones (`pydantic_core`, `uvloop`, `httptools`, `pyyaml`, `watchfiles`,
-`websockets`, `charset_normalizer`) are provided for:
+Every version shipped here is compatible with **CPython 3.9 through 3.12**
+(the lowest-common-denominator releases were kept on purpose: e.g.
+fastapi 0.128.8, requests 2.32.5 — newer releases dropped Python 3.9,
+and old pip resolvers pick the highest version then fail with
+"requires a different Python" instead of backtracking).
 
-    CPython 3.9, 3.10, 3.11 and 3.12  /  Linux x86_64 (manylinux)
+Compiled wheels (`pydantic_core`, `uvloop`, `httptools`, `pyyaml`,
+`watchfiles`, `websockets`, `charset_normalizer`) are provided for
+CPython 3.9 / 3.10 / 3.11 / 3.12, Linux x86_64 (manylinux). pip picks the
+right variant automatically.
 
-pip picks the right variant automatically for the server's Python.
+## Recommended install order
 
-## "No matching distribution found" on an old pip
-
-An outdated pip may not recognise recent manylinux tags and reject every
-compiled wheel (`from versions: none`). Upgrade pip FIRST, offline, from
-this same directory (pip/setuptools/wheel are included):
+Upgrade pip FIRST, offline, from this same directory (pip 26.0.1 /
+setuptools 82.0.1 / wheel / packaging are included — the last releases
+still supporting Python 3.9):
 
 ```bash
 python3 -m pip install --no-index --find-links wheels/ --upgrade pip setuptools wheel
 python3 -m pip install --no-index --find-links wheels/ -r requirements.txt
 ```
 
-If it still fails, check `python3 --version`: below 3.9 the pinned
-versions of fastapi/pydantic cannot run — report it so the requirements
-can be re-pinned.
+An outdated pip may also reject recent manylinux tags ("from versions:
+none") — the upgrade above fixes that too. If it still fails, check
+`python3 --version`: below 3.9 nothing here can run — report it so the
+requirements can be re-pinned.
 
 ## Regenerating
 
