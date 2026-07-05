@@ -648,24 +648,38 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'clone'
     # =====================================================================
-    def clone(self, qtrees_arg: str, job: Optional[dict] = None) -> dict:
+    def clone(self, qtrees_arg: str, job: Optional[dict] = None,
+              fresh: bool = False) -> dict:
         """Definitive clones.
 
-        Two modes:
+        Three modes:
           - a TEST environment exists in the job file -> PROMOTION: the test
             clones already carry the data and the PROD->DR mirror; only the
             volume moves (detach from parents) are launched;
+          - fresh=True -> the existing test environment (if any) is IGNORED
+            and the full flow runs on a clean base; the old test clones are
+            left in place and must be deleted manually (commands printed);
           - no test environment -> full flow (snapshot, propagation,
             FlexClones, clone mirror + resync, volume moves).
         """
         p = self.p
+        old_test_env: Optional[dict] = None
         if job is not None:
             self.job_id = job["job_id"]
             if job.get("test_env") and job.get("clone_uid"):
-                return self._promote_test_env(qtrees_arg, job)
+                if not fresh:
+                    return self._promote_test_env(qtrees_arg, job)
+                # Fresh start requested: keep track of the abandoned test
+                # environment so its clones can be cleaned up afterwards.
+                old_test_env = {"uid": job["clone_uid"],
+                                "volumes": list(job.get("clone_volumes", []))}
+                self.log.warning("FRESH mode: ignoring the existing test "
+                                 "environment (uid %s) — its clones stay in "
+                                 "place and must be deleted manually (see end "
+                                 "of run).", old_test_env["uid"])
 
         self.log.info("=" * 60)
-        self.log.info("  ACTION: clone")
+        self.log.info("  ACTION: clone%s", "  [fresh]" if fresh else "")
         self.log.info("  %s  >>  %s  +  %s",
                       p.source_cluster, p.dest_cluster, p.dr_cluster)
         self.log.info("=" * 60)
@@ -739,10 +753,25 @@ class MigrationEngine:
         self.log.info("")
         self.log.info("  Monitor moves: volume move show -vserver %s / %s",
                       p.dest_vserver, p.dr_vserver)
+        if old_test_env:
+            self.log.info("")
+            self.log.warning("  Abandoned TEST environment %s — delete its "
+                             "clones once convenient:", old_test_env["uid"])
+            for vol in old_test_env["volumes"]:
+                self.log.info("      snapmirror delete -destination-path %s",
+                              p.path(p.dr_vserver, vol))
+            for cluster, svm in ((p.dest_cluster, p.dest_vserver),
+                                 (p.dr_cluster,   p.dr_vserver)):
+                self.log.info("      On %s:", cluster)
+                for vol in old_test_env["volumes"]:
+                    self.log.info("        volume offline -vserver %s -volume "
+                                  "%s ; volume delete -vserver %s -volume %s",
+                                  svm, vol, svm, vol)
         self.log.info("=" * 60)
         return {"clone_uid": clone_uid,
                 "clone_volumes": [f"v_{q}_{clone_uid}" for q in qtrees],
-                "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr}
+                "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr,
+                "abandoned_test_env": old_test_env}
 
     # =====================================================================
     # ACTION 'test'

@@ -53,6 +53,15 @@ class TestRequest(QtreesRequest):
     validity_days: int = Field(7, ge=1, le=365)
 
 
+class CloneRequest(QtreesRequest):
+    """clone payload: qtrees + optional fresh start.
+
+    fresh=true ignores an existing test environment and runs the full flow
+    on a clean base (the old test clones are left to delete manually).
+    """
+    fresh: bool = False
+
+
 class AclRequest(BaseModel):
     """acl payload: decoupled from test/clone — one explicit path."""
     ad_groups: Union[str, List[str]]

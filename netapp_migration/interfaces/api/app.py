@@ -38,7 +38,7 @@ from ...core.engine import MigrationEngine
 from ...core.jobs import JobStore, JobNotFound
 from ...models import MigrationParams, OntapError, ConfirmationRequired
 from ...transport import build_client
-from .schemas import (CreateMigrationRequest, ResumeRequest, QtreesRequest,
+from .schemas import (CreateMigrationRequest, ResumeRequest, CloneRequest,
                       TestRequest, AclRequest, CleanupRequest,
                       ActionAccepted, ActionResult)
 
@@ -283,19 +283,20 @@ def test_migration(job_id: str, req: TestRequest):
 
 @app.post("/api/v1/migrations/{job_id}/clone", status_code=202,
           response_model=ActionAccepted)
-def clone_migration(job_id: str, req: QtreesRequest):
+def clone_migration(job_id: str, req: CloneRequest):
     """Definitive clones.
 
     If a test environment exists for this job, it is PROMOTED (volume moves
-    only); otherwise the full flow runs (propagation, FlexClones, clone
-    mirror, volume moves).
+    only) — unless "fresh": true, which ignores the test environment and
+    runs the full flow on a clean base. Without a test environment the full
+    flow runs (propagation, FlexClones, clone mirror, volume moves).
     """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
 
     def target(logger):
         engine = _engine_for(params, logger)
-        engine.clone(req.qtrees_csv, job=job)
+        engine.clone(req.qtrees_csv, job=job, fresh=req.fresh)
 
     _run_in_background(job_id, "clone", target)
     return ActionAccepted(job_id=job_id, action="clone",

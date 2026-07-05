@@ -209,12 +209,22 @@ des clones.
 python3 netapp_cascade_migration.py --action clone --job-id <ID> --qtrees q_fin,q_hr
 ```
 
-Deux modes automatiques :
+Trois modes :
 
-* **Promotion** — un environnement `test` existe dans le job : vérification
+* **Promotion** (défaut si un environnement `test` existe) : vérification
   que les miroirs de clones sont idle, puis `volume move` (détachement des
   parents). Rien n'est reconstruit ; les qtrees demandés doivent
   correspondre à ceux du test.
+* **`--fresh`** — repartir sur une base propre **même si un test existe** :
+  l'environnement de test est ignoré et le flux complet s'exécute (nouveau
+  snapshot, nouveaux clones avec un nouvel UID). Les anciens clones de test
+  restent en place ; les commandes pour les supprimer sont affichées en fin
+  de run.
+
+  ```bash
+  python3 netapp_cascade_migration.py --action clone --job-id <ID> \
+      --qtrees q_fin,q_hr --fresh
+  ```
 * **Flux complet** — pas d'environnement de test : snapshot dédié →
   propagation cascade → FlexClones sur PROD et DR → SnapMirror entre
   clones + resync → sélection automatique du meilleur aggregate →
@@ -330,6 +340,11 @@ curl -s -X POST $BASE/migrations/$JOB/acl \
 # (volume moves uniquement), sinon flux complet
 curl -s -X POST $BASE/migrations/$JOB/clone \
      -H 'Content-Type: application/json' -d '{"qtrees": "all"}'
+
+# Clones définitifs sur base propre en ignorant l'environnement de test
+# (les anciens clones de test restent à supprimer manuellement)
+curl -s -X POST $BASE/migrations/$JOB/clone \
+     -H 'Content-Type: application/json' -d '{"qtrees": "all", "fresh": true}'
 
 # Coupure d'accès source pour un qtree migré
 curl -s -X POST $BASE/migrations/$JOB/cleanup \

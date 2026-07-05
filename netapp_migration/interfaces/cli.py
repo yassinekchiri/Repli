@@ -112,6 +112,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-validity-days", type=int, default=7,
                         help="(test) validity of the test environment in "
                              "days (default: 7).")
+    parser.add_argument("--fresh", action="store_true",
+                        help="(clone) start from a clean base even if a test "
+                             "environment exists: the full flow runs and the "
+                             "old test clones are left to delete manually.")
     parser.add_argument("--yes", action="store_true",
                         help="(resume) skip the interactive confirmation.")
 
@@ -252,7 +256,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.action == "clone":
             if job is None:
                 engine.check_clone_prerequisites()
-            engine.clone(args.qtrees, job=job)
+            engine.clone(args.qtrees, job=job, fresh=args.fresh)
         elif args.action == "test":
             engine.test(args.qtrees, job=job,
                         validity_days=args.test_validity_days)
