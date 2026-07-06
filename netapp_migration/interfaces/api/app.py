@@ -71,6 +71,20 @@ _SWAGGER_UI_VERSION = "4.15.5"   # cache-buster: bump when assets change
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def _no_cache_docs(request, call_next):
+    """Forbid browser caching of the docs page and the OpenAPI schema.
+
+    Without Cache-Control headers, browsers (Edge in particular) cache
+    /openapi.json heuristically and keep rendering a stale schema in
+    Swagger UI even after the server is updated.
+    """
+    response = await call_next(request)
+    if request.url.path in ("/docs", "/openapi.json"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/docs", include_in_schema=False)
 def swagger_ui():
     return get_swagger_ui_html(
