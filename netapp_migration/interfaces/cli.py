@@ -91,6 +91,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dest-aggr", default="aggr1_dest")
     parser.add_argument("--dr-aggr", default="aggr1_dr")
     parser.add_argument("--noaccess-policy", default="ep_noaccess")
+    parser.add_argument("--snapmirror-schedule", default="hourly",
+                        help="Cron schedule name attached to the SnapMirror "
+                             "relationships. Must exist on the destination "
+                             "cluster (job schedule cron show). Use 'none' "
+                             "to create relationships without a schedule "
+                             "(default: hourly).")
 
     # Action-specific
     parser.add_argument("--create-mode", choices=["full", "pivot-only"],
@@ -188,6 +194,7 @@ def params_from_args(args) -> MigrationParams:
         dest_vserver=args.dest_vserver, dr_vserver=args.dr_vserver,
         pivot_aggr=args.pivot_aggr, dest_aggr=args.dest_aggr,
         dr_aggr=args.dr_aggr, noaccess_policy=args.noaccess_policy,
+        snapmirror_schedule=args.snapmirror_schedule,
         timeout=args.timeout, poll_interval=args.poll_interval,
         dry_run=args.dry_run, transport=args.transport,
         ssh_backend=args.ssh_backend, ssh_user=args.ssh_user,

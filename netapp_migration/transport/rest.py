@@ -338,8 +338,11 @@ class RestClient(OntapClient):
             "source": {"path": source_path},
             "destination": {"path": dest_path},
             "policy": {"name": policy},
-            "transfer_schedule": {"name": schedule},
         }
+        # The cron schedule must exist on the destination cluster; skip the
+        # field entirely when the operator asked for no schedule ("none").
+        if schedule and schedule.lower() != "none":
+            payload["transfer_schedule"] = {"name": schedule}
         try:
             self._request(cluster, "POST", "/snapmirror/relationships",
                           json_body=payload)

@@ -28,6 +28,7 @@ class CreateMigrationRequest(BaseModel):
     dest_aggr: str = "aggr1_dest"
     dr_aggr: str = "aggr1_dr"
     noaccess_policy: str = "ep_noaccess"
+    snapmirror_schedule: str = "hourly"   # cron name on the clusters; "none" to skip
     create_mode: str = Field("full", pattern="^(full|pivot-only)$")
     timeout: int = 3600
     poll_interval: int = 30
