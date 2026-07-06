@@ -50,6 +50,10 @@ _MAX_CAPTURED_LOG_LINES = 4000
 # Swagger UI assets are served locally (static/) because the target
 # servers have no Internet access: the default FastAPI /docs page pulls
 # its JS/CSS from a public CDN and renders blank offline.
+#
+# Vendored Swagger UI is 4.15.5 on purpose: v5 requires a recent browser
+# (modern JS syntax -> silent blank page on older corporate browsers).
+# 4.15.5 only renders OpenAPI 3.0.x, hence openapi_version="3.0.2".
 app = FastAPI(
     title="NetApp Cascade Migration API",
     description="Y fan-out migration orchestration "
@@ -58,8 +62,12 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+# Attribute (not a constructor parameter): pin the version string so
+# Swagger UI 4.x accepts the definition.
+app.openapi_version = "3.0.2"
 
 _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+_SWAGGER_UI_VERSION = "4.15.5"   # cache-buster: bump when assets change
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
@@ -68,8 +76,8 @@ def swagger_ui():
     return get_swagger_ui_html(
         openapi_url=app.openapi_url,
         title=f"{app.title} — Swagger UI",
-        swagger_js_url="/static/swagger-ui-bundle.js",
-        swagger_css_url="/static/swagger-ui.css",
+        swagger_js_url=f"/static/swagger-ui-bundle.js?v={_SWAGGER_UI_VERSION}",
+        swagger_css_url=f"/static/swagger-ui.css?v={_SWAGGER_UI_VERSION}",
         swagger_favicon_url="/static/favicon-32x32.png",
     )
 
