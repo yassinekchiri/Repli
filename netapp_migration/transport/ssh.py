@@ -345,11 +345,9 @@ class SshClient(OntapClient):
     def snapmirror_create(self, cluster, source_path, dest_path,
                           policy="MirrorAllSnapshots", schedule="hourly",
                           idempotent=False):
-        schedule_opt = (f"-schedule {schedule} "
-                        if schedule and schedule.lower() != "none" else "")
         cmd = (f"snapmirror create -source-path {source_path} "
                f"-destination-path {dest_path} -type XDP "
-               f"-policy {policy} {schedule_opt}-throttle unlimited")
+               f"-policy {policy} -schedule {schedule} -throttle unlimited")
         if idempotent:
             r = self._run(cluster, cmd, allow_failure=True)
             if self._already_exists(r):

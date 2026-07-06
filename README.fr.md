@@ -324,7 +324,6 @@ python3 netapp_cascade_migration.py --action cleanup \
 | `--api-user USER` | force le login REST (mot de passe via env/config) |
 | `--insecure` | désactive la vérification TLS (certifs auto-signés) |
 | `--job-dir PATH` | répertoire des fichiers de job |
-| `--snapmirror-schedule NOM` | schedule cron des relations ; doit exister sur le cluster destination ; `none` pour ne pas en mettre (défaut : `hourly`) |
 | `--dry-run` | simulation complète, aucun cluster contacté |
 | `--yes` | (resume) saute la confirmation interactive |
 | `--timeout` / `--poll-interval` | polling SnapMirror (s) |
@@ -507,12 +506,6 @@ listés en fin de run pour suppression manuelle.
   d'origine.
 * **`409 action already running`** (API) : une action est déjà en cours sur
   ce job ; attendre sa fin (`GET /migrations/{id}`).
-* **`Schedule "hourly" not found`** à la création des relations : le
-  schedule cron n'existe pas sur le cluster destination. Soit le créer
-  (`job schedule cron show` / `job schedule cron create -name hourly
-  -minute 5`), soit passer `--snapmirror-schedule <existant>` (CLI) /
-  `"snapmirror_schedule"` (API) — la valeur `none` crée les relations
-  sans schedule.
 * **Page `/docs` vide** : les assets Swagger UI sont servis en local par
   l'API (`/static/`) précisément pour les serveurs sans Internet — si la
   page est vide, vérifier que le code est à jour (`git pull`) et relancer

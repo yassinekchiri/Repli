@@ -202,12 +202,9 @@ class MigrationEngine:
 
         # -- The three SnapMirror relationships (no transfer yet) ----------
         self.c.snapmirror_create(p.pivot_cluster,
-                                 p.path(p.source_vserver, p.volume), pivot_path,
-                                 schedule=p.snapmirror_schedule)
-        self.c.snapmirror_create(p.dest_cluster, pivot_path, prod_path,
-                                 schedule=p.snapmirror_schedule)
-        self.c.snapmirror_create(p.dr_cluster,   pivot_path, dr_path,
-                                 schedule=p.snapmirror_schedule)
+                                 p.path(p.source_vserver, p.volume), pivot_path)
+        self.c.snapmirror_create(p.dest_cluster, pivot_path, prod_path)
+        self.c.snapmirror_create(p.dr_cluster,   pivot_path, dr_path)
         self.log.info("SnapMirror relationships declared (src->pivot, "
                       "pivot->PROD, pivot->DR).")
         self.jobs.set_status(job, "relationships_created")
@@ -446,15 +443,12 @@ class MigrationEngine:
             self.log.info("--- Phase: SnapMirror creation (idempotent) ---")
             self.c.snapmirror_create(p.pivot_cluster,
                                      p.path(p.source_vserver, p.volume),
-                                     pivot_path, idempotent=True,
-                                     schedule=p.snapmirror_schedule)
+                                     pivot_path, idempotent=True)
             self.c.snapmirror_create(p.dest_cluster, pivot_path, prod_path,
-                                     idempotent=True,
-                                     schedule=p.snapmirror_schedule)
+                                     idempotent=True)
             if dr_path:
                 self.c.snapmirror_create(p.dr_cluster, pivot_path, dr_path,
-                                         idempotent=True,
-                                         schedule=p.snapmirror_schedule)
+                                         idempotent=True)
             self.jobs.set_status(job, "relationships_created")
         else:
             self.log.info("Skipping relationship creation (already completed).")
@@ -712,8 +706,7 @@ class MigrationEngine:
             clone_vol = f"v_{qtree}_{clone_uid}"
             prod_clone = p.path(p.dest_vserver, clone_vol)
             dr_clone = p.path(p.dr_vserver, clone_vol)
-            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone,
-                                     schedule=p.snapmirror_schedule)
+            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone)
             self.c.snapmirror_resync(p.dr_cluster, dr_clone)
             self.log.info("         '%s'  relationship created, resync "
                           "launched.", clone_vol)
@@ -841,8 +834,7 @@ class MigrationEngine:
             clone_vol = f"v_{qtree}_{clone_uid}"
             prod_clone = p.path(p.dest_vserver, clone_vol)
             dr_clone = p.path(p.dr_vserver, clone_vol)
-            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone,
-                                     schedule=p.snapmirror_schedule)
+            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone)
             self.c.snapmirror_resync(p.dr_cluster, dr_clone)
             self.log.info("         '%s'  relationship created, resync "
                           "launched.", clone_vol)

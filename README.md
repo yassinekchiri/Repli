@@ -322,7 +322,6 @@ python3 netapp_cascade_migration.py --action cleanup \
 | `--api-user USER` | REST login override (password via env/config) |
 | `--insecure` | skip TLS verification (self-signed certificates) |
 | `--job-dir PATH` | job files directory |
-| `--snapmirror-schedule NAME` | cron schedule for the relationships; must exist on the destination cluster; `none` to skip (default: `hourly`) |
 | `--dry-run` | full simulation, no cluster contacted |
 | `--yes` | (resume) skip the interactive confirmation |
 | `--timeout` / `--poll-interval` | SnapMirror polling (s) |
@@ -506,12 +505,6 @@ end of the run for manual deletion.
   original run.
 * **`409 action already running`** (API): another action is already
   running for this job; wait for it to finish (`GET /migrations/{id}`).
-* **`Schedule "hourly" not found`** when creating relationships: the cron
-  schedule does not exist on the destination cluster. Either create it
-  (`job schedule cron show` / `job schedule cron create -name hourly
-  -minute 5`) or pass `--snapmirror-schedule <existing>` (CLI) /
-  `"snapmirror_schedule"` (API) — value `none` creates the relationships
-  without any schedule.
 * **Blank `/docs` page**: the Swagger UI assets are served locally by the
   API (`/static/`) precisely for offline servers — if the page is blank,
   make sure you pulled the latest code and restarted uvicorn.
