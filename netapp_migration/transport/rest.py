@@ -348,6 +348,17 @@ class RestClient(OntapClient):
                 self.log.warning("SnapMirror %s -> %s already exists — skipping.",
                                  source_path, dest_path)
                 return
+            if "not found" in exc.detail.lower():
+                # ONTAP resolves referenced objects (schedule, policy, peer
+                # SVM) with the CALLER's permissions: an object the role
+                # cannot read is reported as missing even though it exists.
+                raise OntapError(
+                    cluster, exc.operation,
+                    f"{exc.detail} — hint: the referenced object may exist "
+                    f"but be invisible to the API user's role. Grant "
+                    f"readonly access to /api/cluster/schedules, "
+                    f"/api/snapmirror/policies and /api/svm/peers "
+                    f"(see README section 2.5).") from exc
             raise
 
     def _relationship_uuid(self, cluster: str, dest_path: str) -> str:

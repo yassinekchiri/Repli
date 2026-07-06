@@ -161,7 +161,19 @@ security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/sha
 security login rest-role create -role mutrepli_rest -api /api/protocols/file-security/permissions -access all
 security login rest-role create -role mutrepli_rest -api /api/svm/svms -access readonly
 security login rest-role create -role mutrepli_rest -api /api/cluster/jobs -access readonly
+security login rest-role create -role mutrepli_rest -api /api/cluster/schedules -access readonly
+security login rest-role create -role mutrepli_rest -api /api/snapmirror/policies -access readonly
+security login rest-role create -role mutrepli_rest -api /api/svm/peers -access readonly
 ```
+
+> **RBAC gotcha**: ONTAP resolves objects referenced inside a request
+> (the cron schedule, the SnapMirror policy, the peer SVM…) **with the
+> caller's permissions**. If the role cannot read the endpoint of a
+> referenced object, ONTAP answers `... not found` even though the
+> object exists — hence the three read-only grants above. Symptom
+> example: `Schedule "hourly" not found in the Administrative SVM or
+> the SVM for the relationship` while `job schedule cron show` displays
+> it as admin.
 
 **CLI role (used by the `ssh` fallback transport):**
 
@@ -505,6 +517,13 @@ end of the run for manual deletion.
   original run.
 * **`409 action already running`** (API): another action is already
   running for this job; wait for it to finish (`GET /migrations/{id}`).
+* **`Schedule "..." not found` / `Policy "..." not found`** while the
+  object exists on the cluster: the API user's role cannot READ the
+  endpoint of the referenced object, so ONTAP reports it as missing.
+  Grant the read-only accesses listed in section 2.5
+  (`/api/cluster/schedules`, `/api/snapmirror/policies`,
+  `/api/svm/peers`). Quick check as the service account:
+  `curl -sk -u mutrepli "https://<cluster>/api/cluster/schedules?name=hourly"`.
 * **Blank `/docs` page**: the Swagger UI assets are served locally by the
   API (`/static/`) precisely for offline servers — if the page is blank,
   make sure you pulled the latest code and restarted uvicorn.

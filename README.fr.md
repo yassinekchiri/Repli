@@ -160,7 +160,19 @@ security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/sha
 security login rest-role create -role mutrepli_rest -api /api/protocols/file-security/permissions -access all
 security login rest-role create -role mutrepli_rest -api /api/svm/svms -access readonly
 security login rest-role create -role mutrepli_rest -api /api/cluster/jobs -access readonly
+security login rest-role create -role mutrepli_rest -api /api/cluster/schedules -access readonly
+security login rest-role create -role mutrepli_rest -api /api/snapmirror/policies -access readonly
+security login rest-role create -role mutrepli_rest -api /api/svm/peers -access readonly
 ```
+
+> **Piège RBAC** : ONTAP résout les objets référencés dans une requête
+> (le schedule cron, la policy SnapMirror, le SVM peer…) **avec les
+> permissions de l'appelant**. Si le rôle ne peut pas lire l'endpoint
+> d'un objet référencé, ONTAP répond `... not found` alors que l'objet
+> existe — d'où les trois accès lecture seule ci-dessus. Symptôme
+> typique : `Schedule "hourly" not found in the Administrative SVM or
+> the SVM for the relationship` alors que `job schedule cron show`
+> l'affiche en tant qu'admin.
 
 **Rôle CLI (utilisé par le transport `ssh` de secours) :**
 
@@ -506,6 +518,13 @@ listés en fin de run pour suppression manuelle.
   d'origine.
 * **`409 action already running`** (API) : une action est déjà en cours sur
   ce job ; attendre sa fin (`GET /migrations/{id}`).
+* **`Schedule "..." not found` / `Policy "..." not found`** alors que
+  l'objet existe sur le cluster : le rôle de l'utilisateur API ne peut
+  pas LIRE l'endpoint de l'objet référencé, ONTAP le déclare donc
+  introuvable. Accorder les accès lecture seule listés en section 2.5
+  (`/api/cluster/schedules`, `/api/snapmirror/policies`,
+  `/api/svm/peers`). Vérification rapide avec le compte de service :
+  `curl -sk -u mutrepli "https://<cluster>/api/cluster/schedules?name=hourly"`.
 * **Page `/docs` vide** : les assets Swagger UI sont servis en local par
   l'API (`/static/`) précisément pour les serveurs sans Internet — si la
   page est vide, vérifier que le code est à jour (`git pull`) et relancer
