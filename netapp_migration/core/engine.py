@@ -264,6 +264,14 @@ class MigrationEngine:
             self.log.info("PROD and DR already initialized. Live state:")
             return self.check_status(job) or job
 
+        if status in ("started", "space_checked", "volumes_created",
+                      "relationships_created"):
+            self.log.info("  The 'create' action stopped before the pivot "
+                          "initialize (last checkpoint: %s).", status)
+            self.log.info("  Nothing to resume yet — run action 'retry' "
+                          "first to complete the remaining phases.")
+            return job
+
         # -- Single pivot status check (no polling loop) -------------------
         sm = self.c.get_snapmirror(p.pivot_cluster, pivot_path)
         self._log_table(
@@ -328,7 +336,36 @@ class MigrationEngine:
                     "transferred": sm.last_transfer_size,
                     "ready": sm.is_ready}
 
-        if status in ("started", "pivot_initialized"):
+        # -- 'create' interrupted before the pivot initialize ---------------
+        # (started / space_checked / volumes_created / relationships_created)
+        # There may be nothing to query on the clusters yet: show the
+        # checkpoint progression and point the operator at action 'retry'.
+        if status in ("started", "space_checked", "volumes_created",
+                      "relationships_created"):
+            idx = CREATE_STATUS_ORDER.index(status)
+            phase_labels = [
+                ("space_checked",         "Aggregate space check"),
+                ("volumes_created",       "DP volume creation"),
+                ("relationships_created", "SnapMirror relationships"),
+                ("pivot_initialized",     "Pivot initialize"),
+                ("dest_initialized",      "PROD + DR initialize"),
+                ("completed",             "Final synchronization"),
+            ]
+            rows = [[label,
+                     "done" if idx >= CREATE_STATUS_ORDER.index(cp)
+                     else "pending"]
+                    for cp, label in phase_labels]
+            self._log_table(["Create phase", "State"], rows)
+            result["pending_phases"] = [
+                label for cp, label in phase_labels
+                if idx < CREATE_STATUS_ORDER.index(cp)]
+            self.log.info("  The 'create' action stopped before the pivot "
+                          "initialize (last checkpoint: %s).", status)
+            self.log.info("  Resume it with action 'retry' — completed "
+                          "phases will be skipped.")
+            return result
+
+        if status == "pivot_initialized":
             pivot = leg("PIVOT", p.pivot_cluster, pivot_path)
             result["legs"] = [pivot]
             self._log_table(
