@@ -12,7 +12,8 @@ Two implementations exist:
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from ..models import VolumeInfo, AggregateInfo, SnapMirrorInfo
+from ..models import (VolumeInfo, AggregateInfo, SnapMirrorInfo, SvmInfo,
+                      PeerInfo)
 
 
 class OntapClient(ABC):
@@ -123,3 +124,44 @@ class OntapClient(ABC):
         rights: 'no-access' | 'read' | 'write' | 'modify' | 'full-control'.
         Propagation: this folder + sub-folders + files, mode 'propagate'.
         """
+
+    # =====================================================================
+    # READ-ONLY INTROSPECTION — used exclusively by the pre-flight checks.
+    # These must never mutate anything and must not raise when the object
+    # is simply absent: they answer "is this feasible?".
+    # =====================================================================
+
+    @abstractmethod
+    def get_svm(self, cluster: str, svm: str) -> SvmInfo:
+        """SVM state (exists / running / CIFS enabled). Never raises when
+        the SVM is absent: returns SvmInfo(exists=False)."""
+
+    @abstractmethod
+    def aggregate_exists(self, cluster: str, aggregate: str) -> bool:
+        """Explicit existence check (get_aggregate_available cannot tell an
+        absent aggregate from an unknown capacity)."""
+
+    @abstractmethod
+    def list_cluster_peers(self, cluster: str) -> List[PeerInfo]:
+        """Cluster peering entries seen from `cluster`."""
+
+    @abstractmethod
+    def list_svm_peers(self, cluster: str) -> List[PeerInfo]:
+        """SVM peering entries seen from `cluster`."""
+
+    @abstractmethod
+    def snapmirror_policy_exists(self, cluster: str, policy: str) -> bool:
+        """Whether the SnapMirror policy is visible to the API user."""
+
+    @abstractmethod
+    def schedule_exists(self, cluster: str, schedule: str) -> bool:
+        """Whether the cron schedule is visible to the API user.
+
+        Visibility matters as much as existence: ONTAP resolves referenced
+        objects with the caller's permissions, so an object the role cannot
+        read is rejected as 'not found' at creation time.
+        """
+
+    @abstractmethod
+    def junction_path_exists(self, cluster: str, svm: str, path: str) -> bool:
+        """Whether an absolute NAS path is reachable on the SVM (ACL target)."""

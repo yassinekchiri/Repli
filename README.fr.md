@@ -54,6 +54,32 @@ requirements.txt
 Les fichiers de job (`netapp_migration_<ID>.json`) sont **compatibles** avec
 ceux générés par l'ancienne version mono-fichier du script.
 
+Voir [docs/architecture.md](docs/architecture.md) pour le schéma
+d'architecture, la carte complète des capacités de l'API et les workflows
+détaillés de la migration.
+
+### Vérifications préalables
+
+Chaque action vérifie ses prérequis sur les clusters **avant** de toucher à
+quoi que ce soit : SVMs, volumes, aggregates et capacité, peering
+cluster/SVM, visibilité de la policy et du schedule SnapMirror, état des
+relations, existence des qtrees, périmètre du chemin ACL, prévisualisation
+des partages CIFS pour cleanup. Une action refusée ne modifie rien et
+détaille chaque contrôle en échec avec ce qui a été observé et comment le
+corriger (tableau en CLI, HTTP 422). Interroger sans exécuter :
+
+```bash
+curl -s -X POST $BASE/preflight/create -d @create.json           # avant de créer
+curl -s -X POST $BASE/migrations/$JOB/preflight/clone?qtrees=all  # avant de cloner
+```
+
+### Tests
+
+```bash
+pip install --no-index --find-links wheels/ -r requirements-dev.txt
+python3 -m pytest            # 75 tests, hors-ligne, aucun cluster contacté
+```
+
 ---
 
 ## 2. Installation

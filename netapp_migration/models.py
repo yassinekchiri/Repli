@@ -44,6 +44,106 @@ class ConfirmationRequired(Exception):
     """
 
 
+class PreflightFailed(Exception):
+    """Raised when the pre-flight checks of an action did not pass.
+
+    Carries the full report so that interfaces can render every individual
+    check (CLI table / HTTP 422 body) instead of a single opaque message.
+    No cluster mutation has taken place when this is raised.
+    """
+
+    def __init__(self, report: "PreflightReport"):
+        self.report = report
+        super().__init__(report.summary())
+
+
+# =============================================================================
+# PRE-FLIGHT CHECKS
+# =============================================================================
+
+SEVERITY_ERROR = "error"      # blocks the action
+SEVERITY_WARNING = "warning"  # reported, does not block
+
+
+@dataclass
+class CheckResult:
+    """Outcome of one individual feasibility check.
+
+    code   : stable machine-readable identifier (for automation)
+    title  : short human label of what was verified
+    detail : what was actually observed on the cluster
+    hint   : how the operator can make the check pass
+    target : the object concerned, e.g. 'PIV110 / svm_pivot:vol_prod_01'
+    """
+    code: str
+    title: str
+    passed: bool
+    severity: str = SEVERITY_ERROR
+    detail: str = ""
+    hint: str = ""
+    target: str = ""
+
+    @property
+    def blocking(self) -> bool:
+        return (not self.passed) and self.severity == SEVERITY_ERROR
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class PreflightReport:
+    """All checks run before an action, with the overall verdict.
+
+    simulated=True means the checks ran against the dry-run transport: they
+    are informational only and never block.
+    """
+    action: str
+    checks: List[CheckResult] = field(default_factory=list)
+    simulated: bool = False
+
+    def add(self, check: CheckResult) -> CheckResult:
+        self.checks.append(check)
+        return check
+
+    @property
+    def failures(self) -> List[CheckResult]:
+        return [c for c in self.checks if c.blocking]
+
+    @property
+    def warnings(self) -> List[CheckResult]:
+        return [c for c in self.checks
+                if (not c.passed) and c.severity == SEVERITY_WARNING]
+
+    @property
+    def ok(self) -> bool:
+        """True when nothing blocks. A simulated report never blocks."""
+        return self.simulated or not self.failures
+
+    def summary(self) -> str:
+        if self.ok and not self.warnings:
+            return (f"pre-flight for action '{self.action}': "
+                    f"{len(self.checks)} check(s) passed")
+        if self.ok:
+            return (f"pre-flight for action '{self.action}': passed with "
+                    f"{len(self.warnings)} warning(s)")
+        codes = ", ".join(c.code for c in self.failures)
+        return (f"pre-flight for action '{self.action}': "
+                f"{len(self.failures)} check(s) failed ({codes})")
+
+    def to_dict(self) -> dict:
+        return {
+            "action": self.action,
+            "ok": self.ok,
+            "simulated": self.simulated,
+            "summary": self.summary(),
+            "failed_count": len(self.failures),
+            "warning_count": len(self.warnings),
+            "checks": [c.to_dict() for c in self.checks],
+        }
+
+
+
 # =============================================================================
 # CREDENTIALS (REST transport, basic auth)
 # =============================================================================
@@ -130,22 +230,127 @@ class AggregateInfo:
 
 
 @dataclass
+class SvmInfo:
+    """Normalised SVM (vserver) view, used by the pre-flight checks."""
+    name: str
+    exists: bool = True
+    state: str = "unknown"          # 'running' | 'stopped' | ...
+    cifs_enabled: Optional[bool] = None
+    uuid: Optional[str] = None
+
+    @property
+    def is_running(self) -> bool:
+        return self.exists and self.state == "running"
+
+
+@dataclass
+class PeerInfo:
+    """Normalised peering entry (cluster peer or SVM peer)."""
+    name: str                       # remote cluster (or remote SVM for SVM peers)
+    state: str = "unknown"          # 'available' / 'peered' / 'unavailable' ...
+    local_svm: str = ""             # SVM peers only
+    peer_svm: str = ""              # SVM peers only
+    peer_cluster: str = ""          # SVM peers only
+
+    @property
+    def is_usable(self) -> bool:
+        return self.state in ("available", "peered", "ok")
+
+
+# --- SnapMirror state vocabulary -------------------------------------------
+# Explicit sets: anything not listed is 'unknown' and never treated as sane.
+
+TRANSFER_IDLE = "idle"
+TRANSFER_ACTIVE = frozenset({"queued", "preparing", "transferring",
+                             "finalizing"})
+TRANSFER_FAILED = frozenset({"failed", "aborted", "hard_aborted"})
+
+MIRROR_HEALTHY = frozenset({"snapmirrored", "in_sync"})
+MIRROR_UNINITIALIZED = frozenset({"uninitialized", "uninitialised"})
+MIRROR_BROKEN = frozenset({"broken_off", "broken-off", "out_of_sync"})
+MIRROR_ABSENT = "absent"
+
+
+@dataclass
 class SnapMirrorInfo:
     """Normalised SnapMirror relationship state.
 
-    state          : 'snapmirrored' | 'uninitialized' | 'broken_off' | ...
-    transfer_state : 'idle' | 'transferring'
+    state          : mirror state — 'snapmirrored', 'in_sync',
+                     'uninitialized', 'broken_off', 'out_of_sync',
+                     'absent' (no relationship) or 'unknown'
+    transfer_state : 'idle', 'queued', 'preparing', 'transferring',
+                     'finalizing', 'failed', 'aborted' or 'unknown'
+
+    Every predicate is deliberately strict: an absent, failed or unknown
+    relationship is NEVER reported as idle or ready. Callers that need a
+    reason to show the operator use `unhealthy_reason`.
     """
     dest_path: str
     state: str = "unknown"
     transfer_state: str = "unknown"
     last_transfer_size: str = "-"
     exists: bool = True
+    last_error: str = ""
+
+    # ---- transfer-level predicates ---------------------------------------
+    @property
+    def is_transferring(self) -> bool:
+        return self.transfer_state in TRANSFER_ACTIVE
 
     @property
-    def is_ready(self) -> bool:
-        return self.state in ("snapmirrored", "idle", "in_sync")
+    def transfer_failed(self) -> bool:
+        return self.transfer_state in TRANSFER_FAILED
 
     @property
     def is_idle(self) -> bool:
-        return self.transfer_state != "transferring"
+        """No transfer in flight AND the relationship is in a sane state.
+
+        Requires the relationship to exist and its last transfer not to have
+        failed: waiting for 'idle' must never be satisfied by an absent or
+        broken relationship.
+        """
+        return (self.exists
+                and self.transfer_state == TRANSFER_IDLE
+                and not self.is_broken)
+
+    # ---- mirror-level predicates -----------------------------------------
+    @property
+    def is_broken(self) -> bool:
+        return self.state in MIRROR_BROKEN or self.transfer_failed
+
+    @property
+    def is_uninitialized(self) -> bool:
+        return self.exists and self.state in MIRROR_UNINITIALIZED
+
+    @property
+    def is_mirrored(self) -> bool:
+        return self.exists and self.state in MIRROR_HEALTHY
+
+    @property
+    def is_ready(self) -> bool:
+        """Baseline done, data in place and nothing in flight."""
+        return self.is_mirrored and self.transfer_state == TRANSFER_IDLE
+
+    @property
+    def unhealthy_reason(self) -> str:
+        """Human explanation of why the relationship is not ready ('' if ok)."""
+        if not self.exists:
+            return "relationship does not exist"
+        if self.transfer_failed:
+            return (f"last transfer {self.transfer_state}"
+                    + (f": {self.last_error}" if self.last_error else ""))
+        if self.state in MIRROR_BROKEN:
+            return f"mirror state '{self.state}'"
+        if self.is_transferring:
+            return f"transfer in progress ({self.transfer_state})"
+        if self.is_uninitialized:
+            return "relationship declared but never initialized"
+        if not self.is_mirrored:
+            return f"unrecognised mirror state '{self.state}'"
+        return ""
+
+    def describe(self) -> str:
+        """One-line status for logs and API payloads."""
+        if not self.exists:
+            return "absent"
+        return f"{self.state}/{self.transfer_state}"

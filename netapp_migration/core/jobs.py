@@ -43,10 +43,18 @@ class JobNotFound(FileNotFoundError):
 
 
 class JobStore:
-    """Reads/writes migration job files in a single directory."""
+    """Reads/writes migration job files in a single directory.
 
-    def __init__(self, directory: str):
+    read_only=True turns every write into a no-op: used by simulated
+    (--dry-run) runs so a simulation can never rewrite the state of a real
+    job. Reads keep working normally.
+    """
+
+    def __init__(self, directory: str, read_only: bool = False):
         self.directory = directory
+        self.read_only = read_only
+        if not read_only and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
 
     # ------------------------------------------------------------------ #
     def _path(self, job_id: str) -> str:
@@ -80,6 +88,10 @@ class JobStore:
 
     def save(self, job: dict) -> str:
         path = self._path(job["job_id"])
+        if self.read_only:
+            # Simulated run: keep the in-memory job up to date, never touch
+            # the file on disk.
+            return path
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(job, fh, indent=2)

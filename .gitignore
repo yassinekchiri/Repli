@@ -11,3 +11,6 @@ migration_*.log
 
 # Fichiers de job generes a l'execution
 netapp_migration_*.json
+
+# Test artifacts
+.pytest_cache/

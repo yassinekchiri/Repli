@@ -23,9 +23,10 @@ import uuid as uuid_module
 from typing import List, Optional
 
 from ..models import (MigrationParams, OntapError, ConfirmationRequired,
-                      SnapMirrorInfo)
+                      PreflightFailed, PreflightReport, SnapMirrorInfo)
 from ..transport.base import OntapClient
 from .jobs import JobStore, CREATE_STATUS_ORDER
+from .preflight import PreflightChecker
 
 
 class MigrationEngine:
@@ -37,9 +38,15 @@ class MigrationEngine:
         self.p = params
         self.jobs = jobstore
         self.log = logger
+        # Pre-flight checks share the transport: they are read-only probes.
+        # Under dry-run their verdict is informational (simulated=True).
+        self.checker = PreflightChecker(client, params, logger,
+                                        simulated=params.dry_run)
         # Set as soon as a job file exists so callers can print the job id
         # on any failure.
         self.job_id: Optional[str] = None
+        # Report of the last pre-flight run, exposed to the interfaces.
+        self.last_preflight: Optional[PreflightReport] = None
 
     # ------------------------------------------------------------------ #
     # Presentation helpers (plain log lines; interfaces decide rendering)
@@ -87,6 +94,55 @@ class MigrationEngine:
         if prod_note or dr_note:
             self.log.info("  %-*s  %s", prod_w, prod_note, dr_note)
         self.log.info("")
+
+    # ------------------------------------------------------------------ #
+    # Pre-flight
+    # ------------------------------------------------------------------ #
+    def _preflight(self, report: PreflightReport) -> PreflightReport:
+        """Log a pre-flight report and stop the action if it blocks.
+
+        Nothing has been mutated when PreflightFailed is raised: the caller
+        (CLI or API) renders every individual check to the operator.
+        """
+        self.last_preflight = report
+        self.log.info("--- Pre-flight checks: action '%s' ---", report.action)
+
+        rows = []
+        for check in report.checks:
+            if check.passed:
+                verdict = "OK"
+            elif check.severity == "warning":
+                verdict = "WARN"
+            else:
+                verdict = "FAIL"
+            # Long observations (ONTAP error bodies) are truncated to keep
+            # the table readable; the full text stays in the DEBUG log.
+            detail = check.detail or "-"
+            if len(detail) > 68:
+                detail = detail[:65] + "..."
+            rows.append([verdict, check.title, detail, check.target or "-"])
+        if rows:
+            self._log_table(["", "Check", "Observed", "Target"], rows)
+
+        for check in report.checks:
+            if not check.passed:
+                self.log.debug("Check %s: %s | %s", check.code, check.title,
+                               check.detail)
+        for check in report.checks:
+            if not check.passed and check.hint:
+                level = self.log.warning if check.blocking else self.log.info
+                level("  %s [%s]: %s", "FIX" if check.blocking else "note",
+                      check.code, check.hint)
+
+        if report.simulated and report.failures:
+            self.log.warning("[DRY-RUN] %d check(s) would block a real run "
+                             "(simulated state, not blocking here).",
+                             len(report.failures))
+        if not report.ok:
+            self.log.error("%s", report.summary())
+            raise PreflightFailed(report)
+        self.log.info("%s", report.summary())
+        return report
 
     # ------------------------------------------------------------------ #
     # Shared building blocks
@@ -172,6 +228,11 @@ class MigrationEngine:
         self.log.info("=" * 60)
         self.log.info("  ACTION: create  (mode=%s)", create_mode)
         self.log.info("=" * 60)
+
+        # Nothing is created until every prerequisite is verified: SVMs,
+        # source volume, aggregates and their capacity, absence of leftover
+        # DP volumes and relationships, peering, policy and schedule.
+        self._preflight(self.checker.for_create())
 
         if job is None:
             job = self.jobs.create(p, create_mode)
@@ -272,6 +333,10 @@ class MigrationEngine:
                           "first to complete the remaining phases.")
             return job
 
+        # Verify the pivot really finished and that neither destination has
+        # already been initialized (a second initialize would restart PROD).
+        self._preflight(self.checker.for_resume(job))
+
         # -- Single pivot status check (no polling loop) -------------------
         sm = self.c.get_snapmirror(p.pivot_cluster, pivot_path)
         self._log_table(
@@ -306,8 +371,13 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'check-status'
     # =====================================================================
-    def check_status(self, job: dict) -> dict:
-        """Live replication state; also returned as a structured dict."""
+    def check_status(self, job: dict, persist: bool = True) -> dict:
+        """Live replication state; also returned as a structured dict.
+
+        persist=False makes this a strictly read-only probe (used by
+        GET /status): the observed state is reported but the job file is
+        never rewritten.
+        """
         p = self.p
         self.job_id = job["job_id"]
         status = job.get("status", "unknown")
@@ -334,7 +404,9 @@ class MigrationEngine:
             return {"role": role, "cluster": cluster, "path": path,
                     "state": sm.state, "transfer_state": sm.transfer_state,
                     "transferred": sm.last_transfer_size,
-                    "ready": sm.is_ready}
+                    "ready": sm.is_ready,
+                    "healthy": not sm.is_broken,
+                    "reason": sm.unhealthy_reason or "ready"}
 
         # -- 'create' interrupted before the pivot initialize ---------------
         # (started / space_checked / volumes_created / relationships_created)
@@ -369,10 +441,10 @@ class MigrationEngine:
             pivot = leg("PIVOT", p.pivot_cluster, pivot_path)
             result["legs"] = [pivot]
             self._log_table(
-                ["Role", "Cluster", "Path", "State", "Transfer", "Transferred"],
+                ["Role", "Cluster", "Path", "State", "Transfer", "Status"],
                 [[pivot["role"], pivot["cluster"], pivot["path"],
                   pivot["state"], pivot["transfer_state"],
-                  pivot["transferred"]]])
+                  pivot["reason"]]])
             if pivot["ready"]:
                 self.log.info("  Pivot ready. Launch PROD + DR with action 'resume'.")
             else:
@@ -385,21 +457,28 @@ class MigrationEngine:
                 legs.append(leg("DR", p.dr_cluster, dr_path))
             result["legs"] = legs
             self._log_table(
-                ["Role", "Cluster", "Path", "State", "Transfer", "Transferred"],
+                ["Role", "Cluster", "Path", "State", "Transfer", "Status"],
                 [[l["role"], l["cluster"], l["path"], l["state"],
-                  l["transfer_state"], l["transferred"]] for l in legs])
+                  l["transfer_state"], l["reason"]] for l in legs])
 
             if all(l["ready"] for l in legs):
-                self.jobs.set_status(job, "completed")
+                # Every leg is mirrored AND nothing is in flight: safe to
+                # declare the replication finished.
+                if persist:
+                    self.jobs.set_status(job, "completed")
+                    self.log.info("  Both PROD and DR complete. Job %s marked "
+                                  "as completed.", self.job_id)
+                else:
+                    self.log.info("  Both PROD and DR complete (read-only "
+                                  "check: job file unchanged).")
                 result["status"] = "completed"
                 result["completed"] = True
                 self._log_arch(pivot_note="idle", prod_note="idle", dr_note="idle")
-                self.log.info("  Both PROD and DR complete. Job %s marked as "
-                              "completed.", self.job_id)
             else:
-                pending = [f"{l['role']} ({l['state']})"
+                pending = [f"{l['role']}: {l['reason']}"
                            for l in legs if not l["ready"]]
-                self.log.info("  Pending: %s", ", ".join(pending))
+                self.log.info("  Not complete yet — %s", "; ".join(pending))
+                result["pending"] = pending
             return result
 
         self.log.warning("Unrecognised job status '%s'.", status)
@@ -442,6 +521,8 @@ class MigrationEngine:
                     self.log.info("  Pivot is ready — run action 'resume' with "
                                   "confirmation to launch PROD + DR.")
             return job
+
+        self._preflight(self.checker.for_retry(job))
 
         idx = CREATE_STATUS_ORDER.index(status)
         need_space = idx < CREATE_STATUS_ORDER.index("space_checked")
@@ -703,6 +784,10 @@ class MigrationEngine:
         old_test_env: Optional[dict] = None
         if job is not None:
             self.job_id = job["job_id"]
+            # Checked before any branch so a promotion with the wrong qtree
+            # set, or a clone on an unhealthy cascade, is refused up front.
+            self._preflight(self.checker.for_clone(
+                job, self._resolve_qtrees(qtrees_arg), fresh=fresh))
             if job.get("test_env") and job.get("clone_uid"):
                 if not fresh:
                     return self._promote_test_env(qtrees_arg, job)
@@ -835,13 +920,6 @@ class MigrationEngine:
         p = self.p
         if job is not None:
             self.job_id = job["job_id"]
-            if job.get("test_env"):
-                raise OntapError(
-                    p.dest_cluster, "test",
-                    f"a test environment already exists for this job "
-                    f"(uid {job.get('clone_uid')}, created "
-                    f"{job.get('test_created_at')}); promote it with action "
-                    f"'clone' or delete its clones first")
 
         self.log.info("=" * 60)
         self.log.info("  ACTION: test  (full environment — no split, no move)")
@@ -849,7 +927,10 @@ class MigrationEngine:
                       p.source_cluster, p.dest_cluster, p.dr_cluster)
         self.log.info("=" * 60)
 
+        # Cascade complete and healthy, no test environment already in place,
+        # qtrees existing and unique, peering/policy for the clone mirror.
         qtrees = self._resolve_qtrees(qtrees_arg)
+        self._preflight(self.checker.for_test(job or {}, qtrees))
         self.log.info("Qtrees (%d): %s", len(qtrees), ", ".join(qtrees))
 
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -949,13 +1030,12 @@ class MigrationEngine:
             self.job_id = job["job_id"]
 
         groups = [g.strip() for g in ad_groups.split(",") if g.strip()]
-        if not groups:
-            raise OntapError(p.dest_cluster, "acl",
-                             "no AD group provided in ad_groups")
-        if not acl_path or not acl_path.startswith("/"):
-            raise OntapError(p.dest_cluster, "acl",
-                             f"acl_path must be an absolute path on the "
-                             f"destination vserver (got: {acl_path!r})")
+
+        # Path canonical, non-root, inside this job's clones, resolvable on
+        # the SVM, NTFS security style, group syntax.
+        self._preflight(self.checker.for_acl(job, acl_path, groups,
+                                             acl_rights))
+        acl_path = "/" + "/".join(s for s in acl_path.split("/") if s)
 
         self.log.info("=" * 60)
         self.log.info("  ACTION: acl  (force AD groups via NTFS DACL)")
@@ -980,12 +1060,17 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'cleanup'
     # =====================================================================
-    def cleanup(self, qtree: str) -> dict:
+    def cleanup(self, qtree: str, job: Optional[dict] = None) -> dict:
         """Cut source access for one qtree (export-policy, CIFS, rename)."""
         p = self.p
         self.log.info("=" * 60)
         self.log.info("  ACTION: cleanup  |  source qtree '%s'", qtree)
         self.log.info("=" * 60)
+
+        # Qtree non-empty and existing, migration confirmed complete, and an
+        # explicit preview of the CIFS shares that will be deleted.
+        self._preflight(self.checker.for_cleanup(job, qtree))
+        qtree = qtree.strip()
 
         self.c.set_qtree_export_policy(p.source_cluster, p.source_vserver,
                                        p.volume, qtree, p.noaccess_policy)

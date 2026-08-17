@@ -28,7 +28,8 @@ import requests
 import urllib3
 
 from ..models import (OntapError, ClusterCredentials, VolumeInfo,
-                      AggregateInfo, SnapMirrorInfo)
+                      AggregateInfo, SnapMirrorInfo, SvmInfo, PeerInfo,
+                      TRANSFER_ACTIVE, TRANSFER_FAILED, TRANSFER_IDLE)
 from .base import OntapClient
 
 # How long we wait for a *creation* job (volume/clone/snapshot) to finish.
@@ -389,28 +390,62 @@ class RestClient(OntapClient):
         self._request(cluster, "PATCH", f"/snapmirror/relationships/{uuid}",
                       json_body={"state": "snapmirrored"}, wait_job=False)
 
+    # Raw ONTAP transfer states mapped onto our explicit vocabulary. Anything
+    # absent from this table stays 'unknown' and is never treated as sane.
+    _TRANSFER_STATE_MAP = {
+        "success": TRANSFER_IDLE,
+        "idle": TRANSFER_IDLE,
+        "": TRANSFER_IDLE,             # no transfer object -> nothing in flight
+        "queued": "queued",
+        "preparing": "preparing",
+        "transferring": "transferring",
+        "finalizing": "finalizing",
+        "failed": "failed",
+        "aborted": "aborted",
+        "hard_aborted": "hard_aborted",
+    }
+
     def get_snapmirror(self, cluster, dest_path) -> SnapMirrorInfo:
         body = self._request(cluster, "GET", "/snapmirror/relationships",
                              params={"destination.path": dest_path,
-                                     "fields": "state,transfer.state,"
+                                     "fields": "state,healthy,unhealthy_reason,"
+                                               "transfer.state,"
                                                "transfer.bytes_transferred"})
         records = body.get("records", [])
         if not records:
+            # 'absent' with an explicit unknown transfer state: is_idle and
+            # is_ready both stay false, so no wait can be satisfied by it.
             return SnapMirrorInfo(dest_path=dest_path, exists=False,
-                                  state="absent", transfer_state="idle")
+                                  state="absent", transfer_state="unknown")
         rec = records[0]
         transfer = rec.get("transfer", {}) or {}
-        raw_transfer_state = transfer.get("state", "")
-        transfer_state = ("transferring"
-                          if raw_transfer_state in ("transferring", "queued",
-                                                    "preparing")
-                          else "idle")
+        raw_transfer = (transfer.get("state") or "").lower()
+        transfer_state = self._TRANSFER_STATE_MAP.get(raw_transfer, "unknown")
+        if raw_transfer and raw_transfer not in self._TRANSFER_STATE_MAP:
+            self.log.warning("Unrecognised SnapMirror transfer state '%s' on "
+                             "%s — treated as unknown (not idle).",
+                             raw_transfer, dest_path)
+
+        # ONTAP exposes healthy/unhealthy_reason; a relationship reported
+        # unhealthy must not pass as ready even if the state string looks fine.
+        reasons = rec.get("unhealthy_reason") or []
+        if isinstance(reasons, dict):
+            reasons = [reasons]
+        last_error = "; ".join(
+            r.get("message", "") for r in reasons if isinstance(r, dict)
+        ).strip("; ")
+        state = (rec.get("state") or "unknown").lower()
+        if rec.get("healthy") is False and transfer_state == TRANSFER_IDLE:
+            # Idle but unhealthy: surface it as a failure, not as a clean idle.
+            transfer_state = "failed"
+
         transferred = transfer.get("bytes_transferred")
         return SnapMirrorInfo(
             dest_path=dest_path,
-            state=rec.get("state", "unknown"),
+            state=state,
             transfer_state=transfer_state,
             last_transfer_size=str(transferred) if transferred is not None else "-",
+            last_error=last_error,
         )
 
     # ------------------------------------------------------------------ #
@@ -439,3 +474,92 @@ class RestClient(OntapClient):
                       f"/protocols/file-security/permissions/"
                       f"{svm_uuid}/{encoded_path}",
                       json_body=payload, wait_job=False)
+
+    # ================================================================== #
+    # READ-ONLY INTROSPECTION (pre-flight checks)
+    # ================================================================== #
+    def _try_get(self, cluster: str, path: str,
+                 params: Optional[dict] = None) -> dict:
+        """GET that returns {} instead of raising on 403/404.
+
+        A pre-flight check must be able to report "not visible" without
+        aborting the whole report.
+        """
+        try:
+            return self._request(cluster, "GET", path, params=params)
+        except OntapError as exc:
+            self.log.debug("Introspection GET %s on %s unavailable: %s",
+                           path, cluster, exc.detail)
+            return {}
+
+    def get_svm(self, cluster, svm) -> SvmInfo:
+        body = self._try_get(cluster, "/svm/svms",
+                             params={"name": svm,
+                                     "fields": "uuid,state,cifs.enabled"})
+        records = body.get("records", [])
+        if not records:
+            return SvmInfo(name=svm, exists=False, state="absent")
+        rec = records[0]
+        return SvmInfo(name=svm, exists=True,
+                       state=(rec.get("state") or "unknown").lower(),
+                       cifs_enabled=(rec.get("cifs", {}) or {}).get("enabled"),
+                       uuid=rec.get("uuid"))
+
+    def aggregate_exists(self, cluster, aggregate) -> bool:
+        body = self._try_get(cluster, "/storage/aggregates",
+                             params={"name": aggregate, "fields": "name"})
+        return bool(body.get("records"))
+
+    def list_cluster_peers(self, cluster) -> List[PeerInfo]:
+        body = self._try_get(cluster, "/cluster/peers",
+                             params={"fields": "name,status.state"})
+        peers: List[PeerInfo] = []
+        for rec in body.get("records", []):
+            state = ((rec.get("status", {}) or {}).get("state")
+                     or "unknown").lower()
+            peers.append(PeerInfo(name=rec.get("name", ""), state=state))
+        return peers
+
+    def list_svm_peers(self, cluster) -> List[PeerInfo]:
+        body = self._try_get(cluster, "/svm/peers",
+                             params={"fields": "state,svm.name,peer.svm.name,"
+                                               "peer.cluster.name"})
+        peers: List[PeerInfo] = []
+        for rec in body.get("records", []):
+            peer = rec.get("peer", {}) or {}
+            peers.append(PeerInfo(
+                name=(peer.get("svm", {}) or {}).get("name", ""),
+                state=(rec.get("state") or "unknown").lower(),
+                local_svm=(rec.get("svm", {}) or {}).get("name", ""),
+                peer_svm=(peer.get("svm", {}) or {}).get("name", ""),
+                peer_cluster=(peer.get("cluster", {}) or {}).get("name", ""),
+            ))
+        return peers
+
+    def snapmirror_policy_exists(self, cluster, policy) -> bool:
+        body = self._try_get(cluster, "/snapmirror/policies",
+                             params={"name": policy, "fields": "name"})
+        return bool(body.get("records"))
+
+    def schedule_exists(self, cluster, schedule) -> bool:
+        body = self._try_get(cluster, "/cluster/schedules",
+                             params={"name": schedule, "fields": "name"})
+        return bool(body.get("records"))
+
+    def junction_path_exists(self, cluster, svm, path) -> bool:
+        """Resolve an absolute NAS path to a mounted volume on the SVM.
+
+        The path is matched against volume junction paths: '/v_q_fin_ab12' or
+        any sub-directory of it resolves to that volume.
+        """
+        body = self._try_get(cluster, "/storage/volumes",
+                             params={"svm.name": svm,
+                                     "fields": "name,nas.path"})
+        wanted = "/" + path.strip("/")
+        for rec in body.get("records", []):
+            junction = ((rec.get("nas", {}) or {}).get("path") or "").rstrip("/")
+            if not junction:
+                continue
+            if wanted == junction or wanted.startswith(junction + "/"):
+                return True
+        return False

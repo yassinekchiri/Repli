@@ -86,6 +86,21 @@ class ActionAccepted(BaseModel):
     detail: str = ""
 
 
+class PreflightResponse(BaseModel):
+    """Result of a feasibility check run on its own (no mutation)."""
+    action: str
+    ok: bool
+    simulated: bool = False
+    summary: str = ""
+    failed_count: int = 0
+    warning_count: int = 0
+    checks: List[dict] = []
+
+
+class PreflightCreateRequest(CreateMigrationRequest):
+    """Same body as a create, but only the checks are run."""
+
+
 class ActionResult(BaseModel):
     """200 answer for synchronous actions."""
     job_id: Optional[str] = None

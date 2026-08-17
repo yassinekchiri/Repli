@@ -13,7 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional
 
-from ..models import (OntapError, VolumeInfo, AggregateInfo, SnapMirrorInfo)
+from ..models import (OntapError, VolumeInfo, AggregateInfo, SnapMirrorInfo,
+                      SvmInfo, PeerInfo)
 from .base import OntapClient
 
 # Typical error patterns returned by the ONTAP CLI even when the SSH exit
@@ -422,3 +423,83 @@ class SshClient(OntapClient):
         self._run(cluster,
                   f"vserver security file-directory policy apply "
                   f"-vserver {svm} -policy-name {policy_name}")
+
+    # ================================================================== #
+    # READ-ONLY INTROSPECTION (pre-flight checks)
+    # ================================================================== #
+    def get_svm(self, cluster, svm) -> SvmInfo:
+        r = self._run(cluster, f"vserver show -vserver {svm} -instance",
+                      allow_failure=True)
+        fields = parse_instance(r.stdout)
+        if not fields or self._detect_error(r):
+            return SvmInfo(name=svm, exists=False, state="absent")
+        state = (get_instance_field(fields, "Vserver Operational State",
+                                    "Operational State", "state")
+                 or "unknown").lower()
+        allowed = (get_instance_field(fields, "Allowed Protocols") or "").lower()
+        return SvmInfo(name=svm, exists=True, state=state,
+                       cifs_enabled=("cifs" in allowed) if allowed else None)
+
+    def aggregate_exists(self, cluster, aggregate) -> bool:
+        r = self._run(cluster,
+                      f"storage aggregate show -aggregate {aggregate} -instance",
+                      allow_failure=True)
+        return self._detect_error(r) is None and aggregate in r.stdout
+
+    def list_cluster_peers(self, cluster) -> List[PeerInfo]:
+        r = self._run(cluster, "cluster peer show -instance",
+                      allow_failure=True)
+        peers: List[PeerInfo] = []
+        for block in re.split(r"\n\s*\n", r.stdout):
+            fields = parse_instance(block)
+            name = get_instance_field(fields, "Peer Cluster Name", "cluster")
+            if not name:
+                continue
+            state = (get_instance_field(fields, "Availability of the Remote Cluster",
+                                        "Availability") or "unknown").lower()
+            peers.append(PeerInfo(name=name, state=state))
+        return peers
+
+    def list_svm_peers(self, cluster) -> List[PeerInfo]:
+        r = self._run(cluster, "vserver peer show -instance", allow_failure=True)
+        peers: List[PeerInfo] = []
+        for block in re.split(r"\n\s*\n", r.stdout):
+            fields = parse_instance(block)
+            local = get_instance_field(fields, "Vserver", "vserver")
+            remote = get_instance_field(fields, "Peer Vserver", "peer-vserver")
+            if not (local and remote):
+                continue
+            peers.append(PeerInfo(
+                name=remote,
+                state=(get_instance_field(fields, "Peer State", "state")
+                       or "unknown").lower(),
+                local_svm=local, peer_svm=remote,
+                peer_cluster=get_instance_field(fields, "Peer Cluster",
+                                                "peer-cluster") or "",
+            ))
+        return peers
+
+    def snapmirror_policy_exists(self, cluster, policy) -> bool:
+        r = self._run(cluster, f"snapmirror policy show -policy {policy}",
+                      allow_failure=True)
+        return self._detect_error(r) is None and policy in r.stdout
+
+    def schedule_exists(self, cluster, schedule) -> bool:
+        r = self._run(cluster, f"job schedule show -name {schedule}",
+                      allow_failure=True)
+        return self._detect_error(r) is None and schedule in r.stdout
+
+    def junction_path_exists(self, cluster, svm, path) -> bool:
+        r = self._run(cluster,
+                      f"volume show -vserver {svm} -fields volume,junction-path",
+                      allow_failure=True)
+        if self._detect_error(r):
+            return False
+        wanted = "/" + path.strip("/")
+        for line in r.stdout.splitlines():
+            for token in line.split():
+                junction = token.rstrip("/")
+                if junction.startswith("/") and (
+                        wanted == junction or wanted.startswith(junction + "/")):
+                    return True
+        return False

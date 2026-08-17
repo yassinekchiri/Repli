@@ -8,7 +8,8 @@ aggregate space. Used with --dry-run whatever the selected transport.
 import logging
 from typing import List
 
-from ..models import VolumeInfo, AggregateInfo, SnapMirrorInfo
+from ..models import (VolumeInfo, AggregateInfo, SnapMirrorInfo,
+                      SvmInfo, PeerInfo)
 from .base import OntapClient
 
 _FAKE_SIZE = 1024 ** 3          # 1 GiB source volume
@@ -106,3 +107,34 @@ class DryRunClient(OntapClient):
     def apply_file_security(self, cluster, svm, path, groups, rights):
         self._trace(cluster, f"file-security apply {path} "
                              f"groups={groups} rights={rights}")
+
+    # ---- Read-only introspection (pre-flight) -----------------------------
+    # In simulation every prerequisite is reported as satisfied; the engine
+    # marks such reports as `simulated` so they are informational only.
+    def get_svm(self, cluster, svm) -> SvmInfo:
+        self._trace(cluster, f"svm show {svm}")
+        return SvmInfo(name=svm, exists=True, state="running", cifs_enabled=True)
+
+    def aggregate_exists(self, cluster, aggregate) -> bool:
+        self._trace(cluster, f"aggregate exists? {aggregate} -> yes")
+        return True
+
+    def list_cluster_peers(self, cluster) -> List[PeerInfo]:
+        self._trace(cluster, "cluster peer show")
+        return [PeerInfo(name="*", state="available")]
+
+    def list_svm_peers(self, cluster) -> List[PeerInfo]:
+        self._trace(cluster, "svm peer show")
+        return [PeerInfo(name="*", state="peered", local_svm="*", peer_svm="*")]
+
+    def snapmirror_policy_exists(self, cluster, policy) -> bool:
+        self._trace(cluster, f"snapmirror policy exists? {policy} -> yes")
+        return True
+
+    def schedule_exists(self, cluster, schedule) -> bool:
+        self._trace(cluster, f"schedule exists? {schedule} -> yes")
+        return True
+
+    def junction_path_exists(self, cluster, svm, path) -> bool:
+        self._trace(cluster, f"junction path exists? {svm}:{path} -> yes")
+        return True

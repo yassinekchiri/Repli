@@ -11,6 +11,13 @@ transport selection:
 
 Console shows the high-level progress only; the log file receives the
 full DEBUG trace (every REST call / SSH command with its payloads).
+
+Exit codes:
+    0  success
+    1  bad invocation (unknown job, unreadable credentials file)
+    2  ONTAP failure during execution
+    3  unexpected failure
+    4  action refused by the pre-flight checks (nothing was modified)
 """
 
 import argparse
@@ -23,7 +30,8 @@ from typing import List, Optional
 from ..config import CredentialsResolver, job_dir
 from ..core.engine import MigrationEngine
 from ..core.jobs import JobStore, JobNotFound
-from ..models import MigrationParams, OntapError, ConfirmationRequired
+from ..models import (MigrationParams, OntapError, ConfirmationRequired,
+                      PreflightFailed)
 from ..transport import build_client
 
 
@@ -221,6 +229,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         params = params_from_args(args)
 
+    # A simulated run must never rewrite the state of a real job.
+    if params.dry_run:
+        store = JobStore(args.job_dir or job_dir(), read_only=True)
+
     if not args.log_file:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.log_file = f"migration_{args.action}_{stamp}.log"
@@ -264,10 +276,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             engine.acl(args.ad_groups, acl_path=args.acl_path,
                        acl_rights=args.acl_rights, job=job)
         elif args.action == "cleanup":
-            engine.cleanup(args.qtree)
+            engine.cleanup(args.qtree, job=job)
         logger.info("SUCCESS: action '%s' completed without error.", args.action)
         return 0
 
+    except PreflightFailed as exc:
+        # The report itself was already rendered as a table by the engine.
+        logger.error("")
+        logger.error("ACTION REFUSED — %s", exc.report.summary())
+        logger.error("Nothing was modified on any cluster.")
+        logger.error("Fix the checks marked FAIL above, then run the same "
+                     "command again.")
+        _report_job_id(engine, logger)
+        return 4
     except OntapError as exc:
         logger.error("ONTAP FAILURE: %s", exc)
         _report_job_id(engine, logger)

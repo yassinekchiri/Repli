@@ -39,11 +39,13 @@ from fastapi.staticfiles import StaticFiles
 from ...config import CredentialsResolver, job_dir
 from ...core.engine import MigrationEngine
 from ...core.jobs import JobStore, JobNotFound
-from ...models import MigrationParams, OntapError, ConfirmationRequired
+from ...models import (MigrationParams, OntapError, ConfirmationRequired,
+                       PreflightFailed)
 from ...transport import build_client
 from .schemas import (CreateMigrationRequest, ResumeRequest, CloneRequest,
                       TestRequest, AclRequest, CleanupRequest,
-                      ActionAccepted, ActionResult)
+                      ActionAccepted, ActionResult, PreflightResponse,
+                      PreflightCreateRequest)
 
 _MAX_CAPTURED_LOG_LINES = 4000
 
@@ -136,7 +138,10 @@ def _make_run_logger(logs: List[str]) -> logging.Logger:
 def _engine_for(params: MigrationParams, logger: logging.Logger) -> MigrationEngine:
     resolver = CredentialsResolver()          # env-driven on the server
     client = build_client(params, logger, resolver)
-    return MigrationEngine(client, params, _store, logger)
+    # Simulated runs get a read-only store so they cannot rewrite a real job.
+    store = (JobStore(_store.directory, read_only=True)
+             if params.dry_run else _store)
+    return MigrationEngine(client, params, store, logger)
 
 
 def _load_job_or_404(job_id: str) -> dict:
@@ -169,6 +174,11 @@ def _run_in_background(job_id: str, action: str,
         try:
             target(logger)
             run["state"] = "success"
+        except PreflightFailed as exc:
+            run["state"] = "preflight_failed"
+            run["error"] = exc.report.summary()
+            run["preflight"] = exc.report.to_dict()
+            logger.error("PRE-FLIGHT FAILED: %s", exc.report.summary())
         except ConfirmationRequired as exc:
             run["state"] = "confirmation_required"
             run["error"] = str(exc)
@@ -186,6 +196,42 @@ def _run_in_background(job_id: str, action: str,
     return run
 
 
+def _preflight_http_error(exc: PreflightFailed) -> HTTPException:
+    """422 carrying every individual check, so the caller sees what to fix."""
+    report = exc.report.to_dict()
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": "preflight_failed",
+            "message": exc.report.summary(),
+            "action": report["action"],
+            "failed_checks": [c for c in report["checks"]
+                              if not c["passed"] and c["severity"] == "error"],
+            "warnings": [c for c in report["checks"]
+                         if not c["passed"] and c["severity"] == "warning"],
+            "checks": report["checks"],
+            "hint": "no cluster was modified; fix the failed checks and "
+                    "retry the same call",
+        })
+
+
+def _ensure_feasible(params: MigrationParams, action: str,
+                     build_report: Callable) -> None:
+    """Run the pre-flight checks NOW and answer 422 if the action is refused.
+
+    Long actions execute in a background thread, so their verdict would only
+    be visible by polling. Running the read-only checks synchronously here
+    lets the caller get an immediate, itemised answer; the engine re-runs
+    them inside the thread as a safety net against a state change in between.
+    """
+    logs: List[str] = []
+    logger = _make_run_logger(logs)
+    engine = _engine_for(params, logger)
+    report = build_report(engine.checker)
+    if not report.ok:
+        raise _preflight_http_error(PreflightFailed(report))
+
+
 def _run_sync(job_id: Optional[str], action: str,
               target: Callable[[logging.Logger], dict]) -> ActionResult:
     """Run a short action synchronously, capturing its log lines."""
@@ -197,6 +243,11 @@ def _run_sync(job_id: Optional[str], action: str,
         run["state"] = "success"
         return ActionResult(job_id=job_id, action=action,
                             result=result, logs=run["logs"])
+    except PreflightFailed as exc:
+        run["state"] = "preflight_failed"
+        run["error"] = exc.report.summary()
+        run["preflight"] = exc.report.to_dict()
+        raise _preflight_http_error(exc) from exc
     except ConfirmationRequired as exc:
         run["state"] = "confirmation_required"
         run["error"] = str(exc)
@@ -207,6 +258,17 @@ def _run_sync(job_id: Optional[str], action: str,
         run["state"] = "error"
         run["error"] = str(exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except HTTPException:
+        # Already a deliberate HTTP answer: keep it, but never leave the run
+        # registered as still running.
+        run["state"] = "error"
+        raise
+    except Exception as exc:  # noqa: BLE001 — the run must reach a terminal state
+        run["state"] = "error"
+        run["error"] = str(exc)
+        logger.exception("UNEXPECTED FAILURE: %s", exc)
+        raise HTTPException(status_code=500,
+                            detail=f"unexpected failure: {exc}") from exc
 
 
 # =============================================================================
@@ -222,6 +284,9 @@ def health():
 def create_migration(req: CreateMigrationRequest):
     """Start the cascade initialisation; answers immediately with the job id."""
     params = MigrationParams.from_dict(req.model_dump())
+    # Refused up front: no job file is even created for an infeasible cascade.
+    _ensure_feasible(params, "create", lambda ch: ch.for_create())
+
     job = _store.create(params, req.create_mode)
     job_id = job["job_id"]
 
@@ -253,23 +318,103 @@ def get_migration(job_id: str, logs: int = 50):
     run = _runs.get(job_id)
     last_run = None
     if run:
+        tail = run["logs"][-logs:] if logs > 0 else []
         last_run = {"action": run["action"], "state": run["state"],
-                    "error": run["error"],
-                    "logs": run["logs"][-max(0, logs):]}
+                    "error": run["error"], "logs": tail,
+                    "preflight": run.get("preflight")}
     return {"job": job, "last_run": last_run}
 
 
 @app.get("/api/v1/migrations/{job_id}/status")
 def migration_status(job_id: str):
-    """Live ONTAP replication state (queries the clusters)."""
+    """Live ONTAP replication state (queries the clusters).
+
+    Strictly read-only: the job file is never modified by a GET. Use
+    POST .../refresh when you want the observed state to be persisted
+    (a finished replication then flips the job to 'completed').
+    """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
 
     def target(logger) -> dict:
         engine = _engine_for(params, logger)
-        return engine.check_status(job)
+        return engine.check_status(job, persist=False)
 
     return _run_sync(None, "check-status", target)
+
+
+@app.post("/api/v1/migrations/{job_id}/refresh", response_model=ActionResult)
+def refresh_migration(job_id: str):
+    """Re-read the live state AND persist it into the job file."""
+    job = _load_job_or_404(job_id)
+    params = _store.params_of(job)
+
+    def target(logger) -> dict:
+        engine = _engine_for(params, logger)
+        return engine.check_status(job, persist=True)
+
+    return _run_sync(job_id, "refresh", target)
+
+
+# ---- Feasibility checks on demand (never mutate anything) --------------- #
+
+@app.post("/api/v1/preflight/create", response_model=PreflightResponse)
+def preflight_create(req: PreflightCreateRequest):
+    """Check whether a cascade could be created, without creating anything.
+
+    Verifies SVMs, source volume, aggregates and capacity, absence of
+    leftover DP volumes and relationships, cluster/SVM peering, and the
+    visibility of the SnapMirror policy and transfer schedule.
+    """
+    params = MigrationParams.from_dict(req.model_dump())
+    logs: List[str] = []
+    logger = _make_run_logger(logs)
+    engine = _engine_for(params, logger)
+    return PreflightResponse(**engine.checker.for_create().to_dict())
+
+
+@app.post("/api/v1/migrations/{job_id}/preflight/{action}",
+          response_model=PreflightResponse)
+def preflight_action(job_id: str, action: str,
+                     qtrees: Optional[str] = None,
+                     acl_path: Optional[str] = None,
+                     ad_groups: Optional[str] = None,
+                     qtree: Optional[str] = None,
+                     fresh: bool = False):
+    """Check whether an action is feasible on this job, without running it.
+
+    action: resume | retry | test | clone | acl | cleanup
+    The extra query parameters are the ones the action itself would take.
+    """
+    job = _load_job_or_404(job_id)
+    params = _store.params_of(job)
+    logs: List[str] = []
+    logger = _make_run_logger(logs)
+    engine = _engine_for(params, logger)
+    checker = engine.checker
+
+    qtree_list = qtrees or ""
+    group_list = [g.strip() for g in (ad_groups or "").split(",") if g.strip()]
+
+    if action == "resume":
+        report = checker.for_resume(job)
+    elif action == "retry":
+        report = checker.for_retry(job)
+    elif action == "test":
+        report = checker.for_test(job, qtree_list)
+    elif action == "clone":
+        report = checker.for_clone(job, qtree_list, fresh=fresh)
+    elif action == "acl":
+        report = checker.for_acl(job, acl_path or "", group_list,
+                                 "full-control")
+    elif action == "cleanup":
+        report = checker.for_cleanup(job, qtree or "")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown action '{action}'; expected one of "
+                   f"resume, retry, test, clone, acl, cleanup")
+    return PreflightResponse(**report.to_dict())
 
 
 @app.post("/api/v1/migrations/{job_id}/resume", response_model=ActionResult)
@@ -295,6 +440,7 @@ def resume_migration(job_id: str, req: ResumeRequest):
 def retry_migration(job_id: str):
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    _ensure_feasible(params, "retry", lambda ch: ch.for_retry(job))
 
     def target(logger):
         engine = _engine_for(params, logger)
@@ -315,6 +461,8 @@ def test_migration(job_id: str, req: TestRequest):
     """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    _ensure_feasible(params, "test",
+                     lambda ch: ch.for_test(job, req.qtrees_csv))
 
     def target(logger):
         engine = _engine_for(params, logger)
@@ -337,6 +485,9 @@ def clone_migration(job_id: str, req: CloneRequest):
     """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    _ensure_feasible(params, "clone",
+                     lambda ch: ch.for_clone(job, req.qtrees_csv,
+                                             fresh=req.fresh))
 
     def target(logger):
         engine = _engine_for(params, logger)
@@ -372,7 +523,7 @@ def cleanup_migration(job_id: str, req: CleanupRequest):
 
     def target(logger) -> dict:
         engine = _engine_for(params, logger)
-        return engine.cleanup(req.qtree)
+        return engine.cleanup(req.qtree, job=job)
 
     return _run_sync(job_id, "cleanup", target)
 
