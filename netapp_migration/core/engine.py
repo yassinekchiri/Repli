@@ -19,8 +19,7 @@ single-file script:
 import datetime
 import logging
 import time
-import uuid as uuid_module
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from ..models import (MigrationParams, OntapError, ConfirmationRequired,
                       PreflightFailed, PreflightReport, SnapMirrorInfo)
@@ -651,23 +650,47 @@ class MigrationEngine:
         self.log.info("         Snapshot confirmed on both destinations.")
 
     def _create_clones_on_both(self, qtrees: List[str], snap_name: str,
-                               clone_uid: str):
+                               volume_map: Dict[str, str]):
         p = self.p
         for qtree in qtrees:
-            clone_vol = f"v_{qtree}_{clone_uid}"
+            clone_vol = volume_map[qtree]
             self.c.create_clone(p.dest_cluster, p.dest_vserver, clone_vol,
                                 p.volume, snap_name)
             self.c.create_clone(p.dr_cluster, p.dr_vserver, clone_vol,
                                 p.volume, snap_name)
             self.log.info("         '%s'  created on PROD and DR.", clone_vol)
 
-    def _save_clone_metadata(self, job: Optional[dict], clone_uid: str,
-                             qtrees: List[str]):
+    def _save_clone_metadata(self, job: Optional[dict],
+                             volume_map: Dict[str, str], qtrees: List[str]):
         if job is not None:
-            job["clone_uid"] = clone_uid
-            job["clone_volumes"] = [f"v_{q}_{clone_uid}" for q in qtrees]
+            job["volume_map"] = {q: volume_map[q] for q in qtrees}
+            job["clone_volumes"] = [volume_map[q] for q in qtrees]
             job["test_env"] = False    # definitive clones, not a test env
             self.jobs.save(job)
+
+    def _resolve_volume_map(self, qtrees: List[str],
+                            volume_map: Optional[Dict[str, str]],
+                            job: Optional[dict]) -> Dict[str, str]:
+        """Target volume name per qtree, chosen by the client.
+
+        Falls back to the mapping recorded on the job (set by a previous
+        test run) so a promotion reuses the very same names.
+        """
+        mapping = dict((job or {}).get("volume_map") or {})
+        mapping.update({k: v for k, v in (volume_map or {}).items()})
+        resolved = {}
+        for qtree in qtrees:
+            name = mapping.get(qtree) or next(
+                (v for k, v in mapping.items() if k.lower() == qtree.lower()),
+                None)
+            if not name:
+                raise OntapError(
+                    self.p.dest_cluster, "volume mapping",
+                    f"no target volume name given for qtree '{qtree}' — "
+                    f"supply one per qtree (--volume-map CSV, or the "
+                    f"volume_map field of the API request)")
+            resolved[qtree] = name
+        return resolved
 
     def _promote_test_env(self, qtrees_arg: str, job: dict) -> dict:
         """Promote the existing TEST environment to the definitive one.
@@ -678,22 +701,21 @@ class MigrationEngine:
         clones from their parent DP volumes.
         """
         p = self.p
-        clone_uid = job["clone_uid"]
         existing = set(job.get("clone_volumes", []))
         qtrees = self._resolve_qtrees(qtrees_arg)
-        wanted = {q: f"v_{q}_{clone_uid}" for q in qtrees}
+        # Names come from the mapping recorded by the test run: a promotion
+        # never renames anything.
+        wanted = self._resolve_volume_map(qtrees, None, job)
         missing = [v for v in wanted.values() if v not in existing]
         if missing:
             raise OntapError(
                 p.dest_cluster, "clone promotion",
-                f"the test environment (uid {clone_uid}) has no clone(s) "
-                f"{missing}. Promote with the same qtrees as the test run "
-                f"({sorted(existing)}), or delete the test environment and "
-                f"run a full clone")
+                f"the test environment has no clone(s) {missing}. Promote "
+                f"with the same qtrees as the test run ({sorted(existing)}), "
+                f"or delete the test environment and run a full clone")
 
         self.log.info("=" * 60)
-        self.log.info("  ACTION: clone  — PROMOTION of test environment %s",
-                      clone_uid)
+        self.log.info("  ACTION: clone  — PROMOTION of the test environment")
         self.log.info("  Test created: %s  |  valid until: %s",
                       job.get("test_created_at", "unknown"),
                       job.get("test_expires_at", "unknown"))
@@ -750,8 +772,8 @@ class MigrationEngine:
         self.jobs.save(job)
 
         self.log.info("=" * 60)
-        self.log.info("  Test environment %s PROMOTED — volume moves launched "
-                      "for %d clone(s).", clone_uid, len(qtrees))
+        self.log.info("  Test environment PROMOTED — volume moves launched "
+                      "for %d clone(s).", len(qtrees))
         self.log.info("")
         self._log_table(["Clone volume", "PROD aggregate", "DR aggregate"],
                         [[wanted[q], prod_aggr, dr_aggr] for q in qtrees])
@@ -759,7 +781,8 @@ class MigrationEngine:
         self.log.info("  Monitor moves: volume move show -vserver %s / %s",
                       p.dest_vserver, p.dr_vserver)
         self.log.info("=" * 60)
-        return {"promoted": True, "clone_uid": clone_uid,
+        return {"promoted": True,
+                "volume_map": dict(wanted),
                 "clone_volumes": sorted(wanted.values()),
                 "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr}
 
@@ -767,7 +790,8 @@ class MigrationEngine:
     # ACTION 'clone'
     # =====================================================================
     def clone(self, qtrees_arg: str, job: Optional[dict] = None,
-              fresh: bool = False) -> dict:
+              fresh: bool = False,
+              volume_map: Optional[Dict[str, str]] = None) -> dict:
         """Definitive clones.
 
         Three modes:
@@ -787,18 +811,18 @@ class MigrationEngine:
             # Checked before any branch so a promotion with the wrong qtree
             # set, or a clone on an unhealthy cascade, is refused up front.
             self._preflight(self.checker.for_clone(
-                job, self._resolve_qtrees(qtrees_arg), fresh=fresh))
-            if job.get("test_env") and job.get("clone_uid"):
+                job, self._resolve_qtrees(qtrees_arg), fresh=fresh,
+                volume_map=volume_map))
+            if job.get("test_env") and job.get("clone_volumes"):
                 if not fresh:
                     return self._promote_test_env(qtrees_arg, job)
                 # Fresh start requested: keep track of the abandoned test
                 # environment so its clones can be cleaned up afterwards.
-                old_test_env = {"uid": job["clone_uid"],
-                                "volumes": list(job.get("clone_volumes", []))}
+                old_test_env = {"volumes": list(job.get("clone_volumes", []))}
                 self.log.warning("FRESH mode: ignoring the existing test "
-                                 "environment (uid %s) — its clones stay in "
-                                 "place and must be deleted manually (see end "
-                                 "of run).", old_test_env["uid"])
+                                 "environment — its clones (%s) stay in place "
+                                 "and must be deleted manually (see end of "
+                                 "run).", ", ".join(old_test_env["volumes"]))
 
         self.log.info("=" * 60)
         self.log.info("  ACTION: clone%s", "  [fresh]" if fresh else "")
@@ -811,21 +835,22 @@ class MigrationEngine:
 
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         snap_name = f"clone_migr_{stamp}"
-        clone_uid = uuid_module.uuid4().hex[:6]
-        self.log.info("Clone UID for this run: %s  (volumes: v_<qtree>_%s)",
-                      clone_uid, clone_uid)
+        mapping = self._resolve_volume_map(
+            qtrees, volume_map, None if fresh else job)
+        self._log_table(["Qtree", "Target volume"],
+                        [[q, mapping[q]] for q in qtrees])
 
         # Steps 1-3: snapshot + cascade propagation + verification.
         self._propagate_snapshot(snap_name, step_offset=1, total_steps=7)
 
         # Step 4: FlexClones on PROD and DR.
         self.log.info(">> [4/7]  Creating FlexClone volumes on PROD and DR")
-        self._create_clones_on_both(qtrees, snap_name, clone_uid)
+        self._create_clones_on_both(qtrees, snap_name, mapping)
 
         # Step 5: SnapMirror between the clones + resync.
         self.log.info(">> [5/7]  SnapMirror (clone PROD -> clone DR) + resync")
         for qtree in qtrees:
-            clone_vol = f"v_{qtree}_{clone_uid}"
+            clone_vol = mapping[qtree]
             prod_clone = p.path(p.dest_vserver, clone_vol)
             dr_clone = p.path(p.dr_vserver, clone_vol)
             self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone)
@@ -836,9 +861,9 @@ class MigrationEngine:
         # Step 6: wait all resyncs idle.
         self.log.info(">> [6/7]  Waiting for clone resyncs")
         for qtree in qtrees:
-            dr_clone = p.path(p.dr_vserver, f"v_{qtree}_{clone_uid}")
+            dr_clone = p.path(p.dr_vserver, mapping[qtree])
             self._wait_snapmirror(p.dr_cluster, dr_clone, want="idle")
-            self.log.info("         'v_%s_%s'  resync complete.", qtree, clone_uid)
+            self.log.info("         '%s'  resync complete.", mapping[qtree])
 
         # Step 7: best aggregates + volume moves (fire-and-forget).
         self.log.info(">> [7/7]  Selecting aggregates, launching volume moves")
@@ -854,7 +879,7 @@ class MigrationEngine:
                       dr_aggr, dr_parent or "none")
 
         for qtree in qtrees:
-            clone_vol = f"v_{qtree}_{clone_uid}"
+            clone_vol = mapping[qtree]
             self.c.start_volume_move(p.dest_cluster, p.dest_vserver,
                                      clone_vol, prod_aggr)
             self.c.start_volume_move(p.dr_cluster, p.dr_vserver,
@@ -862,23 +887,23 @@ class MigrationEngine:
             self.log.info("         '%s'  move launched  PROD -> %s  /  "
                           "DR -> %s.", clone_vol, prod_aggr, dr_aggr)
 
-        self._save_clone_metadata(job, clone_uid, qtrees)
+        self._save_clone_metadata(job, mapping, qtrees)
 
         self.log.info("=" * 60)
         self.log.info("  Volume moves launched for %d clone(s). Exiting.",
                       len(qtrees))
-        self.log.info("  Clone UID: %s", clone_uid)
         self.log.info("")
-        self._log_table(["Clone volume", "PROD aggregate", "DR aggregate"],
-                        [[f"v_{q}_{clone_uid}", prod_aggr, dr_aggr]
+        self._log_table(["Qtree", "Clone volume", "PROD aggregate",
+                         "DR aggregate"],
+                        [[q, mapping[q], prod_aggr, dr_aggr]
                          for q in qtrees])
         self.log.info("")
         self.log.info("  Monitor moves: volume move show -vserver %s / %s",
                       p.dest_vserver, p.dr_vserver)
         if old_test_env:
             self.log.info("")
-            self.log.warning("  Abandoned TEST environment %s — delete its "
-                             "clones once convenient:", old_test_env["uid"])
+            self.log.warning("  Abandoned TEST environment — delete its "
+                             "clones once convenient:")
             for vol in old_test_env["volumes"]:
                 self.log.info("      snapmirror delete -destination-path %s",
                               p.path(p.dr_vserver, vol))
@@ -890,8 +915,8 @@ class MigrationEngine:
                                   "%s ; volume delete -vserver %s -volume %s",
                                   svm, vol, svm, vol)
         self.log.info("=" * 60)
-        return {"clone_uid": clone_uid,
-                "clone_volumes": [f"v_{q}_{clone_uid}" for q in qtrees],
+        return {"volume_map": {q: mapping[q] for q in qtrees},
+                "clone_volumes": [mapping[q] for q in qtrees],
                 "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr,
                 "abandoned_test_env": old_test_env}
 
@@ -899,13 +924,15 @@ class MigrationEngine:
     # ACTION 'test'
     # =====================================================================
     def test(self, qtrees_arg: str, job: Optional[dict] = None,
-             validity_days: int = 7) -> dict:
+             validity_days: int = 7,
+             volume_map: Optional[Dict[str, str]] = None) -> dict:
         """Full TEST environment: everything except the split / volume move.
 
         Builds the exact future production layout so the client can validate
         access, permissions and replication:
 
-          - FlexClones v_<qtree>_<uid> on future PROD and future DR,
+          - FlexClones on future PROD and future DR, each named by the
+            client through the qtree -> volume mapping,
           - SnapMirror relationships between the PROD and DR clones,
             resynced and waited to idle.
 
@@ -930,26 +957,27 @@ class MigrationEngine:
         # Cascade complete and healthy, no test environment already in place,
         # qtrees existing and unique, peering/policy for the clone mirror.
         qtrees = self._resolve_qtrees(qtrees_arg)
-        self._preflight(self.checker.for_test(job or {}, qtrees))
+        self._preflight(self.checker.for_test(job or {}, qtrees,
+                                              volume_map=volume_map))
         self.log.info("Qtrees (%d): %s", len(qtrees), ", ".join(qtrees))
 
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         snap_name = f"test_migr_{stamp}"
-        clone_uid = uuid_module.uuid4().hex[:6]
-        self.log.info("Clone UID for this run: %s  (volumes: v_<qtree>_%s)",
-                      clone_uid, clone_uid)
+        mapping = self._resolve_volume_map(qtrees, volume_map, job)
+        self._log_table(["Qtree", "Target volume"],
+                        [[q, mapping[q]] for q in qtrees])
 
         # Steps 1-3: snapshot + cascade propagation + verification.
         self._propagate_snapshot(snap_name, step_offset=1, total_steps=6)
 
         # Step 4: FlexClones on future PROD and future DR.
         self.log.info(">> [4/6]  Creating thin FlexClone volumes on PROD and DR")
-        self._create_clones_on_both(qtrees, snap_name, clone_uid)
+        self._create_clones_on_both(qtrees, snap_name, mapping)
 
         # Step 5: SnapMirror between the clones + resync (like production).
         self.log.info(">> [5/6]  SnapMirror (clone PROD -> clone DR) + resync")
         for qtree in qtrees:
-            clone_vol = f"v_{qtree}_{clone_uid}"
+            clone_vol = mapping[qtree]
             prod_clone = p.path(p.dest_vserver, clone_vol)
             dr_clone = p.path(p.dr_vserver, clone_vol)
             self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone)
@@ -960,17 +988,16 @@ class MigrationEngine:
         # Step 6: wait all clone resyncs idle.
         self.log.info(">> [6/6]  Waiting for clone resyncs")
         for qtree in qtrees:
-            dr_clone = p.path(p.dr_vserver, f"v_{qtree}_{clone_uid}")
+            dr_clone = p.path(p.dr_vserver, mapping[qtree])
             self._wait_snapmirror(p.dr_cluster, dr_clone, want="idle")
-            self.log.info("         'v_%s_%s'  resync complete.",
-                          qtree, clone_uid)
+            self.log.info("         '%s'  resync complete.", mapping[qtree])
 
         # Persist the test environment metadata (with its expiry date).
         created = datetime.datetime.now()
         expires = created + datetime.timedelta(days=validity_days)
         if job is not None:
-            job["clone_uid"] = clone_uid
-            job["clone_volumes"] = [f"v_{q}_{clone_uid}" for q in qtrees]
+            job["volume_map"] = {q: mapping[q] for q in qtrees}
+            job["clone_volumes"] = [mapping[q] for q in qtrees]
             job["test_env"] = True
             job["test_qtrees"] = qtrees
             job["test_created_at"] = created.isoformat(timespec="seconds")
@@ -980,14 +1007,13 @@ class MigrationEngine:
         self.log.info("=" * 60)
         self.log.info("  TEST environment ready — %d clone(s), mirrored "
                       "PROD -> DR, no disk space consumed.", len(qtrees))
-        self.log.info("  Clone UID  : %s", clone_uid)
         self.log.info("  Valid until: %s  (%d day(s))",
                       expires.strftime("%Y-%m-%d %H:%M"), validity_days)
         self.log.info("")
-        self._log_table(["Test clone",
+        self._log_table(["Qtree", "Test clone",
                          f"PROD ({p.dest_cluster})", f"DR ({p.dr_cluster})",
                          "Mirror"],
-                        [[f"v_{q}_{clone_uid}", "created", "created", "idle"]
+                        [[q, mapping[q], "created", "created", "idle"]
                          for q in qtrees])
         self.log.info("")
         self.log.info("  The client can now validate access and permissions.")
@@ -997,18 +1023,17 @@ class MigrationEngine:
         self.log.info("    - delete the test environment:")
         for qtree in qtrees:
             self.log.info("      snapmirror delete -destination-path %s",
-                          p.path(p.dr_vserver, f"v_{qtree}_{clone_uid}"))
+                          p.path(p.dr_vserver, mapping[qtree]))
         for cluster, svm in ((p.dest_cluster, p.dest_vserver),
                              (p.dr_cluster,   p.dr_vserver)):
             self.log.info("      On %s:", cluster)
             for qtree in qtrees:
-                self.log.info("        volume offline -vserver %s -volume "
-                              "v_%s_%s ; volume delete -vserver %s -volume "
-                              "v_%s_%s", svm, qtree, clone_uid,
-                              svm, qtree, clone_uid)
+                self.log.info("        volume offline -vserver %s -volume %s "
+                              "; volume delete -vserver %s -volume %s",
+                              svm, mapping[qtree], svm, mapping[qtree])
         self.log.info("=" * 60)
-        return {"clone_uid": clone_uid,
-                "clone_volumes": [f"v_{q}_{clone_uid}" for q in qtrees],
+        return {"volume_map": {q: mapping[q] for q in qtrees},
+                "clone_volumes": [mapping[q] for q in qtrees],
                 "expires_at": expires.isoformat(timespec="seconds")}
 
     # =====================================================================

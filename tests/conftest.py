@@ -278,6 +278,11 @@ def engine(client, params, store, logger):
     return MigrationEngine(client, params, store, logger)
 
 
+def vmap(*qtrees):
+    """Convenience qtree -> target volume mapping for the tests."""
+    return {q: f"vol_{q}" for q in qtrees}
+
+
 def cascade_ready(client, params):
     """Bring the fake estate to a fully replicated, healthy cascade."""
     for cluster, svm, aggr in ((params.pivot_cluster, params.pivot_vserver,

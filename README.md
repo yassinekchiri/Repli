@@ -68,14 +68,15 @@ and how to fix it (CLI table, HTTP 422). Ask without executing:
 
 ```bash
 curl -s -X POST $BASE/preflight/create -d @create.json          # before creating
-curl -s -X POST $BASE/migrations/$JOB/preflight/clone?qtrees=all # before cloning
+curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
+     -d '{"qtrees":"all"}'    # before cloning
 ```
 
 ### Tests
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 75 tests, offline, no cluster contacted
+python3 -m pytest            # 116 tests, offline, no cluster contacted
 ```
 
 ---
@@ -237,6 +238,82 @@ account in `creds.json` (section 2.3): `"username": "mutrepli"`.
 Verify: `security login show -user-or-group-name mutrepli` and, from the
 server, `curl -sk -u mutrepli https://<cluster>/api/storage/volumes?max_records=1`.
 
+### 2.6 Authentication: the global token and delegated tokens
+
+The API and the CLI are protected by tokens. Enforcement starts as soon as a
+token store exists on the server.
+
+**Install — once.** The super admin chooses a global token; it is asked
+interactively and never written anywhere:
+
+```bash
+python3 netapp_cascade_migration.py --action tokens-init
+#   New global token (super admin): ********
+#   Confirm global token: ********
+#   Token store created: netapp_tokens.enc
+```
+
+That token is the key protecting the store (PBKDF2-HMAC-SHA256, 600 000
+iterations, Fernet AES-128-CBC + HMAC) **and** the super-admin API token.
+It cannot be recovered: keep it safe.
+
+**Delegating per qtree.** The super admin hands over a CSV listing, for each
+qtree, the token that owns it and the actions it may run. `NEW_TOKEN` asks
+the API to generate one:
+
+```csv
+qtree,token,actions,label
+q_fin,NEW_TOKEN,"test,clone,acl",Finance
+q_hr,NEW_TOKEN,test,HR
+q_ops,mtk_existing...,"test,acl",Ops
+```
+
+```bash
+python3 netapp_cascade_migration.py --action tokens-import \
+    --scope-csv scopes.csv --scope-out issued.csv
+```
+
+`issued.csv` (mode 0600) is the **only** place a generated token ever appears
+in clear — hand each one to its owner, then delete the file. The store keeps
+salted hashes only.
+
+Delegable actions are the qtree-level ones (`test`, `clone`, `acl`,
+`cleanup`) plus read-only (`status`, `preflight`, `read`). `create`,
+`resume`, `retry`, `refresh` and token administration stay with the super
+admin.
+
+**Changing a scope** later, without re-issuing the token:
+
+```bash
+python3 netapp_cascade_migration.py --action tokens-list
+python3 netapp_cascade_migration.py --action tokens-set-scope \
+    --token-id tok_0be346ea4f5b --grant-qtrees "q_hr,q_ops" --grant-actions "test,acl"
+python3 netapp_cascade_migration.py --action tokens-revoke --token-id tok_xxx
+```
+
+**Starting the API.** The store is decrypted in memory only, so every start
+requires the global token:
+
+```bash
+python3 -m netapp_migration.interfaces.api.serve --host 127.0.0.1 --port 8000
+#   Global token (super admin): ********
+#   Token store unlocked: 3 delegated token(s).
+```
+
+If the service stops, the API answers `503` until a super admin restarts it
+and supplies the global token again. This is deliberate: an unattended
+restart never silently re-opens the API.
+
+Calls carry the token as a bearer header:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" $BASE/auth/whoami
+```
+
+> The CLI is driven by the super admin: delegated tokens are meant for the
+> REST API and cannot open the local encrypted store.
+
+
 ---
 
 ## 3. Command-line usage
@@ -278,7 +355,16 @@ already-completed creations are skipped (idempotent).
 
 ```bash
 python3 netapp_cascade_migration.py --action test --job-id <ID> \
-    --qtrees all --test-validity-days 7
+    --qtrees q_fin,q_hr --volume-map volumes.csv --test-validity-days 7
+```
+
+`--volume-map` is a CSV naming the target volume of each qtree — the client
+chooses these names, nothing is generated:
+
+```csv
+qtree,volume
+q_fin,vol_finance_prod
+q_hr,vol_rh_prod
 ```
 
 Builds the **complete** target environment **except the split / volume
@@ -318,10 +404,12 @@ replication.
 ### 3.5 clone — definitive clones + detachment
 
 ```bash
-python3 netapp_cascade_migration.py --action clone --job-id <ID> --qtrees q_fin,q_hr
+python3 netapp_cascade_migration.py --action clone --job-id <ID> \
+    --qtrees q_fin,q_hr --volume-map volumes.csv
 ```
 
-Three modes:
+A promotion reuses the names recorded by the test run, so `--volume-map` can
+be omitted there. Three modes:
 
 * **Promotion** (default when a `test` environment exists): the clone
   mirrors are checked idle, then `volume move` (detachment from the

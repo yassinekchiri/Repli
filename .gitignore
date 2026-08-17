@@ -14,3 +14,9 @@ netapp_migration_*.json
 
 # Test artifacts
 .pytest_cache/
+
+# Encrypted token store and issued-token CSVs — never commit these
+netapp_tokens.enc
+*.enc
+issued*.csv
+tokens_emis*.csv

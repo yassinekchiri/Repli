@@ -72,6 +72,66 @@ background work runs in threads of the uvicorn process.
 
 ---
 
+## 1bis. Authentication and scopes
+
+```mermaid
+flowchart TB
+    subgraph install["Install — once"]
+        INIT["tokens-init<br/>super admin types the GLOBAL token"]
+        STORE[("netapp_tokens.enc<br/>Fernet AES-128-CBC + HMAC<br/>key = PBKDF2(global token)")]
+        INIT --> STORE
+    end
+
+    subgraph grant["Delegation — CSV driven"]
+        CSVIN["qtree,token,actions<br/>q_fin,NEW_TOKEN,&quot;test,clone,acl&quot;"]
+        IMPORT["tokens-import<br/>POST /auth/scopes/import"]
+        CSVOUT["answer CSV<br/>generated tokens, once"]
+        CSVIN --> IMPORT --> CSVOUT
+        IMPORT -.->|"hashes only"| STORE
+    end
+
+    subgraph run["Runtime"]
+        SERVE["serve.py<br/>prompts for the GLOBAL token"]
+        MEM["store unlocked<br/>IN MEMORY ONLY"]
+        REQ["request<br/>Authorization: Bearer ..."]
+        SERVE --> MEM
+        STORE --> SERVE
+        REQ --> MEM
+        MEM --> SUPER["super admin<br/>everything"]
+        MEM --> SCOPED["scoped token<br/>its actions, its qtrees"]
+    end
+
+    STOP["service restart"] -.->|"memory lost"| LOCKED["API answers 503<br/>until a manual unlock"]
+```
+
+**The global token** is typed by the super admin at install time and again at
+every start of the service. It is never written anywhere: it is the key
+material of the store (PBKDF2-HMAC-SHA256, 600 000 iterations) and doubles as
+the super-admin API token. Lose it and the store cannot be recovered.
+
+**Delegated tokens** are stored as salted hashes only. A generated token
+appears in clear exactly once, in the answer CSV. The store file also holds
+no qtree name in clear — the whole payload is encrypted.
+
+**Scope model**
+
+| Action | Who |
+|---|---|
+| `create`, `resume`, `retry`, `refresh`, token administration | super admin only — they act on the whole cascade |
+| `test`, `clone`, `acl`, `cleanup` | delegable, restricted to the token's qtrees |
+| `status`, `preflight`, `read` | delegable, read-only |
+
+A scoped token that names a qtree outside its grant gets `403` with the list
+of what it does hold. Scopes change at any time with the super-admin token
+(`PATCH /auth/scopes/{id}`) without re-issuing the token.
+
+**Restart policy** — the decrypted store lives only in memory, so a restart
+of the service leaves the API locked (`503`) until a super admin supplies the
+global token again on the command line. That is deliberate: an unattended
+restart must not silently re-open the API.
+
+---
+
 ## 2. What the API can do
 
 ```mermaid
@@ -111,7 +171,12 @@ flowchart LR
 
 | Method | Endpoint | Purpose | Answers |
 |---|---|---|---|
-| `GET` | `/api/v1/health` | service liveness | `200` |
+| `GET` | `/api/v1/health` | service liveness + auth state — **public** | `200` |
+| `GET` | `/api/v1/auth/whoami` | scope of the presented token | `200` `401` |
+| `POST` | `/api/v1/auth/scopes/import` | apply the qtree/token/actions CSV — **super admin** | `200` `422` |
+| `GET` | `/api/v1/auth/scopes` | list delegated scopes (never the tokens) — **super admin** | `200` |
+| `PATCH` | `/api/v1/auth/scopes/{id}` | change a scope dynamically — **super admin** | `200` `400` |
+| `DELETE` | `/api/v1/auth/scopes/{id}` | revoke a token — **super admin** | `204` `400` |
 | `GET` | `/api/v1/migrations` | list jobs | `200` |
 | `GET` | `/api/v1/migrations/{id}` | job record, last run state, log tail, last pre-flight report | `200` `404` |
 | `GET` | `/api/v1/migrations/{id}/status` | live replication state — **read-only**, never writes the job | `200` `404` `502` |
@@ -135,6 +200,9 @@ flowchart LR
 | `400` | unknown action name | fix the URL |
 | `404` | no such job | check the job id / job directory |
 | `409` | another action is running on this job, **or** confirmation required | wait, or re-POST with `{"confirm": true}` |
+| `401` | missing, unknown or revoked token | present a valid token |
+| `403` | the token's scope does not cover this action or qtree | ask the super admin to widen the scope |
+| `503` | the token store is locked (service restarted) or not initialised | a super admin must restart the service with the global token |
 | `422` | **pre-flight refused the action — nothing was modified** | fix the listed checks, retry |
 | `502` | ONTAP failed during execution | read `detail`, check the log file |
 | `500` | unexpected failure | read the log file |
@@ -183,6 +251,7 @@ consume by automation.
 | `clone` (promotion) | requested qtrees **exactly match** the test set; each clone exists on PROD and DR; each clone mirror is healthy and idle; validity not expired (warning); a move-target aggregate exists other than the parent's |
 | `clone` (full/fresh) | same as `test`, plus the move-target aggregate check; `--fresh` warns that the old test clones are abandoned |
 | `acl` | path provided, absolute, no traversal, **not `/`**; path belongs to a **clone volume of this job**; path resolves on the PROD SVM; volume security style is NTFS/mixed; AD group syntax |
+| `test` / `clone` naming | **every qtree has an explicit target volume name**; names are distinct; each is a legal ONTAP volume name; each is free on PROD **and** DR |
 | `cleanup` | qtree **non-empty** and existing on the source; no path separator; migration `completed`; clones promoted (warning); **explicit preview of the exact CIFS shares** that will be deleted |
 
 ---
@@ -366,6 +435,8 @@ These are deliberately **not** addressed by the pre-flight work and remain open:
   concurrently; only one action per job id is serialised.
 * **Volume moves are launched, not tracked** — `clone` exits once the moves
   start, by design; their completion is not verified by the tool.
+* **The CLI is driven by the super admin only.** Delegated tokens are meant
+  for the REST API; they cannot open the local encrypted store.
 * **Clones contain every qtree of the source volume.** A FlexClone copies the
   whole parent, so after the move each target volume holds all the source
   qtrees — a data-segregation and capacity issue that needs a product

@@ -1,6 +1,9 @@
 # --- ONTAP REST transport (default) ---
 requests>=2.31
 
+# --- Token encryption (authentication layer) ---
+cryptography>=43.0
+
 # --- REST API interface ---
 fastapi>=0.110
 uvicorn[standard]>=0.29

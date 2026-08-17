@@ -354,3 +354,111 @@ class SnapMirrorInfo:
         if not self.exists:
             return "absent"
         return f"{self.state}/{self.transfer_state}"
+
+
+# =============================================================================
+# AUTHENTICATION / AUTHORISATION
+# =============================================================================
+
+class AuthError(Exception):
+    """Authentication failure: no token, unknown token, or locked store."""
+
+    def __init__(self, message: str, hint: str = ""):
+        self.message = message
+        self.hint = hint
+        super().__init__(message)
+
+
+class ForbiddenError(Exception):
+    """The token is valid but its scope does not cover this request."""
+
+    def __init__(self, message: str, hint: str = ""):
+        self.message = message
+        self.hint = hint
+        super().__init__(message)
+
+
+# Actions a scoped (per-qtree) token may be granted.
+ACTIONS_QTREE_SCOPED = frozenset({"test", "clone", "acl", "cleanup"})
+# Read-only actions, always grantable to a scoped token.
+ACTIONS_READ = frozenset({"status", "preflight", "read"})
+# Actions that act on the whole cascade: super-admin only, never delegated.
+ACTIONS_SUPER_ONLY = frozenset({"create", "resume", "retry", "refresh",
+                                "tokens"})
+GRANTABLE_ACTIONS = ACTIONS_QTREE_SCOPED | ACTIONS_READ
+
+
+@dataclass
+class TokenScope:
+    """What one scoped token is allowed to do, and on which qtrees."""
+    token_id: str
+    qtrees: List[str] = field(default_factory=list)
+    actions: List[str] = field(default_factory=list)
+    label: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Principal:
+    """The authenticated caller behind a request.
+
+    A super admin bypasses every scope check; a scoped principal may only
+    run the actions it was granted, on the qtrees it owns.
+    """
+    is_super_admin: bool = False
+    token_id: str = ""
+    qtrees: List[str] = field(default_factory=list)
+    actions: List[str] = field(default_factory=list)
+    label: str = ""
+
+    @property
+    def name(self) -> str:
+        return "super-admin" if self.is_super_admin else (
+            self.label or self.token_id)
+
+    def may(self, action: str) -> bool:
+        if self.is_super_admin:
+            return True
+        return action in self.actions
+
+    def owns(self, qtrees) -> bool:
+        if self.is_super_admin:
+            return True
+        allowed = {q.lower() for q in self.qtrees}
+        return all(q.strip().lower() in allowed for q in qtrees if q.strip())
+
+    def authorise(self, action: str, qtrees=None) -> None:
+        """Raise ForbiddenError unless the action is within scope."""
+        if self.is_super_admin:
+            return
+        if action in ACTIONS_SUPER_ONLY:
+            raise ForbiddenError(
+                f"action '{action}' is reserved to the super admin",
+                hint="ask the super admin to run it, or to widen this "
+                     "token's scope (only qtree-level actions can be "
+                     "delegated)")
+        if not self.may(action):
+            raise ForbiddenError(
+                f"token '{self.name}' is not allowed to run '{action}'",
+                hint=f"granted actions: {', '.join(sorted(self.actions)) or 'none'}")
+        requested = [q for q in (qtrees or []) if q and q.strip()]
+        if requested and not self.owns(requested):
+            outside = sorted({q for q in requested
+                              if q.strip().lower() not in
+                              {o.lower() for o in self.qtrees}})
+            raise ForbiddenError(
+                f"token '{self.name}' has no access to qtree(s): "
+                f"{', '.join(outside)}",
+                hint=f"granted qtrees: {', '.join(sorted(self.qtrees)) or 'none'}")
+
+    def to_dict(self) -> dict:
+        return {"principal": self.name, "super_admin": self.is_super_admin,
+                "token_id": self.token_id, "qtrees": sorted(self.qtrees),
+                "actions": sorted(self.actions)}
+
+
+SUPER_ADMIN = Principal(is_super_admin=True, token_id="super", label="super-admin")

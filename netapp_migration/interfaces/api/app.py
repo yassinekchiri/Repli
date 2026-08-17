@@ -31,7 +31,7 @@ import threading
 import uuid
 from typing import Callable, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -40,12 +40,16 @@ from ...config import CredentialsResolver, job_dir
 from ...core.engine import MigrationEngine
 from ...core.jobs import JobStore, JobNotFound
 from ...models import (MigrationParams, OntapError, ConfirmationRequired,
-                       PreflightFailed)
+                       PreflightFailed, AuthError, ForbiddenError, Principal)
+from ...security.tokens import TokenStore
+from ...security import csvio
 from ...transport import build_client
 from .schemas import (CreateMigrationRequest, ResumeRequest, CloneRequest,
                       TestRequest, AclRequest, CleanupRequest,
                       ActionAccepted, ActionResult, PreflightResponse,
-                      PreflightCreateRequest)
+                      PreflightCreateRequest, PreflightActionRequest,
+                      ScopeCsvRequest, ScopeCsvResponse, ScopeUpdateRequest,
+                      ScopeResponse, WhoAmIResponse)
 
 _MAX_CAPTURED_LOG_LINES = 4000
 
@@ -98,7 +102,99 @@ def swagger_ui():
     )
 
 _store = JobStore(job_dir())
+# Unlocked at startup by the launcher (serve.py) with the global token.
+# While locked, every endpoint answers 503: the API is deliberately unusable
+# until a super admin re-supplies the global token on the command line.
+_tokens = TokenStore()
 _registry_lock = threading.Lock()
+
+
+def token_store() -> TokenStore:
+    return _tokens
+
+
+def _bearer(request: Request) -> str:
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return request.headers.get("x-api-token", "").strip()
+
+
+def current_principal(request: Request) -> Principal:
+    """Authenticate the caller, or refuse the request.
+
+    401 when the token is missing/unknown, 503 when the store is still
+    locked (the API was restarted and nobody supplied the global token).
+    """
+    if not _tokens.exists:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "not_initialised",
+                    "message": "no token store on this server",
+                    "hint": "initialise it with: python3 "
+                            "netapp_cascade_migration.py --action tokens-init"})
+    if not _tokens.unlocked:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "locked",
+                    "message": "the API is locked: its token store has not "
+                               "been unlocked since the last restart",
+                    "hint": "a super admin must restart the service and "
+                            "supply the global token: python3 -m "
+                            "netapp_migration.interfaces.api.serve"})
+    try:
+        return _tokens.authenticate(_bearer(request))
+    except AuthError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "unauthenticated", "message": exc.message,
+                    "hint": exc.hint}) from exc
+
+
+def require_super_admin(principal: Principal = Depends(current_principal)
+                        ) -> Principal:
+    if not principal.is_super_admin:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "forbidden",
+                    "message": "this endpoint is reserved to the super admin",
+                    "hint": "use the global token"})
+    return principal
+
+
+def _requested_qtrees(params: MigrationParams, qtrees_csv: str,
+                      mapping: dict) -> List[str]:
+    """Qtrees a request targets, for the scope check.
+
+    'all' cannot be resolved without contacting the source cluster, so a
+    scoped token must name its qtrees explicitly (the mapping it supplies
+    already does).
+    """
+    raw = (qtrees_csv or "").strip()
+    if raw.lower() == "all":
+        return sorted(mapping) if mapping else ["*"]
+    return [q.strip() for q in raw.split(",") if q.strip()]
+
+
+def _qtrees_of_path(job: dict, acl_path: str) -> List[str]:
+    """Which qtree owns the volume an ACL path points at."""
+    first = (acl_path or "").strip("/").split("/")[0]
+    for qtree, volume in (job.get("volume_map") or {}).items():
+        if volume == first:
+            return [qtree]
+    return [first] if first else []
+
+
+def _authorise(principal: Principal, action: str, qtrees=None) -> None:
+    """Scope check; 403 with the granted scope when it does not cover."""
+    try:
+        principal.authorise(action, qtrees or [])
+    except ForbiddenError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "forbidden", "message": exc.message,
+                    "hint": exc.hint,
+                    "granted": principal.to_dict()}) from exc
 # job_id -> info about the last (or current) action run on that job.
 _runs: Dict[str, dict] = {}
 
@@ -277,11 +373,21 @@ def _run_sync(job_id: Optional[str], action: str,
 
 @app.get("/api/v1/health")
 def health():
-    return {"status": "ok", "job_dir": _store.directory}
+    """Public liveness probe: no token required, no sensitive detail."""
+    return {"status": "ok", "job_dir": _store.directory,
+            "auth": {"initialised": _tokens.exists,
+                     "unlocked": _tokens.unlocked}}
+
+
+@app.get("/api/v1/auth/whoami", response_model=WhoAmIResponse)
+def whoami(principal: Principal = Depends(current_principal)):
+    """Echo the scope attached to the presented token."""
+    return WhoAmIResponse(**principal.to_dict())
 
 
 @app.post("/api/v1/migrations", status_code=202, response_model=ActionAccepted)
-def create_migration(req: CreateMigrationRequest):
+def create_migration(req: CreateMigrationRequest,
+                     principal: Principal = Depends(require_super_admin)):
     """Start the cascade initialisation; answers immediately with the job id."""
     params = MigrationParams.from_dict(req.model_dump())
     # Refused up front: no job file is even created for an infeasible cascade.
@@ -301,8 +407,14 @@ def create_migration(req: CreateMigrationRequest):
 
 
 @app.get("/api/v1/migrations")
-def list_migrations():
+def list_migrations(principal: Principal = Depends(current_principal)):
     jobs = _store.list_jobs()
+    if not principal.is_super_admin:
+        # A scoped caller only sees jobs holding at least one of its qtrees.
+        owned = {q.lower() for q in principal.qtrees}
+        jobs = [j for j in jobs
+                if owned & {q.lower() for q in (j.get("volume_map") or {})}
+                or owned & {q.lower() for q in (j.get("test_qtrees") or [])}]
     return {"count": len(jobs),
             "jobs": [{"job_id": j.get("job_id"),
                       "status": j.get("status"),
@@ -312,7 +424,8 @@ def list_migrations():
 
 
 @app.get("/api/v1/migrations/{job_id}")
-def get_migration(job_id: str, logs: int = 50):
+def get_migration(job_id: str, logs: int = 50,
+                  principal: Principal = Depends(current_principal)):
     """Job record + last action run (state and captured log tail)."""
     job = _load_job_or_404(job_id)
     run = _runs.get(job_id)
@@ -326,7 +439,8 @@ def get_migration(job_id: str, logs: int = 50):
 
 
 @app.get("/api/v1/migrations/{job_id}/status")
-def migration_status(job_id: str):
+def migration_status(job_id: str,
+                     principal: Principal = Depends(current_principal)):
     """Live ONTAP replication state (queries the clusters).
 
     Strictly read-only: the job file is never modified by a GET. Use
@@ -344,7 +458,8 @@ def migration_status(job_id: str):
 
 
 @app.post("/api/v1/migrations/{job_id}/refresh", response_model=ActionResult)
-def refresh_migration(job_id: str):
+def refresh_migration(job_id: str,
+                      principal: Principal = Depends(require_super_admin)):
     """Re-read the live state AND persist it into the job file."""
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
@@ -359,7 +474,8 @@ def refresh_migration(job_id: str):
 # ---- Feasibility checks on demand (never mutate anything) --------------- #
 
 @app.post("/api/v1/preflight/create", response_model=PreflightResponse)
-def preflight_create(req: PreflightCreateRequest):
+def preflight_create(req: PreflightCreateRequest,
+                     principal: Principal = Depends(require_super_admin)):
     """Check whether a cascade could be created, without creating anything.
 
     Verifies SVMs, source volume, aggregates and capacity, absence of
@@ -376,39 +492,50 @@ def preflight_create(req: PreflightCreateRequest):
 @app.post("/api/v1/migrations/{job_id}/preflight/{action}",
           response_model=PreflightResponse)
 def preflight_action(job_id: str, action: str,
-                     qtrees: Optional[str] = None,
-                     acl_path: Optional[str] = None,
-                     ad_groups: Optional[str] = None,
-                     qtree: Optional[str] = None,
-                     fresh: bool = False):
+                     req: Optional[PreflightActionRequest] = None,
+                     principal: Principal = Depends(current_principal)):
     """Check whether an action is feasible on this job, without running it.
 
     action: resume | retry | test | clone | acl | cleanup
-    The extra query parameters are the ones the action itself would take.
+    The body carries the same fields the action itself would take.
     """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    req = req or PreflightActionRequest()
+    mapping = req.mapping
+    qtree_list = req.qtrees_csv
+
+    # Checking feasibility is itself scoped: a token may only probe what it
+    # is allowed to run.
+    if action in ("test", "clone"):
+        _authorise(principal, action,
+                   _requested_qtrees(params, qtree_list, mapping))
+    elif action == "acl":
+        _authorise(principal, "acl", _qtrees_of_path(job, req.acl_path or ""))
+    elif action == "cleanup":
+        _authorise(principal, "cleanup", [req.qtree] if req.qtree else [])
+    else:
+        _authorise(principal, action)
+
     logs: List[str] = []
     logger = _make_run_logger(logs)
     engine = _engine_for(params, logger)
     checker = engine.checker
-
-    qtree_list = qtrees or ""
-    group_list = [g.strip() for g in (ad_groups or "").split(",") if g.strip()]
 
     if action == "resume":
         report = checker.for_resume(job)
     elif action == "retry":
         report = checker.for_retry(job)
     elif action == "test":
-        report = checker.for_test(job, qtree_list)
+        report = checker.for_test(job, qtree_list, volume_map=mapping)
     elif action == "clone":
-        report = checker.for_clone(job, qtree_list, fresh=fresh)
+        report = checker.for_clone(job, qtree_list, fresh=req.fresh,
+                                   volume_map=mapping)
     elif action == "acl":
-        report = checker.for_acl(job, acl_path or "", group_list,
+        report = checker.for_acl(job, req.acl_path or "", req.ad_groups_list,
                                  "full-control")
     elif action == "cleanup":
-        report = checker.for_cleanup(job, qtree or "")
+        report = checker.for_cleanup(job, req.qtree or "")
     else:
         raise HTTPException(
             status_code=400,
@@ -418,7 +545,8 @@ def preflight_action(job_id: str, action: str,
 
 
 @app.post("/api/v1/migrations/{job_id}/resume", response_model=ActionResult)
-def resume_migration(job_id: str, req: ResumeRequest):
+def resume_migration(job_id: str, req: ResumeRequest,
+                     principal: Principal = Depends(require_super_admin)):
     """Fan out to PROD + DR once the pivot is ready.
 
     Without {"confirm": true} the call answers 409 when the pivot is ready,
@@ -437,7 +565,8 @@ def resume_migration(job_id: str, req: ResumeRequest):
 
 @app.post("/api/v1/migrations/{job_id}/retry", status_code=202,
           response_model=ActionAccepted)
-def retry_migration(job_id: str):
+def retry_migration(job_id: str,
+                    principal: Principal = Depends(require_super_admin)):
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
     _ensure_feasible(params, "retry", lambda ch: ch.for_retry(job))
@@ -453,7 +582,8 @@ def retry_migration(job_id: str):
 
 @app.post("/api/v1/migrations/{job_id}/test", status_code=202,
           response_model=ActionAccepted)
-def test_migration(job_id: str, req: TestRequest):
+def test_migration(job_id: str, req: TestRequest,
+                   principal: Principal = Depends(current_principal)):
     """Full TEST environment: clones + PROD->DR mirror, no split/move.
 
     Time-limited (validity_days); promote it with POST .../clone before
@@ -461,12 +591,17 @@ def test_migration(job_id: str, req: TestRequest):
     """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    mapping = req.mapping
+    _authorise(principal, "test", _requested_qtrees(params, req.qtrees_csv,
+                                                    mapping))
     _ensure_feasible(params, "test",
-                     lambda ch: ch.for_test(job, req.qtrees_csv))
+                     lambda ch: ch.for_test(job, req.qtrees_csv,
+                                            volume_map=mapping))
 
     def target(logger):
         engine = _engine_for(params, logger)
-        engine.test(req.qtrees_csv, job=job, validity_days=req.validity_days)
+        engine.test(req.qtrees_csv, job=job, validity_days=req.validity_days,
+                    volume_map=mapping)
 
     _run_in_background(job_id, "test", target)
     return ActionAccepted(job_id=job_id, action="test",
@@ -475,7 +610,8 @@ def test_migration(job_id: str, req: TestRequest):
 
 @app.post("/api/v1/migrations/{job_id}/clone", status_code=202,
           response_model=ActionAccepted)
-def clone_migration(job_id: str, req: CloneRequest):
+def clone_migration(job_id: str, req: CloneRequest,
+                    principal: Principal = Depends(current_principal)):
     """Definitive clones.
 
     If a test environment exists for this job, it is PROMOTED (volume moves
@@ -485,13 +621,18 @@ def clone_migration(job_id: str, req: CloneRequest):
     """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    mapping = req.mapping or dict(job.get("volume_map") or {})
+    _authorise(principal, "clone", _requested_qtrees(params, req.qtrees_csv,
+                                                     mapping))
     _ensure_feasible(params, "clone",
                      lambda ch: ch.for_clone(job, req.qtrees_csv,
-                                             fresh=req.fresh))
+                                             fresh=req.fresh,
+                                             volume_map=mapping))
 
     def target(logger):
         engine = _engine_for(params, logger)
-        engine.clone(req.qtrees_csv, job=job, fresh=req.fresh)
+        engine.clone(req.qtrees_csv, job=job, fresh=req.fresh,
+                     volume_map=mapping)
 
     _run_in_background(job_id, "clone", target)
     return ActionAccepted(job_id=job_id, action="clone",
@@ -499,13 +640,15 @@ def clone_migration(job_id: str, req: CloneRequest):
 
 
 @app.post("/api/v1/migrations/{job_id}/acl", response_model=ActionResult)
-def acl_migration(job_id: str, req: AclRequest):
+def acl_migration(job_id: str, req: AclRequest,
+                  principal: Principal = Depends(current_principal)):
     """Force AD-group DACLs on ONE destination path (server-side).
 
     Decoupled from test/clone: the caller provides the exact path.
     """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    _authorise(principal, "acl", _qtrees_of_path(job, req.acl_path))
 
     def target(logger) -> dict:
         engine = _engine_for(params, logger)
@@ -516,10 +659,12 @@ def acl_migration(job_id: str, req: AclRequest):
 
 
 @app.post("/api/v1/migrations/{job_id}/cleanup", response_model=ActionResult)
-def cleanup_migration(job_id: str, req: CleanupRequest):
+def cleanup_migration(job_id: str, req: CleanupRequest,
+                      principal: Principal = Depends(current_principal)):
     """Cut source access for one qtree (export-policy, CIFS, rename)."""
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
+    _authorise(principal, "cleanup", [req.qtree] if req.qtree else [])
 
     def target(logger) -> dict:
         engine = _engine_for(params, logger)
@@ -531,3 +676,82 @@ def cleanup_migration(job_id: str, req: CleanupRequest):
 @app.exception_handler(OntapError)
 def ontap_error_handler(_request, exc: OntapError):
     return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
+# =============================================================================
+# TOKEN ADMINISTRATION (super admin only)
+# =============================================================================
+
+def _auth_http_error(exc: AuthError) -> HTTPException:
+    return HTTPException(status_code=400,
+                         detail={"error": "token_store",
+                                 "message": exc.message, "hint": exc.hint})
+
+
+@app.post("/api/v1/auth/scopes/import", response_model=ScopeCsvResponse)
+def import_scopes(req: ScopeCsvRequest,
+                  principal: Principal = Depends(require_super_admin)):
+    """Apply the qtree/token/actions CSV.
+
+    Every `NEW_TOKEN` line yields a freshly generated token, returned in
+    clear in the answer CSV — the only place it ever appears. Existing
+    tokens listed by value keep their identity and see their scope updated.
+    """
+    try:
+        rows = csvio.parse_scope_csv(req.csv)
+    except ValueError as exc:
+        raise HTTPException(status_code=422,
+                            detail={"error": "invalid_csv",
+                                    "message": str(exc),
+                                    "hint": "expected header: qtree,token,"
+                                            "actions[,label]"}) from exc
+    results, created, updated = [], 0, 0
+    for row in rows:
+        try:
+            outcome = _tokens.upsert(row["qtree"], row["actions"],
+                                     row["token"], row["label"])
+        except AuthError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_scope",
+                        "message": f"line {row['line']}: {exc.message}",
+                        "hint": exc.hint}) from exc
+        outcome["label"] = row["label"]
+        results.append(outcome)
+        created += outcome["status"] == "created"
+        updated += outcome["status"] == "updated"
+    return ScopeCsvResponse(csv=csvio.render_scope_csv(results),
+                            created=created, updated=updated,
+                            tokens=[{k: v for k, v in r.items()
+                                     if k != "token"} for r in results])
+
+
+@app.get("/api/v1/auth/scopes", response_model=List[ScopeResponse])
+def list_scopes(principal: Principal = Depends(require_super_admin)):
+    """Every delegated scope. Tokens themselves are never returned."""
+    return [ScopeResponse(**scope.to_dict()) for scope in _tokens.list_scopes()]
+
+
+@app.patch("/api/v1/auth/scopes/{token_id}", response_model=ScopeResponse)
+def update_scope(token_id: str, req: ScopeUpdateRequest,
+                 principal: Principal = Depends(require_super_admin)):
+    """Change a scope dynamically: qtrees and/or actions, same token."""
+    try:
+        scope = _tokens.set_scope(token_id,
+                                  qtrees=req.as_list(req.qtrees),
+                                  actions=req.as_list(req.actions),
+                                  label=req.label)
+    except AuthError as exc:
+        raise _auth_http_error(exc) from exc
+    return ScopeResponse(**scope.to_dict())
+
+
+@app.delete("/api/v1/auth/scopes/{token_id}", status_code=204)
+def revoke_scope(token_id: str,
+                 principal: Principal = Depends(require_super_admin)):
+    """Revoke a delegated token immediately."""
+    try:
+        _tokens.revoke(token_id)
+    except AuthError as exc:
+        raise _auth_http_error(exc) from exc
+    return None

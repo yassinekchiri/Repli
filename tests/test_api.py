@@ -8,24 +8,35 @@ from fastapi.testclient import TestClient
 from conftest import FakeClient, cascade_ready
 
 
+GLOBAL_TOKEN = "SuperGlobalToken123"
+
+
 @pytest.fixture
 def api(tmp_path, monkeypatch, client, params):
-    """API wired onto the in-memory fake estate and a temporary job dir."""
+    """API wired onto the fake estate, with an unlocked token store."""
     import netapp_migration.interfaces.api.app as app_module
     from netapp_migration.core.jobs import JobStore
     from netapp_migration.core.engine import MigrationEngine
+    from netapp_migration.security.tokens import TokenStore
 
-    store = JobStore(str(tmp_path))
+    store = JobStore(str(tmp_path / "jobs"))
+    tokens = TokenStore(str(tmp_path / "tokens.enc"))
+    tokens.initialise(GLOBAL_TOKEN)
+
     monkeypatch.setattr(app_module, "_store", store)
+    monkeypatch.setattr(app_module, "_tokens", tokens)
     monkeypatch.setattr(app_module, "_runs", {})
 
     def fake_engine(engine_params, logger):
-        target = (JobStore(str(tmp_path), read_only=True)
+        target = (JobStore(str(tmp_path / "jobs"), read_only=True)
                   if engine_params.dry_run else store)
         return MigrationEngine(client, engine_params, target, logger)
 
     monkeypatch.setattr(app_module, "_engine_for", fake_engine)
-    return TestClient(app_module.app), store, client
+
+    http = TestClient(app_module.app)
+    http.headers.update({"Authorization": f"Bearer {GLOBAL_TOKEN}"})
+    return http, store, client, tokens
 
 
 CREATE_BODY = {
@@ -40,12 +51,12 @@ CREATE_BODY = {
 
 
 def test_health(api):
-    http, _, _ = api
+    http, _, _, _ = api
     assert http.get("/api/v1/health").json()["status"] == "ok"
 
 
 def test_preflight_create_reports_every_check(api):
-    http, _, fake = api
+    http, _, fake, tokens = api
     fake.schedules["DRC"] = []
     body = http.post("/api/v1/preflight/create", json=CREATE_BODY).json()
     assert body["ok"] is False
@@ -59,7 +70,7 @@ def test_preflight_create_reports_every_check(api):
 
 
 def test_preflight_create_passes_and_mutates_nothing(api):
-    http, store, fake = api
+    http, store, fake, tokens = api
     body = http.post("/api/v1/preflight/create", json=CREATE_BODY).json()
     assert body["ok"] is True
     assert fake.calls == []
@@ -68,7 +79,7 @@ def test_preflight_create_passes_and_mutates_nothing(api):
 
 def test_create_returns_422_with_failed_checks(api):
     """An infeasible create is refused up front, not attempted."""
-    http, _, fake = api
+    http, _, fake, tokens = api
     fake.aggregates["PRD"].pop("aggr_prd")
     r = http.post("/api/v1/migrations", json=CREATE_BODY)
     assert r.status_code == 422
@@ -82,7 +93,7 @@ def test_create_returns_422_with_failed_checks(api):
 
 
 def test_create_accepted_on_healthy_estate(api):
-    http, store, fake = api
+    http, store, fake, tokens = api
     r = http.post("/api/v1/migrations", json=CREATE_BODY)
     assert r.status_code == 202
     job_id = r.json()["job_id"]
@@ -90,7 +101,7 @@ def test_create_accepted_on_healthy_estate(api):
 
 
 def test_status_is_read_only(api):
-    http, store, fake = api
+    http, store, fake, tokens = api
     from netapp_migration.models import MigrationParams
     params = MigrationParams.from_dict(CREATE_BODY)
     job = store.create(params)
@@ -107,7 +118,7 @@ def test_status_is_read_only(api):
 
 
 def test_preflight_action_endpoint(api):
-    http, store, fake = api
+    http, store, fake, tokens = api
     from netapp_migration.models import MigrationParams
     params = MigrationParams.from_dict(CREATE_BODY)
     job = store.create(params)
@@ -115,18 +126,21 @@ def test_preflight_action_endpoint(api):
     cascade_ready(fake, params)
 
     ok = http.post(f"/api/v1/migrations/{job['job_id']}/preflight/test",
-                   params={"qtrees": "q_fin,q_hr"}).json()
+                   json={"qtrees": "q_fin,q_hr",
+                         "volume_map": {"q_fin": "vol_fin",
+                                        "q_hr": "vol_rh"}}).json()
     assert ok["ok"] is True
 
     bad = http.post(f"/api/v1/migrations/{job['job_id']}/preflight/test",
-                    params={"qtrees": "q_missing"}).json()
+                    json={"qtrees": "q_missing",
+                          "volume_map": {"q_missing": "vol_x"}}).json()
     assert bad["ok"] is False
     assert any(c["code"] == "QTREES_MISSING" for c in bad["checks"])
     assert fake.calls == []
 
 
 def test_preflight_unknown_action(api):
-    http, store, _ = api
+    http, store, _, tokens = api
     from netapp_migration.models import MigrationParams
     job = store.create(MigrationParams.from_dict(CREATE_BODY))
     r = http.post(f"/api/v1/migrations/{job['job_id']}/preflight/banana")
@@ -134,7 +148,7 @@ def test_preflight_unknown_action(api):
 
 
 def test_acl_rejects_root_with_readable_checks(api):
-    http, store, fake = api
+    http, store, fake, tokens = api
     from netapp_migration.models import MigrationParams
     job = store.create(MigrationParams.from_dict(CREATE_BODY))
     r = http.post(f"/api/v1/migrations/{job['job_id']}/acl",
@@ -146,15 +160,20 @@ def test_acl_rejects_root_with_readable_checks(api):
 
 
 def test_cleanup_rejects_empty_qtree(api):
-    http, store, fake = api
-    r = http.post("/api/v1/migrations/x/cleanup", json={"qtree": ""})
-    assert r.status_code in (404, 422)          # unknown job or refused qtree
+    http, store, fake, tokens = api
+    from netapp_migration.models import MigrationParams
+    job = store.create(MigrationParams.from_dict(CREATE_BODY))
+    r = http.post(f"/api/v1/migrations/{job['job_id']}/cleanup",
+                  json={"qtree": ""})
+    assert r.status_code == 422
+    codes = {c["code"] for c in r.json()["detail"]["failed_checks"]}
+    assert "CLEANUP_QTREE_MISSING" in codes
     assert fake.calls == []
 
 
 def test_logs_zero_returns_no_logs(api):
     """P2: logs=0 used to return every captured line."""
-    http, store, fake = api
+    http, store, fake, tokens = api
     r = http.post("/api/v1/migrations", json=CREATE_BODY)
     job_id = r.json()["job_id"]
     body = http.get(f"/api/v1/migrations/{job_id}", params={"logs": 0}).json()
@@ -162,12 +181,12 @@ def test_logs_zero_returns_no_logs(api):
 
 
 def test_missing_job_is_404(api):
-    http, _, _ = api
+    http, _, _, _ = api
     assert http.get("/api/v1/migrations/NOPE").status_code == 404
 
 
 def test_openapi_is_renderable(api):
-    http, _, _ = api
+    http, _, _, _ = api
     spec = http.get("/openapi.json").json()
     assert spec["openapi"].startswith("3.0")
     assert "/api/v1/preflight/create" in spec["paths"]

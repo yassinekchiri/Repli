@@ -21,6 +21,11 @@ class DryRunClient(OntapClient):
 
     def __init__(self, logger: logging.Logger):
         self.log = logger
+        # Simulated inventory: objects this run has "created". Without it
+        # every existence check would answer yes, and the pre-flight report
+        # would claim that target names are already taken.
+        self._volumes: set = set()
+        self._snapshots: set = set()
 
     def _trace(self, cluster: str, operation: str):
         self.log.info("[DRY-RUN] %-12s %s", cluster, operation)
@@ -32,17 +37,21 @@ class DryRunClient(OntapClient):
                           security_style="ntfs", aggregate="aggr_dryrun_parent")
 
     def volume_exists(self, cluster, svm, volume) -> bool:
-        self._trace(cluster, f"volume exists? {svm}:{volume} -> yes")
-        return True
+        found = (cluster, svm, volume) in self._volumes
+        self._trace(cluster, f"volume exists? {svm}:{volume} -> "
+                             f"{'yes' if found else 'no'}")
+        return found
 
     def create_dp_volume(self, cluster, svm, volume, aggregate, size_bytes,
                          security_style, idempotent=False):
         self._trace(cluster, f"volume create {svm}:{volume} (DP, aggr={aggregate})")
+        self._volumes.add((cluster, svm, volume))
 
     def create_clone(self, cluster, svm, clone_name, parent_volume,
                      parent_snapshot):
         self._trace(cluster, f"volume clone create {svm}:{clone_name} "
                              f"(parent={parent_volume}@{parent_snapshot})")
+        self._volumes.add((cluster, svm, clone_name))
 
     def start_volume_move(self, cluster, svm, volume, dest_aggregate):
         self._trace(cluster, f"volume move start {svm}:{volume} -> {dest_aggregate}")
@@ -59,10 +68,14 @@ class DryRunClient(OntapClient):
     # ---- Snapshots -------------------------------------------------------
     def create_snapshot(self, cluster, svm, volume, snapshot):
         self._trace(cluster, f"snapshot create {svm}:{volume}@{snapshot}")
+        # A snapshot created on the source is assumed propagated everywhere.
+        self._snapshots.add(snapshot)
 
     def snapshot_exists(self, cluster, svm, volume, snapshot) -> bool:
-        self._trace(cluster, f"snapshot exists? {svm}:{volume}@{snapshot} -> yes")
-        return True
+        found = snapshot in self._snapshots
+        self._trace(cluster, f"snapshot exists? {svm}:{volume}@{snapshot} -> "
+                             f"{'yes' if found else 'no'}")
+        return found
 
     # ---- Qtrees ----------------------------------------------------------
     def list_qtrees(self, cluster, svm, volume) -> List[str]:

@@ -410,6 +410,73 @@ class PreflightChecker:
                           target=target)
         return normalised
 
+    def _check_volume_map(self, report: PreflightReport,
+                          qtrees: Sequence[str],
+                          volume_map: Optional[Dict[str, str]],
+                          job: Optional[dict]):
+        """Every qtree must be given an explicit, legal, free volume name."""
+        p = self.p
+        mapping = dict((job or {}).get("volume_map") or {})
+        mapping.update({k: v for k, v in (volume_map or {}).items() if v})
+        lowered = {k.lower(): v for k, v in mapping.items()}
+
+        resolved: Dict[str, str] = {}
+        missing = []
+        for qtree in qtrees:
+            name = mapping.get(qtree) or lowered.get(qtree.lower())
+            if name:
+                resolved[qtree] = name
+            else:
+                missing.append(qtree)
+
+        self._add(report, "VOLUME_MAP_MISSING",
+                  "Every qtree has a target volume name", not missing,
+                  detail=f"no name given for: {', '.join(missing)}" if missing
+                         else f"{len(resolved)} name(s) provided",
+                  hint="supply one line per qtree (qtree,volume) via "
+                       "--volume-map, or the volume_map field of the API "
+                       "request" if missing else "")
+        if not resolved:
+            return
+
+        # Distinct names — two qtrees cannot land on the same volume.
+        duplicates = sorted({v for v in resolved.values()
+                             if list(resolved.values()).count(v) > 1})
+        self._add(report, "VOLUME_MAP_DUPLICATE",
+                  "Target volume names are distinct", not duplicates,
+                  detail=f"reused: {', '.join(duplicates)}" if duplicates
+                         else "all distinct",
+                  hint="give each qtree its own volume name" if duplicates else "")
+
+        for qtree, name in sorted(resolved.items()):
+            legal = (_VOLUME_NAME_RE.match(name) is not None
+                     and len(name) <= _VOLUME_NAME_MAX)
+            self._add(report, "VOLUME_NAME_ILLEGAL",
+                      f"'{name}' is a valid ONTAP volume name", legal,
+                      detail=f"qtree '{qtree}' -> '{name}' "
+                             f"({len(name)} chars)",
+                      hint="letters, digits and underscore only, starting "
+                           "with a letter or underscore, 203 characters "
+                           "maximum" if not legal else "")
+            if not legal:
+                continue
+            # The name must be free on BOTH destinations (unless this job
+            # already created it, i.e. a promotion reusing its own clones).
+            already_ours = name in set((job or {}).get("clone_volumes", []))
+            for cluster, svm, role in ((p.dest_cluster, p.dest_vserver, "PROD"),
+                                       (p.dr_cluster, p.dr_vserver, "DR")):
+                taken, err = self._safe(
+                    lambda c=cluster, sv=svm, n=name:
+                        self.c.volume_exists(c, sv, n), False)
+                free = (not taken) or already_ours
+                self._add(report, "VOLUME_NAME_TAKEN",
+                          f"{role}: volume '{name}' is available", free,
+                          detail=err or ("already exists" if taken
+                                         else "name available"),
+                          hint="choose another name, or delete the leftover "
+                               "volume" if not free else "",
+                          target=f"{cluster} / {svm}:{name}")
+
     # ================================================================== #
     # ACTION: create
     # ================================================================== #
@@ -630,7 +697,8 @@ class PreflightChecker:
             self._check_relationship_ready(report, p.dr_cluster,
                                            job["dr_dest_path"], "DR")
 
-    def for_test(self, job: dict, qtrees: Sequence[str]) -> PreflightReport:
+    def for_test(self, job: dict, qtrees: Sequence[str],
+                 volume_map: Optional[Dict[str, str]] = None) -> PreflightReport:
         p = self.p
         report = self._report("test")
         status = job.get("status", "unknown")
@@ -643,20 +711,22 @@ class PreflightChecker:
                        "check-status) before building a test environment",
                   target=job.get("job_id", ""))
 
-        existing_uid = job.get("clone_uid") if job.get("test_env") else None
+        existing = (job.get("clone_volumes") or []) if job.get("test_env") \
+            else []
         self._add(report, "TEST_ENV_ALREADY_EXISTS",
-                  "No test environment already in place", not existing_uid,
-                  detail=f"test environment '{existing_uid}' created "
+                  "No test environment already in place", not existing,
+                  detail=f"test clones {', '.join(existing)} created "
                          f"{job.get('test_created_at', 'unknown')}"
-                         if existing_uid else "none",
+                         if existing else "none",
                   hint="promote it with action 'clone', or delete its clones "
-                       "before building a new one" if existing_uid else "",
+                       "before building a new one" if existing else "",
                   target=job.get("job_id", ""))
 
         if status in _CASCADE_READY_STATUSES:
             self._check_cascade_healthy(report, job)
 
         normalised = self._check_qtrees(report, qtrees)
+        self._check_volume_map(report, normalised, volume_map, job)
 
         # The clone mirror PROD -> DR needs its own peering, policy and
         # schedule on the DR cluster.
@@ -669,16 +739,16 @@ class PreflightChecker:
         return report
 
     def for_clone(self, job: dict, qtrees: Sequence[str],
-                  fresh: bool = False) -> PreflightReport:
+                  fresh: bool = False,
+                  volume_map: Optional[Dict[str, str]] = None) -> PreflightReport:
         p = self.p
         report = self._report("clone")
-        promoting = bool(job.get("test_env") and job.get("clone_uid")
+        promoting = bool(job.get("test_env") and job.get("clone_volumes")
                          and not fresh)
 
         if promoting:
-            uid = job["clone_uid"]
-            test_qtrees = job.get("test_qtrees") or [
-                v[2:-(len(uid) + 1)] for v in job.get("clone_volumes", [])]
+            recorded = dict(job.get("volume_map") or {})
+            test_qtrees = job.get("test_qtrees") or list(recorded)
             requested = list(dict.fromkeys(self.resolve_qtrees(qtrees)))
             exact = sorted(requested) == sorted(dict.fromkeys(test_qtrees))
             self._add(report, "PROMOTION_QTREE_MISMATCH",
@@ -688,11 +758,13 @@ class PreflightChecker:
                       hint="promote the exact same qtrees as the test run, or "
                            "use --fresh to rebuild from scratch"
                            if not exact else "",
-                      target=uid)
+                      target=job.get("job_id", ""))
 
             # The clones themselves and their mirrors must be healthy.
             for qtree in test_qtrees:
-                clone = f"v_{qtree}_{uid}"
+                clone = recorded.get(qtree, "")
+                if not clone:
+                    continue
                 self._check_volume_present(report, p.dest_cluster,
                                            p.dest_vserver, clone,
                                            f"PROD clone {clone}")
@@ -716,7 +788,8 @@ class PreflightChecker:
                           hint="promoting an expired environment is allowed "
                                "but confirm the data is still relevant"
                                if expired else "",
-                          target=uid, severity=SEVERITY_WARNING)
+                          target=job.get("job_id", ""),
+                          severity=SEVERITY_WARNING)
         else:
             status = job.get("status", "unknown") if job else "unknown"
             if job:
@@ -728,7 +801,9 @@ class PreflightChecker:
                           target=job.get("job_id", ""))
                 if status in _CASCADE_READY_STATUSES:
                     self._check_cascade_healthy(report, job)
-            self._check_qtrees(report, qtrees)
+            normalised = self._check_qtrees(report, qtrees)
+            self._check_volume_map(report, normalised, volume_map,
+                                   None if fresh else job)
             self._check_peering(report, p.dr_cluster, p.dr_vserver,
                                 p.dest_cluster, p.dest_vserver,
                                 "clone PROD -> clone DR")
@@ -740,9 +815,9 @@ class PreflightChecker:
                 self._add(report, "FRESH_ABANDONS_TEST_ENV",
                           "Fresh mode abandons the existing test environment",
                           False,
-                          detail=f"test environment "
-                                 f"'{job.get('clone_uid')}' will be left in "
-                                 f"place",
+                          detail=f"test clones "
+                                 f"{', '.join(job.get('clone_volumes', []))} "
+                                 f"will be left in place",
                           hint="its clones must be deleted manually once the "
                                "new clones are validated",
                           target=job.get("job_id", ""),

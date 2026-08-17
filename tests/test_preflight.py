@@ -7,7 +7,7 @@ import pytest
 from netapp_migration.core.preflight import PreflightChecker
 from netapp_migration.models import PreflightFailed
 
-from conftest import cascade_ready
+from conftest import cascade_ready, vmap
 
 
 def checker(client, params, logger, simulated=False):
@@ -155,7 +155,8 @@ def test_resume_refuses_second_initialize(client, params, logger, store):
 
 def test_test_requires_a_complete_cascade(client, params, logger, store):
     job = store.create(params)
-    report = checker(client, params, logger).for_test(job, ["q_fin"])
+    report = checker(client, params, logger).for_test(
+        job, ["q_fin"], volume_map=vmap("q_fin"))
     assert "CASCADE_NOT_READY" in failing_codes(report)
 
 
@@ -163,7 +164,8 @@ def test_test_rejects_unknown_qtree(client, params, logger, store):
     job = store.create(params)
     store.set_status(job, "completed")
     cascade_ready(client, params)
-    report = checker(client, params, logger).for_test(job, ["q_missing"])
+    report = checker(client, params, logger).for_test(
+        job, ["q_missing"], volume_map=vmap("q_missing"))
     assert "QTREES_MISSING" in failing_codes(report)
 
 
@@ -171,7 +173,8 @@ def test_test_rejects_duplicate_qtrees(client, params, logger, store):
     job = store.create(params)
     store.set_status(job, "completed")
     cascade_ready(client, params)
-    report = checker(client, params, logger).for_test(job, ["q_fin", "q_fin"])
+    report = checker(client, params, logger).for_test(
+        job, ["q_fin", "q_fin"], volume_map=vmap("q_fin"))
     assert "QTREES_DUPLICATED" in failing_codes(report)
 
 
@@ -179,9 +182,10 @@ def test_test_refuses_when_environment_exists(client, params, logger, store):
     job = store.create(params)
     store.set_status(job, "completed")
     cascade_ready(client, params)
-    job.update({"test_env": True, "clone_uid": "abc123",
-                "clone_volumes": ["v_q_fin_abc123"]})
-    report = checker(client, params, logger).for_test(job, ["q_fin"])
+    job.update({"test_env": True, "volume_map": {"q_fin": "vol_fin"},
+                "clone_volumes": ["vol_fin"]})
+    report = checker(client, params, logger).for_test(
+        job, ["q_fin"], volume_map=vmap("q_fin"))
     assert "TEST_ENV_ALREADY_EXISTS" in failing_codes(report)
 
 
@@ -191,7 +195,8 @@ def test_test_detects_broken_cascade(client, params, logger, store):
     cascade_ready(client, params)
     client.add_relationship(job["dr_dest_path"], state="broken_off",
                             transfer_state="failed")
-    report = checker(client, params, logger).for_test(job, ["q_fin"])
+    report = checker(client, params, logger).for_test(
+        job, ["q_fin"], volume_map=vmap("q_fin"))
     assert "SNAPMIRROR_NOT_READY" in failing_codes(report)
 
 
@@ -201,14 +206,14 @@ def test_clone_promotion_rejects_partial_qtree_set(client, params, logger,
     job = store.create(params)
     store.set_status(job, "completed")
     cascade_ready(client, params)
-    uid = "abc123"
-    job.update({"test_env": True, "clone_uid": uid,
+    mapping = {"q_fin": "vol_fin", "q_hr": "vol_rh"}
+    job.update({"test_env": True, "volume_map": mapping,
                 "test_qtrees": ["q_fin", "q_hr"],
-                "clone_volumes": [f"v_q_fin_{uid}", f"v_q_hr_{uid}"]})
-    for qtree in ("q_fin", "q_hr"):
+                "clone_volumes": list(mapping.values())})
+    for qtree, volume in mapping.items():
         for cluster, svm in (("PRD", "svm_dest"), ("DRC", "svm_dr")):
-            client.add_volume(cluster, svm, f"v_{qtree}_{uid}")
-        client.add_relationship(f"svm_dr:v_{qtree}_{uid}")
+            client.add_volume(cluster, svm, volume)
+        client.add_relationship(f"svm_dr:{volume}")
     report = checker(client, params, logger).for_clone(job, ["q_fin"])
     assert "PROMOTION_QTREE_MISMATCH" in failing_codes(report)
 
@@ -217,14 +222,14 @@ def test_clone_promotion_accepts_exact_qtree_set(client, params, logger, store):
     job = store.create(params)
     store.set_status(job, "completed")
     cascade_ready(client, params)
-    uid = "abc123"
-    job.update({"test_env": True, "clone_uid": uid,
+    mapping = {"q_fin": "vol_fin", "q_hr": "vol_rh"}
+    job.update({"test_env": True, "volume_map": mapping,
                 "test_qtrees": ["q_fin", "q_hr"],
-                "clone_volumes": [f"v_q_fin_{uid}", f"v_q_hr_{uid}"]})
-    for qtree in ("q_fin", "q_hr"):
+                "clone_volumes": list(mapping.values())})
+    for qtree, volume in mapping.items():
         for cluster, svm in (("PRD", "svm_dest"), ("DRC", "svm_dr")):
-            client.add_volume(cluster, svm, f"v_{qtree}_{uid}")
-        client.add_relationship(f"svm_dr:v_{qtree}_{uid}")
+            client.add_volume(cluster, svm, volume)
+        client.add_relationship(f"svm_dr:{volume}")
     report = checker(client, params, logger).for_clone(job, ["q_hr", "q_fin"])
     assert report.ok, report.summary()
 
@@ -332,7 +337,8 @@ def test_qtrees_all_is_expanded(client, params, logger, store):
     job = store.create(params)
     store.set_status(job, "completed")
     cascade_ready(client, params)
-    report = checker(client, params, logger).for_test(job, "all")
+    report = checker(client, params, logger).for_test(
+        job, "all", volume_map=vmap("q_fin", "q_hr", "q_ops"))
     assert report.ok, report.summary()
     check = next(c for c in report.checks if c.code == "QTREES_EMPTY")
     assert "3 qtree(s)" in check.detail
