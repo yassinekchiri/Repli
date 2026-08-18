@@ -139,9 +139,9 @@ def current_principal(request: Request) -> Principal:
             detail={"error": "locked",
                     "message": "the API is locked: its token store has not "
                                "been unlocked since the last restart",
-                    "hint": "a super admin must restart the service and "
-                            "supply the global token: python3 -m "
-                            "netapp_migration.interfaces.api.serve"})
+                    "hint": "a super admin must supply the global token: "
+                            "python3 netapp_cascade_migration.py "
+                            "--action api-unlock"})
     try:
         return _tokens.authenticate(_bearer(request))
     except AuthError as exc:

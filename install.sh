@@ -101,6 +101,7 @@ LOG_DIR="${PREFIX}/logs"
 ETC_DIR="${PREFIX}/etc"
 TOKEN_STORE="${ETC_DIR}/netapp_tokens.enc"
 CREDS_FILE="${ETC_DIR}/creds.json"
+UNLOCK_SOCKET="${ETC_DIR}/unlock.sock"
 
 # ----------------------------------------------------------------------------
 # 1. Prerequisites
@@ -342,23 +343,31 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# notify: the unit is reported active only once the port is really bound,
+# never while the process is still starting up.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${PREFIX}
 Environment=NETAPP_MIGRATION_CONFIG=${CREDS_FILE}
 Environment=NETAPP_MIGRATION_JOB_DIR=${JOB_DIR}
 Environment=NETAPP_TOKEN_STORE=${TOKEN_STORE}
+Environment=NETAPP_UNLOCK_SOCKET=${UNLOCK_SOCKET}
 
-# The global token is typed by a super admin on every start: the unit reads
-# it from stdin, so the service is NEVER started automatically.
+# A service has no terminal: an administrator connected over SSH could never
+# answer a prompt here. So it starts LOCKED — the port is bound, every
+# endpoint answers 503 — and a super admin supplies the global token from
+# their own session with '--action api-unlock'. The token still reaches the
+# process only in memory, and a restart comes back locked.
 ExecStart=${PYBIN} -m netapp_migration.interfaces.api.serve \\
-    --host ${API_HOST} --port ${API_PORT} --token-stdin
-StandardInput=tty
-TTYPath=/dev/console
+    --host ${API_HOST} --port ${API_PORT} \\
+    --start-locked --unlock-socket ${UNLOCK_SOCKET}
+StandardInput=null
 
-# No automatic restart: an unattended restart could not supply the token,
-# and must not silently re-open a locked API.
+# No automatic restart: a restart must be a deliberate act, followed by a
+# deliberate unlock.
 Restart=no
 
 # Hardening
@@ -366,7 +375,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${JOB_DIR} ${LOG_DIR}
+ReadWritePaths=${JOB_DIR} ${LOG_DIR} ${ETC_DIR}
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
@@ -449,12 +458,17 @@ ${BOLD}Next steps${RESET}
            --action tokens-import --token-store ${TOKEN_STORE} \\
            --scope-csv scopes.csv --scope-out issued.csv
 
-  4. Start the API (asks for the global token):
+  4. Start the API. It comes up LOCKED — the port is bound but every
+     endpoint answers 503 — because a service has no terminal to prompt on.
+     A super admin then unlocks it from their own session:
 EOF
 if (( INSTALL_SERVICE )); then
 cat <<EOF
-       systemctl start ${SERVICE_NAME}      # then type the token on the console
-     or, in the foreground:
+       systemctl start ${SERVICE_NAME}
+       ${CLI} --action api-unlock --unlock-socket ${UNLOCK_SOCKET}
+
+     or run it in the foreground instead, where it prompts directly
+     (use tmux/screen so it survives the SSH session):
        ${PYBIN} -m netapp_migration.interfaces.api.serve \\
            --host ${API_HOST} --port ${API_PORT}
 EOF
@@ -462,13 +476,27 @@ else
 cat <<EOF
        ${PYBIN} -m netapp_migration.interfaces.api.serve \\
            --host ${API_HOST} --port ${API_PORT}
+     It prompts for the global token, then serves. Use tmux/screen so it
+     survives the SSH session.
 EOF
 fi
 cat <<EOF
 
   5. Check it answers:
        curl -s http://${API_HOST}:${API_PORT}/api/v1/health
+       -> {"auth":{"unlocked":true}} once step 4 is complete
        Swagger UI: http://${API_HOST}:${API_PORT}/docs
+EOF
+if [[ "${API_HOST}" == "127.0.0.1" ]]; then
+cat <<EOF
+
+${BOLD}Note${RESET} — the API is bound to 127.0.0.1: /docs is reachable from this
+server only. To open it from a workstation, either tunnel:
+       ssh -L ${API_PORT}:127.0.0.1:${API_PORT} <user>@$(hostname -f 2>/dev/null || hostname)
+or reinstall with --host 0.0.0.0 once the port is firewalled properly.
+EOF
+fi
+cat <<EOF
 
 Full documentation: ${PREFIX}/README.md and ${PREFIX}/docs/architecture.md
 EOF

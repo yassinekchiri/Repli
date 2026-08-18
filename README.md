@@ -371,7 +371,11 @@ python3 netapp_cascade_migration.py --action tokens-revoke --token-id tok_xxx
 ```
 
 **Starting the API.** The store is decrypted in memory only, so every start
-requires the global token:
+requires the global token. There are two ways to supply it, because a
+terminal and a service are not the same situation.
+
+*In a terminal* (use `tmux`/`screen` so it outlives the SSH session) — it
+prompts before binding the port:
 
 ```bash
 python3 -m netapp_migration.interfaces.api.serve --host 127.0.0.1 --port 8000
@@ -379,9 +383,31 @@ python3 -m netapp_migration.interfaces.api.serve --host 127.0.0.1 --port 8000
 #   Token store unlocked: 3 delegated token(s).
 ```
 
-If the service stops, the API answers `503` until a super admin restarts it
-and supplies the global token again. This is deliberate: an unattended
-restart never silently re-opens the API.
+*Under systemd* — a service has no terminal an administrator connected over
+SSH can type into, so it starts **locked** instead: the port is bound
+immediately and every endpoint answers `503` until a super admin unlocks it
+from their own session:
+
+```bash
+systemctl start netapp-migration-api
+python3 netapp_cascade_migration.py --action api-unlock \
+    --unlock-socket /opt/netapp-migration/etc/unlock.sock
+#   Global token (super admin): ********
+#   API unlocked (unlocked, 3 delegated token(s)).
+```
+
+The token travels over a unix socket with mode `0600`, owned by the service
+account: never on disk, never in `argv`, never in the environment. Check the
+state at any time — this endpoint needs no authentication:
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/health
+# {"status":"ok", ..., "auth":{"initialised":true,"unlocked":true}}
+```
+
+If the service stops, the API comes back **locked** and answers `503` until a
+super admin supplies the global token again. This is deliberate: an
+unattended restart never silently re-opens the API.
 
 Calls carry the token as a bearer header:
 
@@ -629,22 +655,56 @@ curl -s -X POST $BASE/migrations/$JOB/cleanup \
      -H 'Content-Type: application/json' -d '{"qtree": "q_fin"}'
 ```
 
-### 4.4 systemd service (example)
+### 4.4 systemd service
+
+`install.sh` and `install-standalone.sh` write this unit for you. Two points
+are not negotiable and are the reason it does not simply run `uvicorn`:
+
+* it goes through `…api.serve`, which owns the token store — starting
+  `uvicorn app:app` directly leaves the store locked and every endpoint
+  answering `503` forever;
+* it starts **locked** and never tries to prompt. A service has no terminal;
+  reading a token from `/dev/console` blocks invisibly and the port is never
+  bound.
 
 ```ini
 # /etc/systemd/system/netapp-migration-api.service
 [Unit]
 Description=NetApp Cascade Migration API
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=migration
+# notify: active only once the port is really bound — never a process that
+# looks healthy while it is stuck starting up.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60
+User=netappmig
+Group=netappmig
 WorkingDirectory=/opt/netapp-migration
-Environment=NETAPP_MIGRATION_CONFIG=/etc/netapp-migration/creds.json
-Environment=NETAPP_MIGRATION_JOB_DIR=/var/lib/netapp-migration/jobs
-ExecStart=/opt/netapp-migration/.venv/bin/uvicorn \
-    netapp_migration.interfaces.api.app:app --host 0.0.0.0 --port 8000
-Restart=on-failure
+Environment=NETAPP_MIGRATION_CONFIG=/opt/netapp-migration/etc/creds.json
+Environment=NETAPP_MIGRATION_JOB_DIR=/opt/netapp-migration/jobs
+Environment=NETAPP_TOKEN_STORE=/opt/netapp-migration/etc/netapp_tokens.enc
+Environment=NETAPP_UNLOCK_SOCKET=/opt/netapp-migration/etc/unlock.sock
+
+ExecStart=/opt/netapp-migration/.venv/bin/python \
+    -m netapp_migration.interfaces.api.serve \
+    --host 127.0.0.1 --port 8000 \
+    --start-locked --unlock-socket /opt/netapp-migration/etc/unlock.sock
+StandardInput=null
+
+# A restart must be a deliberate act, followed by a deliberate unlock.
+Restart=no
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/netapp-migration/jobs /opt/netapp-migration/logs /opt/netapp-migration/etc
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -652,8 +712,13 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl daemon-reload
-systemctl enable --now netapp-migration-api
+systemctl start netapp-migration-api          # comes up locked
+python3 netapp_cascade_migration.py --action api-unlock \
+    --unlock-socket /opt/netapp-migration/etc/unlock.sock
 ```
+
+The unit is deliberately **not** enabled at boot: an unattended start would
+produce a locked API nobody asked for.
 
 ---
 
@@ -715,6 +780,26 @@ end of the run for manual deletion.
   (`/api/cluster/schedules`, `/api/snapmirror/policies`,
   `/api/svm/peers`). Quick check as the service account:
   `curl -sk -u mutrepli "https://<cluster>/api/cluster/schedules?name=hourly"`.
+* **The service is "active" but nothing listens on 8000** (`ss -ltnp` shows
+  no process, `/docs` unreachable): the unit is stuck before binding the
+  port. Check `systemctl status` and the journal. Historically this was a
+  unit that read the token from `/dev/console` — a prompt nobody could see
+  or answer over SSH. The current unit starts locked and never prompts; if
+  you still have the old one, reinstall or replace it with the unit in
+  section 4.4.
+* **Everything answers `503 {"error":"locked"}`**: the API is running but
+  its token store has not been unlocked since the last start. Unlock it:
+  `--action api-unlock --unlock-socket <prefix>/etc/unlock.sock`.
+  `curl /api/v1/health` shows `auth.unlocked` without authenticating.
+* **`no unlock socket at …`**: the API is not running, or it was started in
+  the foreground (where it prompts) rather than with `--start-locked`.
+* **`not allowed to open …/unlock.sock`**: the socket is `0600` and owned by
+  the service account — run the unlock as that account or as root
+  (`sudo -u netappmig …`).
+* **`/docs` works locally but not from a workstation**: the API is bound to
+  `127.0.0.1` (the default). Tunnel with
+  `ssh -L 8000:127.0.0.1:8000 user@server`, or start it with
+  `--host 0.0.0.0` once the port is properly firewalled.
 * **Blank `/docs` page**: the Swagger UI assets are served locally by the
   API (`/static/`) precisely for offline servers — if the page is blank,
   make sure you pulled the latest code and restarted uvicorn.

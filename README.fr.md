@@ -378,7 +378,11 @@ python3 netapp_cascade_migration.py --action tokens-revoke --token-id tok_xxx
 ```
 
 **Démarrer l'API.** Le coffre n'est déchiffré qu'en mémoire : chaque
-démarrage réclame le token global :
+démarrage réclame le token global. Deux façons de le fournir, parce qu'un
+terminal et un service ne sont pas la même situation.
+
+*Dans un terminal* (avec `tmux`/`screen` pour survivre à la session SSH) —
+l'API demande le token avant d'ouvrir le port :
 
 ```bash
 python3 -m netapp_migration.interfaces.api.serve --host 127.0.0.1 --port 8000
@@ -386,9 +390,31 @@ python3 -m netapp_migration.interfaces.api.serve --host 127.0.0.1 --port 8000
 #   Token store unlocked: 3 delegated token(s).
 ```
 
-Si le service s'arrête, l'API répond `503` jusqu'à ce qu'un super admin la
-relance en redonnant le token global. C'est volontaire : un redémarrage non
-supervisé ne rouvre jamais l'API silencieusement.
+*Sous systemd* — un service n'a aucun terminal sur lequel un administrateur
+connecté en SSH pourrait taper. L'API démarre donc **verrouillée** : le port
+est ouvert immédiatement et tous les endpoints répondent `503` jusqu'à ce
+qu'un super admin la déverrouille depuis sa propre session :
+
+```bash
+systemctl start netapp-migration-api
+python3 netapp_cascade_migration.py --action api-unlock \
+    --unlock-socket /opt/netapp-migration/etc/unlock.sock
+#   Global token (super admin): ********
+#   API unlocked (unlocked, 3 delegated token(s)).
+```
+
+Le token transite par une socket unix en mode `0600`, propriété du compte de
+service : jamais sur disque, jamais dans `argv`, jamais dans l'environnement.
+L'état se vérifie à tout moment, sans authentification :
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/health
+# {"status":"ok", ..., "auth":{"initialised":true,"unlocked":true}}
+```
+
+Si le service s'arrête, l'API revient **verrouillée** et répond `503` jusqu'à
+ce qu'un super admin redonne le token global. C'est volontaire : un
+redémarrage non supervisé ne rouvre jamais l'API silencieusement.
 
 Les appels portent le token en en-tête :
 
@@ -638,22 +664,57 @@ curl -s -X POST $BASE/migrations/$JOB/cleanup \
      -H 'Content-Type: application/json' -d '{"qtree": "q_fin"}'
 ```
 
-### 4.4 Service systemd (exemple)
+### 4.4 Service systemd
+
+`install.sh` et `install-standalone.sh` écrivent cette unité pour vous. Deux
+points ne sont pas négociables, et expliquent pourquoi elle ne lance pas
+simplement `uvicorn` :
+
+* elle passe par `…api.serve`, qui possède le coffre de tokens — lancer
+  `uvicorn app:app` directement laisse le coffre verrouillé et tous les
+  endpoints en `503` pour toujours ;
+* elle démarre **verrouillée** et ne tente jamais de poser une question. Un
+  service n'a pas de terminal : lire le token sur `/dev/console` bloque
+  invisiblement et le port n'est jamais ouvert.
 
 ```ini
 # /etc/systemd/system/netapp-migration-api.service
 [Unit]
 Description=NetApp Cascade Migration API
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User=migration
+# notify: active only once the port is really bound — never a process that
+# looks healthy while it is stuck starting up.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60
+User=netappmig
+Group=netappmig
 WorkingDirectory=/opt/netapp-migration
-Environment=NETAPP_MIGRATION_CONFIG=/etc/netapp-migration/creds.json
-Environment=NETAPP_MIGRATION_JOB_DIR=/var/lib/netapp-migration/jobs
-ExecStart=/opt/netapp-migration/.venv/bin/uvicorn \
-    netapp_migration.interfaces.api.app:app --host 0.0.0.0 --port 8000
-Restart=on-failure
+Environment=NETAPP_MIGRATION_CONFIG=/opt/netapp-migration/etc/creds.json
+Environment=NETAPP_MIGRATION_JOB_DIR=/opt/netapp-migration/jobs
+Environment=NETAPP_TOKEN_STORE=/opt/netapp-migration/etc/netapp_tokens.enc
+Environment=NETAPP_UNLOCK_SOCKET=/opt/netapp-migration/etc/unlock.sock
+
+ExecStart=/opt/netapp-migration/.venv/bin/python \
+    -m netapp_migration.interfaces.api.serve \
+    --host 127.0.0.1 --port 8000 \
+    --start-locked --unlock-socket /opt/netapp-migration/etc/unlock.sock
+StandardInput=null
+
+# A restart must be a deliberate act, followed by a deliberate unlock.
+Restart=no
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/netapp-migration/jobs /opt/netapp-migration/logs /opt/netapp-migration/etc
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -661,8 +722,13 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl daemon-reload
-systemctl enable --now netapp-migration-api
+systemctl start netapp-migration-api          # démarre verrouillée
+python3 netapp_cascade_migration.py --action api-unlock \
+    --unlock-socket /opt/netapp-migration/etc/unlock.sock
 ```
+
+L'unité n'est volontairement **pas** activée au démarrage : un lancement non
+supervisé ne produirait qu'une API verrouillée que personne n'a demandée.
 
 ---
 
@@ -723,6 +789,26 @@ listés en fin de run pour suppression manuelle.
   (`/api/cluster/schedules`, `/api/snapmirror/policies`,
   `/api/svm/peers`). Vérification rapide avec le compte de service :
   `curl -sk -u mutrepli "https://<cluster>/api/cluster/schedules?name=hourly"`.
+* **Le service est « active » mais rien n'écoute sur 8000** (`ss -ltnp` ne
+  montre aucun processus, `/docs` injoignable) : l'unité est bloquée avant
+  l'ouverture du port. Voir `systemctl status` et le journal. Historiquement
+  il s'agissait d'une unité qui lisait le token sur `/dev/console` — une
+  invite que personne ne pouvait voir ni renseigner en SSH. L'unité actuelle
+  démarre verrouillée et ne pose aucune question ; si vous avez encore
+  l'ancienne, réinstallez ou remplacez-la par celle de la section 4.4.
+* **Tout répond `503 {"error":"locked"}`** : l'API tourne mais son coffre
+  n'a pas été déverrouillé depuis le dernier démarrage. Déverrouillez-la :
+  `--action api-unlock --unlock-socket <prefix>/etc/unlock.sock`.
+  `curl /api/v1/health` affiche `auth.unlocked` sans authentification.
+* **`no unlock socket at …`** : l'API ne tourne pas, ou elle a été lancée au
+  premier plan (où elle demande le token) et non avec `--start-locked`.
+* **`not allowed to open …/unlock.sock`** : la socket est en `0600` et
+  appartient au compte de service — lancez le déverrouillage avec ce compte
+  ou en root (`sudo -u netappmig …`).
+* **`/docs` marche en local mais pas depuis un poste de travail** : l'API
+  écoute sur `127.0.0.1` (valeur par défaut). Faites un tunnel
+  `ssh -L 8000:127.0.0.1:8000 user@serveur`, ou démarrez-la avec
+  `--host 0.0.0.0` une fois le port correctement filtré.
 * **Page `/docs` vide** : les assets Swagger UI sont servis en local par
   l'API (`/static/`) précisément pour les serveurs sans Internet — si la
   page est vide, vérifier que le code est à jour (`git pull`) et relancer

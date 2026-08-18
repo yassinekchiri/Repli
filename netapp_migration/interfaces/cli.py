@@ -89,7 +89,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                                  "resume", "check-status", "retry",
                                  "tokens-init", "tokens-import",
                                  "tokens-list", "tokens-revoke",
-                                 "tokens-set-scope"])
+                                 "tokens-set-scope", "api-unlock"])
 
     # Topology (create / clone-without-job / cleanup)
     parser.add_argument("--source-cluster")
@@ -155,6 +155,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="(tokens-set-scope) new qtree list, comma-separated.")
     parser.add_argument("--grant-actions",
                         help="(tokens-set-scope) new action list, comma-separated.")
+    parser.add_argument("--unlock-socket", default=None,
+                        help="(api-unlock) unlock socket of a running API "
+                             "started with --start-locked (default: "
+                             "unlock.sock beside the token store).")
 
     # Transport
     parser.add_argument("--transport", choices=["rest", "ssh"], default="rest",
@@ -284,6 +288,41 @@ def _authenticate(args) -> Principal:
              "admin (global token) can drive the CLI directly")
 
 
+def _run_api_unlock(args) -> int:
+    """Hand the global token to a locked, already-running API."""
+    from ..interfaces.api.unlock import request_unlock, default_socket_path
+
+    store = TokenStore(args.token_store)
+    path = args.unlock_socket or default_socket_path(store.path)
+
+    token = args.token or _prompt_token("Global token (super admin): ")
+    if not token:
+        print("ERROR: no token supplied.", file=sys.stderr)
+        return 1
+
+    try:
+        answer = request_unlock(path, token)
+    except FileNotFoundError:
+        print(f"ERROR: no unlock socket at {path}", file=sys.stderr)
+        print("       the API is not running, or was not started with "
+              "--start-locked.", file=sys.stderr)
+        return 1
+    except PermissionError:
+        print(f"ERROR: not allowed to open {path}", file=sys.stderr)
+        print("       run this as the service account or as root.",
+              file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"ERROR: cannot reach {path}: {exc}", file=sys.stderr)
+        return 1
+
+    if answer.startswith("OK"):
+        print(f"API unlocked ({answer[3:].strip()}).")
+        return 0
+    print(f"ERROR: {answer[4:].strip() or 'unlock refused'}", file=sys.stderr)
+    return 1
+
+
 def _run_token_action(args) -> int:
     """tokens-* actions: local administration of the encrypted store."""
     action = args.action
@@ -402,6 +441,9 @@ def _run_token_action(args) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.action == "api-unlock":
+        return _run_api_unlock(args)
 
     if args.action in TOKEN_ACTIONS:
         return _run_token_action(args)
