@@ -136,6 +136,14 @@ pip install -r requirements.txt
 # pip install paramiko
 ```
 
+`requirements.txt` bounds every dependency (floor **and** ceiling). The
+ceilings are deliberate: they mark the first upstream release that dropped
+Python 3.9, which the target servers run. An old pip resolver picks the
+newest version first and then fails with
+`Package 'requests' requires a different Python: 3.9.25 not in '>=3.10'`
+instead of backtracking — the ceilings prevent that. Raise them only after
+re-testing on 3.9.
+
 #### Offline dependencies (server without repository access)
 
 The repository ships a `wheels/` directory with every required package

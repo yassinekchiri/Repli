@@ -139,6 +139,14 @@ pip install -r requirements.txt
 # pip install paramiko
 ```
 
+`requirements.txt` borne chaque dépendance (plancher **et** plafond). Les
+plafonds sont volontaires : ils marquent la première version amont qui a
+abandonné Python 3.9, la version installée sur les serveurs cibles. Un
+résolveur pip ancien prend d'abord la version la plus récente puis échoue
+avec `Package 'requests' requires a different Python: 3.9.25 not in
+'>=3.10'` au lieu de revenir en arrière — les plafonds évitent ça. Ne les
+relever qu'après un nouveau test sur 3.9.
+
 #### Dépendances hors-ligne (serveur sans accès aux dépôts)
 
 Le dépôt embarque un répertoire `wheels/` avec tous les paquets requis

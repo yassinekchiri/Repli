@@ -53,5 +53,21 @@ pip download -r requirements.txt -d wheels/ \
 
 Then commit the refreshed directory.
 
+`requirements.txt` carries an upper bound on every direct dependency
+(the first upstream release known to drop Python 3.9), so a re-download
+already lands on 3.9-compatible versions — no manual pruning needed.
+Two things still need checking by hand:
+
+* **Transitive dependencies have no ceiling.** After downloading, run
+  `python3 -m pip install --no-index --find-links wheels/ --dry-run
+  -r requirements-dev.txt` with a Python 3.9 interpreter and delete any
+  transitive wheel it rejects (past offenders: `anyio`, `urllib3`,
+  `click`, `pycparser`, `iniconfig`, `python-dotenv`, `starlette`).
+* **Conditional dependencies are resolved with the *downloading*
+  interpreter.** `pip download` evaluates environment markers such as
+  `python_version < "3.11"` against the machine you run it on, so
+  `exceptiongroup` (needed by `anyio` on 3.9/3.10) is silently skipped
+  when downloading from 3.11+. Add it explicitly if it disappears.
+
 Note: `paramiko` (optional, only for `--transport ssh --ssh-backend
 paramiko`) is NOT included.

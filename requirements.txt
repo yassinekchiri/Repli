@@ -1,13 +1,45 @@
-# --- ONTAP REST transport (default) ---
-requests>=2.31
+# netapp-migration — runtime dependencies
+#
+# Supported interpreters: CPython 3.9 → 3.12 (the target servers run 3.9).
+#
+# Every requirement below carries BOTH a floor and a ceiling. The floor is the
+# oldest release whose API the code actually uses; the ceiling is there because
+# pip's legacy resolver, when it is allowed to reach a repository, picks the
+# newest version first and then *fails* on `Requires-Python` instead of
+# backtracking. Without a ceiling an online install on Python 3.9 ends with:
+#
+#     Package 'requests' requires a different Python: 3.9.25 not in '>=3.10'
+#
+# The ceilings therefore mark the first upstream release known to drop
+# Python 3.9. Raise them only after re-testing on 3.9.
+#
+# OFFLINE INSTALL (the supported path — the servers have no repository access):
+#
+#     pip install --no-index --find-links wheels/ -r requirements.txt
+#
+# `wheels/` is the source of truth for the exact versions that ship; see
+# wheels/README.md. The versions currently bundled are noted after each line.
 
-# --- Token encryption (authentication layer) ---
-cryptography>=43.0
+# --- ONTAP REST transport (default) -----------------------------------------
+# requests 2.34.x requires Python >= 3.10.
+requests>=2.31,<2.33            # bundled: 2.32.5
 
-# --- REST API interface ---
-fastapi>=0.110
-uvicorn[standard]>=0.29
+# --- Token encryption (authentication layer) --------------------------------
+# Fernet + PBKDF2-HMAC-SHA256 for the encrypted token store.
+# Bounded to the cp39-abi3 wheel that ships in wheels/.
+cryptography>=43.0,<44          # bundled: 43.0.3
 
-# --- Optional: SSH transport with the paramiko backend ---
+# --- REST API interface -----------------------------------------------------
+# fastapi 0.139.x and starlette 1.3.x require Python >= 3.10.
+fastapi>=0.110,<0.129           # bundled: 0.128.8 (starlette 0.49.3)
+
+# uvicorn 0.50.x requires Python >= 3.10.
+# The [standard] extra pulls uvloop/httptools/websockets/watchfiles/PyYAML/
+# python-dotenv — all of them are in wheels/ for 3.9 → 3.12.
+uvicorn[standard]>=0.29,<0.40   # bundled: 0.39.0
+
+# --- Optional: SSH transport with the paramiko backend ----------------------
 # Only needed for:  --transport ssh --ssh-backend paramiko
-# paramiko>=2.11
+# Not bundled in wheels/ — the REST transport is the default and the SSH
+# transport works without it through the system `ssh` binary.
+# paramiko>=2.11,<4
