@@ -91,7 +91,35 @@ python3 -m pytest            # 116 tests, offline, no cluster contacted
   role granting access to the `storage`, `snapmirror` and `protocols`
   endpoints)
 
-### 2.2 Steps
+### 2.2 Automated install on a fresh VM (recommended)
+
+`install.sh` does everything offline, from the bundled `wheels/`: checks the
+prerequisites, creates the virtual environment, installs the dependencies,
+verifies the package, runs the test suite, writes a credentials template,
+installs the systemd unit and initialises the token store.
+
+```bash
+sudo ./install.sh                       # /opt/netapp-migration, systemd unit
+sudo ./install.sh --prefix /opt/nm --user migration --port 8000
+./install.sh --prefix "$HOME/nm" --no-service     # unprivileged install
+./install.sh --check                    # verify prerequisites, change nothing
+```
+
+The only thing it cannot provide is Python itself: a Python **3.9+** with the
+`venv` module must already be on the VM (`apt-get install python3-venv` or
+`dnf install python3-libs`). Everything else comes from `wheels/`.
+
+The script refuses to start rather than half-install: if the bundle has no
+compiled wheel for the VM's Python version, it says so and tells you how to
+regenerate it. It is safe to re-run — an existing venv, credentials file or
+token store is detected and kept.
+
+The systemd unit is deliberately **not enabled at boot**: the API needs the
+global token typed by a super admin at every start.
+
+### 2.2b Manual install
+
+**Steps:**
 
 ```bash
 # 1. Get the code
@@ -108,7 +136,7 @@ pip install -r requirements.txt
 # pip install paramiko
 ```
 
-### 2.2b Offline installation (server without repository access)
+#### Offline dependencies (server without repository access)
 
 The repository ships a `wheels/` directory with every required package
 pre-downloaded (CPython 3.9 to 3.12 / Linux x86_64). On a server that

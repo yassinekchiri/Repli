@@ -92,7 +92,37 @@ python3 -m pytest            # 116 tests, hors-ligne, aucun cluster contacté
 * Un compte ONTAP avec les droits API REST (rôle `admin` ou rôle dédié avec
   accès aux endpoints `storage`, `snapmirror`, `protocols`)
 
-### 2.2 Étapes
+### 2.2 Installation automatisée sur une VM vierge (recommandé)
+
+`install.sh` fait tout hors-ligne, depuis le répertoire `wheels/` embarqué :
+vérification des prérequis, création de l'environnement virtuel, installation
+des dépendances, vérification du package, exécution de la suite de tests,
+écriture d'un modèle de credentials, installation de l'unité systemd et
+initialisation du coffre de tokens.
+
+```bash
+sudo ./install.sh                       # /opt/netapp-migration, unité systemd
+sudo ./install.sh --prefix /opt/nm --user migration --port 8000
+./install.sh --prefix "$HOME/nm" --no-service     # installation sans droits root
+./install.sh --check                    # vérifie les prérequis, ne change rien
+```
+
+La seule chose qu'il ne peut pas fournir, c'est Python lui-même : un Python
+**3.9+** avec le module `venv` doit déjà être présent sur la VM
+(`apt-get install python3-venv` ou `dnf install python3-libs`). Tout le reste
+vient de `wheels/`.
+
+Le script refuse de démarrer plutôt que d'installer à moitié : si le bundle
+n'a pas de roue compilée pour la version de Python de la VM, il le dit et
+indique comment la régénérer. Il est réexécutable sans risque — un venv, un
+fichier de credentials ou un coffre existant est détecté et conservé.
+
+L'unité systemd n'est volontairement **pas activée au démarrage** : l'API
+réclame le token global saisi par un super admin à chaque lancement.
+
+### 2.2b Installation manuelle
+
+**Étapes :**
 
 ```bash
 # 1. Récupérer le code
@@ -109,7 +139,7 @@ pip install -r requirements.txt
 # pip install paramiko
 ```
 
-### 2.2b Installation hors-ligne (serveur sans accès aux dépôts)
+#### Dépendances hors-ligne (serveur sans accès aux dépôts)
 
 Le dépôt embarque un répertoire `wheels/` avec tous les paquets requis
 pré-téléchargés (CPython 3.9 à 3.12 / Linux x86_64). Sur un serveur qui
