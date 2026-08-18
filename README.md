@@ -49,6 +49,11 @@ netapp_migration/
 
 netapp_cascade_migration.py # CLI entry point (historical compatibility)
 requirements.txt
+install.sh                  # installer, offline, needs the checkout + wheels/
+install-standalone.sh       # installer, ONE self-contained file (generated)
+tools/
+├── installer_template.sh   # body of install-standalone.sh
+└── build_standalone_installer.py  # embeds the source into that body
 ```
 
 Job files (`netapp_migration_<ID>.json`) are **compatible** with the ones
@@ -116,6 +121,44 @@ token store is detected and kept.
 
 The systemd unit is deliberately **not enabled at boot**: the API needs the
 global token typed by a super admin at every start.
+
+### 2.2a Single-file install (no repository access at all)
+
+`install-standalone.sh` carries the **whole application inside itself**: one
+file to carry onto the VM, no `git clone`, no checkout, nothing else to copy.
+It unpacks its own payload (SHA-256 verified), then installs the Python
+dependencies from whatever package index the machine is configured for.
+
+Use it when the VM cannot reach the code repository but *can* reach a PyPI
+mirror. Use `install.sh` (section 2.2) the other way round: full checkout
+available, no package index at all.
+
+```bash
+# copy the single file onto the VM, then:
+sudo bash install-standalone.sh
+
+# behind an internal mirror / Artifactory:
+sudo bash install-standalone.sh \
+    --index-url https://artifactory.example/api/pypi/pypi/simple \
+    --trusted-host artifactory.example
+
+bash install-standalone.sh --check                 # verify only
+bash install-standalone.sh --extract-only ./src    # just unpack the source
+```
+
+It accepts the same options as `install.sh`, plus `--index-url`,
+`--extra-index-url`, `--trusted-host` and `--pip-timeout`. It must be run as
+a **file**, not piped (`curl … | bash` leaves nothing to unpack from).
+
+Rebuilding it after a code change — the payload is a snapshot, so it goes
+stale otherwise:
+
+```bash
+python3 tools/build_standalone_installer.py
+```
+
+The build is deterministic: an unchanged tree produces a byte-identical
+script, so `git status` stays quiet when nothing really changed.
 
 ### 2.2b Manual install
 

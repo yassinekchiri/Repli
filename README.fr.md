@@ -49,6 +49,11 @@ netapp_migration/
 
 netapp_cascade_migration.py # point d'entrée CLI (compatibilité historique)
 requirements.txt
+install.sh                  # installeur hors-ligne, exige le checkout + wheels/
+install-standalone.sh       # installeur en UN seul fichier autonome (généré)
+tools/
+├── installer_template.sh   # corps de install-standalone.sh
+└── build_standalone_installer.py  # y embarque les sources
 ```
 
 Les fichiers de job (`netapp_migration_<ID>.json`) sont **compatibles** avec
@@ -119,6 +124,47 @@ fichier de credentials ou un coffre existant est détecté et conservé.
 
 L'unité systemd n'est volontairement **pas activée au démarrage** : l'API
 réclame le token global saisi par un super admin à chaque lancement.
+
+### 2.2a Installation en un seul fichier (aucun accès au dépôt)
+
+`install-standalone.sh` embarque **toute l'application dans le fichier
+lui-même** : un seul fichier à transporter sur la VM, pas de `git clone`, pas
+de checkout, rien d'autre à copier. Il déballe sa propre charge utile
+(vérifiée en SHA-256), puis installe les dépendances Python depuis l'index de
+paquets déjà configuré sur la machine.
+
+À utiliser quand la VM n'a pas accès au dépôt de code mais *a* accès à un
+miroir PyPI. `install.sh` (section 2.2) couvre le cas inverse : checkout
+complet disponible, aucun index de paquets.
+
+```bash
+# copier le fichier unique sur la VM, puis :
+sudo bash install-standalone.sh
+
+# derrière un miroir interne / Artifactory :
+sudo bash install-standalone.sh \
+    --index-url https://artifactory.example/api/pypi/pypi/simple \
+    --trusted-host artifactory.example
+
+bash install-standalone.sh --check                 # vérifie seulement
+bash install-standalone.sh --extract-only ./src    # déballe juste les sources
+```
+
+Il accepte les mêmes options qu'`install.sh`, plus `--index-url`,
+`--extra-index-url`, `--trusted-host` et `--pip-timeout`. Il doit être lancé
+en tant que **fichier**, pas dans un tube (`curl … | bash` ne laisse rien à
+déballer).
+
+Régénération après une modification du code — la charge utile est un
+instantané, elle devient sinon obsolète :
+
+```bash
+python3 tools/build_standalone_installer.py
+```
+
+La construction est déterministe : un arbre inchangé produit un script
+identique à l'octet près, `git status` reste donc silencieux si rien n'a
+réellement changé.
 
 ### 2.2b Installation manuelle
 

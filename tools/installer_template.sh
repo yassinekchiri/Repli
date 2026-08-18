@@ -1,29 +1,49 @@
 #!/usr/bin/env bash
 #
-# NetApp Cascade Migration — offline installer for a fresh VM.
+# NetApp Cascade Migration — standalone installer (single file, online deps).
 #
-# Installs everything from the bundled wheels/ directory: no PyPI, no mirror,
-# no Internet. Safe to re-run: existing pieces are detected and kept.
+# This ONE file carries the whole application inside it. Nothing else needs to
+# be downloaded: no git clone, no repository access. Only the Python
+# dependencies are fetched, from the pip index the machine is already
+# configured for (PyPI, an internal mirror, Artifactory...).
 #
-#   sudo ./install.sh                         # full install, defaults
-#   sudo ./install.sh --prefix /opt/netapp-migration --user migration
-#   ./install.sh --no-service                 # no systemd unit
-#   ./install.sh --check                      # verify only, change nothing
+# Use install.sh instead when the machine has NO package index at all: that
+# one installs from the bundled wheels/ directory and needs the full checkout.
+#
+#   sudo bash install-standalone.sh                       # full install
+#   sudo bash install-standalone.sh --index-url https://artifactory/api/pypi/pypi/simple
+#   bash install-standalone.sh --prefix "$HOME/netapp-migration" --no-service
+#   bash install-standalone.sh --check                    # verify only
 #
 # See --help for every option.
+#
+#   Built     : @BUILD_DATE@
+#   Revision  : @REVISION@
+#   Payload   : @FILE_COUNT@ files, @PAYLOAD_BYTES@ bytes, sha256 @PAYLOAD_SHA256_SHORT@
 
 set -Eeuo pipefail
+
+# Empty when piped (`curl | bash`) — caught with a clear message below.
+SELF="${BASH_SOURCE[0]:-}"
+PAYLOAD_SHA256="@PAYLOAD_SHA256@"
+PAYLOAD_MARKER="__NETAPP_MIGRATION_PAYLOAD__"
+BUILD_REVISION="@REVISION@"
 
 # ----------------------------------------------------------------------------
 # Defaults
 # ----------------------------------------------------------------------------
-SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/opt/netapp-migration"
 SERVICE_USER="netappmig"
 SERVICE_NAME="netapp-migration-api"
 API_HOST="127.0.0.1"
 API_PORT="8000"
 MIN_PY_MINOR=9
+
+INDEX_URL=""
+EXTRA_INDEX_URL=""
+TRUSTED_HOSTS=()
+PIP_TIMEOUT=120
+PIP_RETRIES=10
 
 INSTALL_SERVICE=1
 INIT_TOKENS=1
@@ -47,50 +67,70 @@ warn()  { printf '    %s[WARN]%s %s\n'   "${YELLOW}" "${RESET}" "$*"; }
 info()  { printf '           %s\n' "$*"; }
 die()   { printf '\n%s[FAIL]%s %s\n' "${RED}" "${RESET}" "$*" >&2; exit 1; }
 
+WORKDIR=""
+# Must always succeed: a failing EXIT trap re-triggers the ERR trap and
+# would print a bogus "aborted" after a perfectly good run.
+cleanup() {
+    [[ -n "${WORKDIR}" && -d "${WORKDIR}" ]] && rm -rf "${WORKDIR}"
+    return 0
+}
+trap cleanup EXIT
+
 on_error() {
-    local line=$1
     printf '\n%s[FAIL]%s installation aborted (line %s).\n' \
-        "${RED}" "${RESET}" "${line}" >&2
-    printf '       Nothing else was changed. Fix the cause and re-run.\n' >&2
+        "${RED}" "${RESET}" "$1" >&2
+    printf '       Fix the cause and re-run — the script is safe to re-run.\n' >&2
 }
 trap 'on_error $LINENO' ERR
 
 usage() {
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # The header block: from line 2 up to the first blank line.
+    sed -n '2,/^$/p' "${SELF}" | sed 's/^# \{0,1\}//'
     cat <<EOF
 
 Options:
-  --prefix PATH       install directory        (default: ${PREFIX})
-  --user NAME         service account          (default: ${SERVICE_USER})
-  --host ADDR         API bind address         (default: ${API_HOST})
-  --port PORT         API port                 (default: ${API_PORT})
-  --service-name NAME systemd unit name        (default: ${SERVICE_NAME})
-  --no-service        do not install the systemd unit
-  --no-tokens         do not initialise the token store now
-  --no-tests          skip the offline test suite
-  --check             verify prerequisites only, change nothing
-  -y, --yes           do not ask for confirmation
-  -h, --help          this help
+  --prefix PATH         install directory        (default: ${PREFIX})
+  --user NAME           service account          (default: ${SERVICE_USER})
+  --host ADDR           API bind address         (default: ${API_HOST})
+  --port PORT           API port                 (default: ${API_PORT})
+  --service-name NAME   systemd unit name        (default: ${SERVICE_NAME})
+  --index-url URL       pip index (internal mirror / Artifactory)
+  --extra-index-url URL additional pip index
+  --trusted-host HOST   pip trusted host (repeatable, for a self-signed mirror)
+  --pip-timeout SEC     per-request pip timeout  (default: ${PIP_TIMEOUT})
+  --no-service          do not install the systemd unit
+  --no-tokens           do not initialise the token store now
+  --no-tests            skip the test suite
+  --check               verify prerequisites only, change nothing
+  --extract-only DIR    unpack the embedded source into DIR and stop
+  -y, --yes             do not ask for confirmation
+  -h, --help            this help
 EOF
 }
 
 # ----------------------------------------------------------------------------
 # Arguments
 # ----------------------------------------------------------------------------
+EXTRACT_ONLY=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --prefix)       PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
-        --user)         SERVICE_USER="${2:?--user needs a name}"; shift 2 ;;
-        --host)         API_HOST="${2:?--host needs an address}"; shift 2 ;;
-        --port)         API_PORT="${2:?--port needs a number}"; shift 2 ;;
-        --service-name) SERVICE_NAME="${2:?--service-name needs a name}"; shift 2 ;;
-        --no-service)   INSTALL_SERVICE=0; shift ;;
-        --no-tokens)    INIT_TOKENS=0; shift ;;
-        --no-tests)     RUN_TESTS=0; shift ;;
-        --check)        CHECK_ONLY=1; shift ;;
-        -y|--yes)       ASSUME_YES=1; shift ;;
-        -h|--help)      usage; exit 0 ;;
-        *)              die "unknown option '$1' (try --help)" ;;
+        --prefix)          PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
+        --user)            SERVICE_USER="${2:?--user needs a name}"; shift 2 ;;
+        --host)            API_HOST="${2:?--host needs an address}"; shift 2 ;;
+        --port)            API_PORT="${2:?--port needs a number}"; shift 2 ;;
+        --service-name)    SERVICE_NAME="${2:?--service-name needs a name}"; shift 2 ;;
+        --index-url)       INDEX_URL="${2:?--index-url needs a URL}"; shift 2 ;;
+        --extra-index-url) EXTRA_INDEX_URL="${2:?--extra-index-url needs a URL}"; shift 2 ;;
+        --trusted-host)    TRUSTED_HOSTS+=("${2:?--trusted-host needs a host}"); shift 2 ;;
+        --pip-timeout)     PIP_TIMEOUT="${2:?--pip-timeout needs seconds}"; shift 2 ;;
+        --no-service)      INSTALL_SERVICE=0; shift ;;
+        --no-tokens)       INIT_TOKENS=0; shift ;;
+        --no-tests)        RUN_TESTS=0; shift ;;
+        --check)           CHECK_ONLY=1; shift ;;
+        --extract-only)    EXTRACT_ONLY="${2:?--extract-only needs a directory}"; shift 2 ;;
+        -y|--yes)          ASSUME_YES=1; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        *)                 die "unknown option '$1' (try --help)" ;;
     esac
 done
 
@@ -107,21 +147,21 @@ CREDS_FILE="${ETC_DIR}/creds.json"
 # ----------------------------------------------------------------------------
 step "Checking prerequisites"
 
-[[ -f "${SOURCE_DIR}/netapp_cascade_migration.py" ]] \
-    || die "run this script from the repository root (netapp_cascade_migration.py not found)"
-[[ -d "${SOURCE_DIR}/wheels" ]] \
-    || die "the wheels/ directory is missing — this installer is offline-only"
-
-WHEEL_COUNT=$(find "${SOURCE_DIR}/wheels" -name '*.whl' | wc -l)
-(( WHEEL_COUNT > 0 )) || die "wheels/ contains no .whl file"
-ok "${WHEEL_COUNT} wheels available for the offline install"
+# The payload lives inside this very file, so the script must exist on disk.
+# `curl ... | bash` gives $0 = "bash" and there would be nothing to unpack.
+if [[ ! -f "${SELF}" ]]; then
+    die "this installer carries its payload inside itself and cannot be piped.
+       Save it to a file first:
+         curl -o install-standalone.sh <url> && bash install-standalone.sh"
+fi
+ok "self-contained installer: ${SELF}"
 
 # Python interpreter: prefer the newest usable one on the machine.
 PYTHON=""
 for candidate in python3.12 python3.11 python3.10 python3.9 python3; do
     command -v "${candidate}" >/dev/null 2>&1 || continue
-    minor=$("${candidate}" -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)
     major=$("${candidate}" -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)
+    minor=$("${candidate}" -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)
     if (( major == 3 && minor >= MIN_PY_MINOR )); then
         PYTHON="${candidate}"
         break
@@ -132,24 +172,10 @@ PY_VERSION=$("${PYTHON}" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3]
 ok "Python ${PY_VERSION} (${PYTHON})"
 
 # The venv module is a separate package on Debian/Ubuntu.
-if ! "${PYTHON}" -c 'import venv' >/dev/null 2>&1; then
-    die "the 'venv' module is missing — install it first:
+"${PYTHON}" -c 'import venv' >/dev/null 2>&1 || die "the 'venv' module is missing — install it first:
        Debian/Ubuntu : apt-get install python3-venv
        RHEL/Rocky    : dnf install python3-libs"
-fi
 ok "venv module available"
-
-# Matching compiled wheels must exist for this interpreter.
-PY_TAG="cp$("${PYTHON}" -c 'import sys; print("%d%d" % sys.version_info[:2])')"
-if ! find "${SOURCE_DIR}/wheels" -name "pydantic_core-*${PY_TAG}*" | grep -q .; then
-    warn "no compiled wheel tagged ${PY_TAG} in wheels/"
-    info "Python ${PY_VERSION} is probably not covered by this bundle."
-    info "Regenerate it from a machine with repository access:"
-    info "  pip download -r requirements.txt -d wheels/ --only-binary :all: \\"
-    info "      --python-version ${PY_VERSION%.*} --platform manylinux2014_x86_64"
-    die "aborting rather than producing a half-installed system"
-fi
-ok "compiled wheels present for ${PY_TAG}"
 
 command -v systemctl >/dev/null 2>&1 || {
     if (( INSTALL_SERVICE )); then
@@ -158,8 +184,66 @@ command -v systemctl >/dev/null 2>&1 || {
     fi
 }
 
+# ----------------------------------------------------------------------------
+# 2. Unpacking the embedded payload
+# ----------------------------------------------------------------------------
+# Done with Python rather than base64/tar so that the same code path works on
+# every distribution, and so the integrity check is not optional.
+extract_payload() {
+    local dest="$1"
+    "${PYTHON}" - "${SELF}" "${PAYLOAD_MARKER}" "${PAYLOAD_SHA256}" "${dest}" <<'PYEXTRACT'
+import base64, hashlib, io, os, sys, tarfile
+
+script, marker, expected, dest = sys.argv[1:5]
+
+with open(script, "rb") as fh:
+    blob = fh.read()
+
+needle = ("\n" + marker + "\n").encode()
+at = blob.find(needle)
+if at < 0:
+    sys.exit("payload marker not found — the file is truncated or corrupted")
+
+payload = base64.b64decode(blob[at + len(needle):], validate=False)
+digest = hashlib.sha256(payload).hexdigest()
+if digest != expected:
+    sys.exit("payload checksum mismatch\n"
+             f"  expected {expected}\n"
+             f"  got      {digest}\n"
+             "the file was altered in transit (mail, copy/paste, CRLF...)")
+
+count = 0
+with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tar:
+    for member in tar.getmembers():
+        name = os.path.normpath(member.name)
+        if name.startswith(("/", "..")) or member.issym() or member.islnk():
+            sys.exit(f"refusing unsafe archive member: {member.name}")
+        count += 1
+    tar.extractall(dest)
+
+print(count)
+PYEXTRACT
+}
+
+step "Unpacking the embedded application"
+WORKDIR="$(mktemp -d)"
+FILE_COUNT="$(extract_payload "${WORKDIR}")" \
+    || die "could not unpack the embedded payload"
+ok "${FILE_COUNT} files unpacked and checksum verified"
+[[ -f "${WORKDIR}/netapp_cascade_migration.py" ]] \
+    || die "the payload does not contain the application"
+
+if [[ -n "${EXTRACT_ONLY}" ]]; then
+    mkdir -p "${EXTRACT_ONLY}"
+    cp -r "${WORKDIR}/." "${EXTRACT_ONLY}/"
+    ok "source extracted to ${EXTRACT_ONLY} — nothing else was changed"
+    exit 0
+fi
+
 if (( CHECK_ONLY )); then
     step "Check mode: prerequisites satisfied, nothing was changed"
+    info "Python ${PY_VERSION}, payload verified, ${FILE_COUNT} files ready."
+    info "Dependencies would be fetched from: ${INDEX_URL:-the configured pip index}"
     exit 0
 fi
 
@@ -177,12 +261,13 @@ fi
 }
 
 # ----------------------------------------------------------------------------
-# 2. Confirmation
+# 3. Confirmation
 # ----------------------------------------------------------------------------
 step "Installation plan"
-info "Source        : ${SOURCE_DIR}"
+info "Revision      : ${BUILD_REVISION}"
 info "Install dir   : ${PREFIX}"
 info "Python        : ${PYTHON} (${PY_VERSION})"
+info "Dependencies  : ${INDEX_URL:-configured pip index} (network required)"
 info "Job directory : ${JOB_DIR}"
 info "Token store   : ${TOKEN_STORE}"
 if (( INSTALL_SERVICE )); then
@@ -197,7 +282,7 @@ if (( ! ASSUME_YES )); then
 fi
 
 # ----------------------------------------------------------------------------
-# 3. Service account
+# 4. Service account
 # ----------------------------------------------------------------------------
 if (( INSTALL_SERVICE )); then
     step "Service account"
@@ -213,32 +298,28 @@ if (( INSTALL_SERVICE )); then
 fi
 
 # ----------------------------------------------------------------------------
-# 4. Directories and code
+# 5. Directories and code
 # ----------------------------------------------------------------------------
 step "Installing the code into ${PREFIX}"
 mkdir -p "${PREFIX}" "${JOB_DIR}" "${LOG_DIR}" "${ETC_DIR}"
 
-if [[ "${SOURCE_DIR}" != "${PREFIX}" ]]; then
-    for item in netapp_migration netapp_cascade_migration.py requirements.txt \
-                requirements-dev.txt wheels docs tests pytest.ini \
-                README.md README.fr.md; do
-        [[ -e "${SOURCE_DIR}/${item}" ]] || continue
-        rm -rf "${PREFIX:?}/${item}"
-        cp -r "${SOURCE_DIR}/${item}" "${PREFIX}/"
-    done
-    ok "code copied"
-else
-    ok "installing in place"
-fi
+for item in netapp_migration netapp_cascade_migration.py requirements.txt \
+            requirements-dev.txt docs tests pytest.ini \
+            README.md README.fr.md; do
+    [[ -e "${WORKDIR}/${item}" ]] || continue
+    rm -rf "${PREFIX:?}/${item}"
+    cp -r "${WORKDIR}/${item}" "${PREFIX}/"
+done
+ok "code installed"
 
 chmod 700 "${ETC_DIR}"
 chmod 750 "${JOB_DIR}" "${LOG_DIR}"
 ok "directories ready (etc 700, jobs/logs 750)"
 
 # ----------------------------------------------------------------------------
-# 5. Virtual environment, offline
+# 6. Virtual environment and dependencies (online)
 # ----------------------------------------------------------------------------
-step "Creating the virtual environment (offline)"
+step "Creating the virtual environment"
 if [[ -x "${PYBIN}" ]]; then
     ok "virtual environment already present — reusing it"
 else
@@ -246,33 +327,49 @@ else
     ok "virtual environment created: ${VENV}"
 fi
 
-PIP_ARGS=(--no-index --find-links "${PREFIX}/wheels" --disable-pip-version-check)
+PIP_ARGS=(--disable-pip-version-check
+          --timeout "${PIP_TIMEOUT}" --retries "${PIP_RETRIES}")
+[[ -n "${INDEX_URL}" ]]       && PIP_ARGS+=(--index-url "${INDEX_URL}")
+[[ -n "${EXTRA_INDEX_URL}" ]] && PIP_ARGS+=(--extra-index-url "${EXTRA_INDEX_URL}")
+for host in "${TRUSTED_HOSTS[@]+"${TRUSTED_HOSTS[@]}"}"; do
+    PIP_ARGS+=(--trusted-host "${host}")
+done
 
-# pip itself first: an old pip rejects recent manylinux tags.
-"${PYBIN}" -m pip install --quiet "${PIP_ARGS[@]}" --upgrade pip setuptools wheel \
-    || die "could not upgrade pip from wheels/ — the bundle may not cover Python ${PY_VERSION}"
-ok "pip $("${PYBIN}" -m pip --version | awk '{print $2}') ready"
+step "Installing the dependencies (network)"
+info "an internal mirror behind a slow link needs the retries below;"
+info "timeout ${PIP_TIMEOUT}s, ${PIP_RETRIES} retries per package"
 
-"${PYBIN}" -m pip install --quiet "${PIP_ARGS[@]}" -r "${PREFIX}/requirements.txt" \
-    || die "dependency installation failed — see the message above"
-ok "runtime dependencies installed (no network used)"
+# pip itself first: an old pip rejects recent manylinux tags. Not fatal —
+# some mirrors do not carry pip.
+if "${PYBIN}" -m pip install --quiet "${PIP_ARGS[@]}" \
+        --upgrade pip setuptools wheel 2>/dev/null; then
+    ok "pip $("${PYBIN}" -m pip --version | awk '{print $2}') ready"
+else
+    warn "could not upgrade pip — continuing with $("${PYBIN}" -m pip --version | awk '{print $2}')"
+fi
+
+"${PYBIN}" -m pip install "${PIP_ARGS[@]}" -r "${PREFIX}/requirements.txt" \
+    || die "dependency installation failed.
+       Behind a proxy or an internal mirror, point pip at it:
+         --index-url https://<mirror>/api/pypi/pypi/simple --trusted-host <mirror>
+       With no index at all, use install.sh with the bundled wheels/ instead."
+ok "runtime dependencies installed"
 
 if (( RUN_TESTS )) && [[ -f "${PREFIX}/requirements-dev.txt" ]]; then
     if "${PYBIN}" -m pip install --quiet "${PIP_ARGS[@]}" \
-            -r "${PREFIX}/requirements-dev.txt" 2>/dev/null; then
+            -r "${PREFIX}/requirements-dev.txt"; then
         ok "test dependencies installed"
     else
-        warn "test dependencies unavailable in wheels/ — tests will be skipped"
+        warn "test dependencies unavailable — tests will be skipped"
         RUN_TESTS=0
     fi
 fi
 
 # ----------------------------------------------------------------------------
-# 6. Verification
+# 7. Verification
 # ----------------------------------------------------------------------------
 step "Verifying the installation"
-# From ${PREFIX}: the package is installed as a directory, not on sys.path,
-# so the check must not depend on the directory the installer was called from.
+# From ${PREFIX}: the package is installed as a directory, not on sys.path.
 ( cd "${PREFIX}" && "${PYBIN}" - <<'PYCHECK'
 from cryptography.fernet import Fernet
 import fastapi, uvicorn, requests
@@ -300,7 +397,7 @@ if (( RUN_TESTS )); then
 fi
 
 # ----------------------------------------------------------------------------
-# 7. Credentials template
+# 8. Credentials template
 # ----------------------------------------------------------------------------
 step "ONTAP credentials"
 if [[ -f "${CREDS_FILE}" ]]; then
@@ -329,7 +426,7 @@ EOF
 fi
 
 # ----------------------------------------------------------------------------
-# 8. systemd unit
+# 9. systemd unit
 # ----------------------------------------------------------------------------
 if (( INSTALL_SERVICE )); then
     step "systemd service"
@@ -381,7 +478,7 @@ EOF
 fi
 
 # ----------------------------------------------------------------------------
-# 9. Ownership
+# 10. Ownership
 # ----------------------------------------------------------------------------
 if (( INSTALL_SERVICE )) && id -u "${SERVICE_USER}" >/dev/null 2>&1; then
     step "Permissions"
@@ -390,7 +487,7 @@ if (( INSTALL_SERVICE )) && id -u "${SERVICE_USER}" >/dev/null 2>&1; then
 fi
 
 # ----------------------------------------------------------------------------
-# 10. Token store
+# 11. Token store
 # ----------------------------------------------------------------------------
 if (( INIT_TOKENS )); then
     step "Token store (super admin)"
@@ -427,6 +524,7 @@ cat <<EOF
 ${BOLD}${GREEN}Installation complete.${RESET}
 
   Install directory : ${PREFIX}
+  Revision          : ${BUILD_REVISION}
   Python            : ${PY_VERSION}
   Credentials       : ${CREDS_FILE}
   Job directory     : ${JOB_DIR}
@@ -472,3 +570,5 @@ cat <<EOF
 
 Full documentation: ${PREFIX}/README.md and ${PREFIX}/docs/architecture.md
 EOF
+
+exit 0
