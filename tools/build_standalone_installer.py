@@ -45,6 +45,10 @@ PAYLOAD = [
 ]
 
 EXCLUDED_DIRS = {"__pycache__", ".pytest_cache", ".git", ".venv"}
+# The Swagger walkthrough screenshots: ~1 MB of PNG that belongs in the
+# repository, not in a file people carry onto a server by hand. The guide
+# text itself is kept.
+EXCLUDED_RELPATHS = {os.path.join("docs", "images")}
 EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".orig", ".rej", ".swp")
 
 
@@ -59,6 +63,11 @@ def collect(root: str) -> list:
             found.append((absolute, entry))
             continue
         for dirpath, dirnames, filenames in os.walk(absolute):
+            relative = os.path.relpath(dirpath, root)
+            if any(relative == skip or relative.startswith(skip + os.sep)
+                   for skip in EXCLUDED_RELPATHS):
+                dirnames[:] = []
+                continue
             dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
             for filename in sorted(filenames):
                 if filename.endswith(EXCLUDED_SUFFIXES):

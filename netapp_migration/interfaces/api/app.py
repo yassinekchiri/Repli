@@ -31,9 +31,10 @@ import threading
 import uuid
 from typing import Callable, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
 from ...config import CredentialsResolver, job_dir
@@ -113,6 +114,15 @@ def token_store() -> TokenStore:
     return _tokens
 
 
+# Declared so the scheme appears in the OpenAPI document: that is what puts
+# the "Authorize" button in Swagger UI and makes /docs attach the bearer
+# header to every "Try it out". auto_error=False because the header is read
+# by _bearer() below — this dependency is there to document, not to enforce.
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    description="Global token (super admin) or a delegated token.")
+
+
 def _bearer(request: Request) -> str:
     header = request.headers.get("authorization", "")
     if header.lower().startswith("bearer "):
@@ -120,7 +130,8 @@ def _bearer(request: Request) -> str:
     return request.headers.get("x-api-token", "").strip()
 
 
-def current_principal(request: Request) -> Principal:
+def current_principal(request: Request,
+                      _credentials=Security(bearer_scheme)) -> Principal:
     """Authenticate the caller, or refuse the request.
 
     401 when the token is missing/unknown, 503 when the store is still

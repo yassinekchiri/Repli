@@ -53,7 +53,12 @@ install.sh                  # installeur hors-ligne, exige le checkout + wheels/
 install-standalone.sh       # installeur en UN seul fichier autonome (généré)
 tools/
 ├── installer_template.sh   # corps de install-standalone.sh
-└── build_standalone_installer.py  # y embarque les sources
+├── build_standalone_installer.py  # y embarque les sources
+└── capture_swagger_guide.py     # régénère les captures de docs/api-guide.fr.md
+docs/
+├── api-guide.md            # parcours illustré de Swagger UI (+ .fr.md)
+├── architecture.md         # schémas, carte de l'API, workflows
+└── images/                 # captures utilisées par le guide
 ```
 
 Les fichiers de job (`netapp_migration_<ID>.json`) sont **compatibles** avec
@@ -83,7 +88,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 116 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 130 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -584,6 +589,10 @@ uvicorn netapp_migration.interfaces.api.app:app --host 0.0.0.0 --port 8000
 ```
 
 Documentation interactive (Swagger UI) : `http://<serveur>:8000/docs`
+
+**Première utilisation ? Suivez [docs/api-guide.fr.md](docs/api-guide.fr.md)**
+— une migration complète pas à pas dans Swagger UI, avec une capture d'écran
+réelle à chaque étape.
 
 > **Important** : lancer **un seul worker** (pas de `--workers N`) — le
 > registre des actions en cours est en mémoire de processus.
