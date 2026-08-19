@@ -838,7 +838,8 @@ class MigrationEngine:
     def clone(self, qtrees_arg: str, job: Optional[dict] = None,
               fresh: bool = False,
               volume_map: Optional[Dict[str, str]] = None,
-              qtree_map: Optional[Dict[str, str]] = None) -> dict:
+              qtree_map: Optional[Dict[str, str]] = None,
+              prune: bool = True) -> dict:
         """Definitive clones.
 
         Three modes:
@@ -859,7 +860,8 @@ class MigrationEngine:
             # set, or a clone on an unhealthy cascade, is refused up front.
             self._preflight(self.checker.for_clone(
                 job, self._resolve_qtrees(qtrees_arg), fresh=fresh,
-                volume_map=volume_map, qtree_map=qtree_map))
+                volume_map=volume_map, qtree_map=qtree_map,
+                prune=prune))
             if job.get("test_env") and job.get("clone_volumes"):
                 if not fresh:
                     return self._promote_test_env(qtrees_arg, job)
@@ -901,6 +903,19 @@ class MigrationEngine:
         if renames:
             self.log.info(">> [4/7]  Renaming qtrees inside the PROD clones")
             self._rename_qtrees_in_clones(qtrees, mapping, renames)
+
+        # Step 4c: each clone keeps only the qtree it was created for. Before
+        # the mirror, so DR never receives the others; before the move, so
+        # only the remaining data is relocated.
+        pruned: Dict[str, list] = {}
+        if prune:
+            self.log.info(">> [4/7]  Removing the qtrees each clone inherited")
+            pruned = self._prune_inherited_qtrees(qtrees, mapping, renames)
+            if not pruned:
+                self.log.info("         Nothing to remove.")
+        else:
+            self.log.warning("PRUNE DISABLED: each clone keeps every qtree of "
+                             "the source volume, including other clients'.")
 
         # Step 5: SnapMirror between the clones + resync.
         self.log.info(">> [5/7]  SnapMirror (clone PROD -> clone DR) + resync")
@@ -949,9 +964,11 @@ class MigrationEngine:
                       len(qtrees))
         self.log.info("")
         self._log_table(["Qtree", "Clone volume", "Qtree in the clone",
-                         "PROD aggregate", "DR aggregate"],
-                        [[q, mapping[q], renames.get(q, q), prod_aggr, dr_aggr]
-                         for q in qtrees])
+                         "Inherited qtrees removed", "PROD aggregate",
+                         "DR aggregate"],
+                        [[q, mapping[q], renames.get(q, q),
+                          ", ".join(pruned.get(q, [])) or "-",
+                          prod_aggr, dr_aggr] for q in qtrees])
         self.log.info("")
         self.log.info("  Monitor moves: volume move show -vserver %s / %s",
                       p.dest_vserver, p.dr_vserver)
@@ -972,6 +989,7 @@ class MigrationEngine:
         self.log.info("=" * 60)
         return {"volume_map": {q: mapping[q] for q in qtrees},
                 "qtree_map": dict(renames),
+                "pruned": pruned,
                 "clone_volumes": [mapping[q] for q in qtrees],
                 "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr,
                 "abandoned_test_env": old_test_env}
@@ -982,7 +1000,8 @@ class MigrationEngine:
     def test(self, qtrees_arg: str, job: Optional[dict] = None,
              validity_days: int = 7,
              volume_map: Optional[Dict[str, str]] = None,
-             qtree_map: Optional[Dict[str, str]] = None) -> dict:
+             qtree_map: Optional[Dict[str, str]] = None,
+             prune: bool = True) -> dict:
         """Full TEST environment: everything except the split / volume move.
 
         Builds the exact future production layout so the client can validate
@@ -1016,7 +1035,8 @@ class MigrationEngine:
         qtrees = self._resolve_qtrees(qtrees_arg)
         self._preflight(self.checker.for_test(job or {}, qtrees,
                                               volume_map=volume_map,
-                                              qtree_map=qtree_map))
+                                              qtree_map=qtree_map,
+                                              prune=prune))
         self.log.info("Qtrees (%d): %s", len(qtrees), ", ".join(qtrees))
 
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1039,6 +1059,18 @@ class MigrationEngine:
         if renames:
             self.log.info(">> [4/6]  Renaming qtrees inside the PROD clones")
             self._rename_qtrees_in_clones(qtrees, mapping, renames)
+
+        # Step 4c: same pruning as production — the client must validate a
+        # volume holding their data and nothing else.
+        pruned: Dict[str, list] = {}
+        if prune:
+            self.log.info(">> [4/6]  Removing the qtrees each clone inherited")
+            pruned = self._prune_inherited_qtrees(qtrees, mapping, renames)
+            if not pruned:
+                self.log.info("         Nothing to remove.")
+        else:
+            self.log.warning("PRUNE DISABLED: each clone keeps every qtree of "
+                             "the source volume, including other clients'.")
 
         # Step 5: SnapMirror between the clones + resync (like production).
         self.log.info(">> [5/6]  SnapMirror (clone PROD -> clone DR) + resync")
@@ -1152,81 +1184,51 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'cleanup'
     # =====================================================================
-    def prune(self, qtrees_arg: str, job: Optional[dict] = None,
-              confirm: bool = False) -> dict:
-        """Delete, in each clone volume, every qtree it does not own.
+    def _prune_inherited_qtrees(self, qtrees: List[str],
+                                volumes: Dict[str, str],
+                                renames: Dict[str, str]) -> Dict[str, list]:
+        """Delete, in each clone, every qtree it did not come for.
 
-        A FlexClone is a copy of the WHOLE parent volume, so the volume
-        created for q_fin also holds q_hr, q_ops and the rest. After the
-        volume move has detached it from its parent, that surplus is real
-        occupied space — and other clients' data sitting in this client's
-        volume. This removes it.
+        A FlexClone copies the WHOLE parent volume, so the volume created for
+        q_fin also holds q_hr, q_ops and the rest — other clients' data in
+        this client's volume.
 
-        Irreversible, so it is fenced in:
-          - the volume must be split from its parent and its move finished,
-            otherwise the space would not be freed anyway;
-          - the qtree the volume was created for is never touched;
-          - PROD only: the DR clone is a mirror destination and receives the
-            deletions by replication;
-          - nothing happens without confirm=True.
+        Done here, right after the clones are created and BEFORE the mirror
+        and the volume move:
+          - the DR clone receives the deletions through the first resync, so
+            it never carries the surplus either;
+          - the volume move then relocates only what is left.
 
-        The SOURCE volume is never touched by this action.
+        PROD only (the DR clone is a mirror destination, hence read-only).
+        The parent volume and the SOURCE are never touched: a clone is a
+        separate volume, and deleting inside it cannot affect what it came
+        from.
         """
         p = self.p
-        if job is not None:
-            self.job_id = job["job_id"]
-        qtrees = self._resolve_qtrees(qtrees_arg)
-        self._preflight(self.checker.for_prune(job or {}, qtrees))
-
-        mapping = self._resolve_volume_map(qtrees, None, job)
-        renames = self._resolve_qtree_map(qtrees, None, job)
-
-        self.log.info("=" * 60)
-        self.log.info("  ACTION: prune  |  removing inherited qtrees")
-        self.log.info("=" * 60)
-
-        # What would go, per volume, before anything goes.
-        plan: Dict[str, List[str]] = {}
+        deleted: Dict[str, list] = {}
         for qtree in qtrees:
-            volume = mapping[qtree]
+            volume = volumes[qtree]
             kept = renames.get(qtree, qtree)
             present = self.c.list_qtrees(p.dest_cluster, p.dest_vserver, volume)
-            plan[qtree] = [q for q in present
-                           if q.lower() != kept.lower() and q not in ("", "-")]
-
-        rows = [[q, mapping[q], renames.get(q, q),
-                 ", ".join(plan[q]) or "(nothing to remove)"] for q in qtrees]
-        self._log_table(["Qtree", "Clone volume", "Kept", "To be DELETED"], rows)
-
-        total = sum(len(v) for v in plan.values())
-        if not total:
-            self.log.info("  Nothing to prune: every clone holds only its own "
-                          "qtree.")
-            return {"pruned": {}, "deleted_count": 0}
-
-        if not confirm:
-            raise ConfirmationRequired(
-                f"prune would permanently delete {total} qtree(s) and all "
-                f"their data from {len(qtrees)} clone volume(s) — re-run with "
-                f"confirmation once the table above has been checked")
-
-        deleted: Dict[str, List[str]] = {}
-        for qtree in qtrees:
-            volume = mapping[qtree]
-            for surplus in plan[qtree]:
+            surplus = [q for q in present
+                       if q.lower() != kept.lower() and q not in ("", "-")]
+            if not surplus:
+                continue
+            if kept.lower() not in {q.lower() for q in present}:
+                # Never empty a volume: if what it came for is not there,
+                # something is wrong with the mapping, not with the data.
+                raise OntapError(
+                    p.dest_cluster, f"prune {volume}",
+                    f"'{kept}' not found in the clone — refusing to delete "
+                    f"the {len(surplus)} other qtree(s) and leave an empty "
+                    f"volume")
+            for name in surplus:
                 self.c.delete_qtree(p.dest_cluster, p.dest_vserver,
-                                    volume, surplus)
-                deleted.setdefault(qtree, []).append(surplus)
-                self.log.info("         '%s'  qtree '%s' deleted.",
-                              volume, surplus)
-
-        self.log.info("=" * 60)
-        self.log.info("  %d qtree(s) deleted across %d clone volume(s).",
-                      sum(len(v) for v in deleted.values()), len(deleted))
-        self.log.info("  The DR copies follow on the next SnapMirror update.")
-        self.log.info("=" * 60)
-        return {"pruned": deleted,
-                "deleted_count": sum(len(v) for v in deleted.values())}
+                                    volume, name)
+                deleted.setdefault(qtree, []).append(name)
+            self.log.info("         '%s'  %d inherited qtree(s) removed: %s",
+                          volume, len(surplus), ", ".join(surplus))
+        return deleted
 
     def cleanup(self, qtree: str, job: Optional[dict] = None) -> dict:
         """Cut source access for one qtree (export-policy, CIFS, rename)."""

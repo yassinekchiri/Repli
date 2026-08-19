@@ -18,7 +18,6 @@ Endpoint map (prefix /api/v1):
     POST /migrations/{job_id}/test      thin FlexClones         -> 202 (background)
     POST /migrations/{job_id}/clone     real clones + vol move  -> 202 (background)
     POST /migrations/{job_id}/acl       force AD-group DACLs
-    POST /migrations/{job_id}/prune     delete inherited qtrees (destructive)
     POST /migrations/{job_id}/cleanup   cut source access
 
 Long actions run in a background thread; poll GET /migrations/{job_id} to
@@ -52,8 +51,7 @@ from .schemas import (CreateMigrationRequest, ResumeRequest, CloneRequest,
                       TestRequest, AclRequest, CleanupRequest,
                       ActionAccepted, ActionResult, PreflightResponse,
                       PreflightCreateRequest, PreflightActionRequest,
-                      PruneRequest, ScopeCsvRequest, ScopeCsvResponse,
-                      ScopeUpdateRequest,
+                      ScopeCsvRequest, ScopeCsvResponse, ScopeUpdateRequest,
                       ScopeResponse, WhoAmIResponse)
 
 _MAX_CAPTURED_LOG_LINES = 4000
@@ -530,9 +528,6 @@ def preflight_action(job_id: str, action: str,
                    _requested_qtrees(params, qtree_list, mapping))
     elif action == "acl":
         _authorise(principal, "acl", _qtrees_of_path(job, req.acl_path or ""))
-    elif action == "prune":
-        _authorise(principal, "prune",
-                   _requested_qtrees(params, qtree_list, mapping))
     elif action == "cleanup":
         _authorise(principal, "cleanup", [req.qtree] if req.qtree else [])
     else:
@@ -549,15 +544,14 @@ def preflight_action(job_id: str, action: str,
         report = checker.for_retry(job)
     elif action == "test":
         report = checker.for_test(job, qtree_list, volume_map=mapping,
-                                  qtree_map=renames)
+                                  qtree_map=renames, prune=req.prune)
     elif action == "clone":
         report = checker.for_clone(job, qtree_list, fresh=req.fresh,
-                                   volume_map=mapping, qtree_map=renames)
+                                   volume_map=mapping, qtree_map=renames,
+                                   prune=req.prune)
     elif action == "acl":
         report = checker.for_acl(job, req.acl_path or "", req.ad_groups_list,
                                  "full-control")
-    elif action == "prune":
-        report = checker.for_prune(job, qtree_list)
     elif action == "cleanup":
         report = checker.for_cleanup(job, req.qtree or "")
     else:
@@ -622,12 +616,13 @@ def test_migration(job_id: str, req: TestRequest,
     _ensure_feasible(params, "test",
                      lambda ch: ch.for_test(job, req.qtrees_csv,
                                             volume_map=mapping,
-                                            qtree_map=renames))
+                                            qtree_map=renames,
+                                            prune=req.prune))
 
     def target(logger):
         engine = _engine_for(params, logger)
         engine.test(req.qtrees_csv, job=job, validity_days=req.validity_days,
-                    volume_map=mapping, qtree_map=renames)
+                    volume_map=mapping, qtree_map=renames, prune=req.prune)
 
     _run_in_background(job_id, "test", target)
     return ActionAccepted(job_id=job_id, action="test",
@@ -655,12 +650,13 @@ def clone_migration(job_id: str, req: CloneRequest,
                      lambda ch: ch.for_clone(job, req.qtrees_csv,
                                              fresh=req.fresh,
                                              volume_map=mapping,
-                                             qtree_map=renames))
+                                             qtree_map=renames,
+                                             prune=req.prune))
 
     def target(logger):
         engine = _engine_for(params, logger)
         engine.clone(req.qtrees_csv, job=job, fresh=req.fresh,
-                     volume_map=mapping, qtree_map=renames)
+                     volume_map=mapping, qtree_map=renames, prune=req.prune)
 
     _run_in_background(job_id, "clone", target)
     return ActionAccepted(job_id=job_id, action="clone",
@@ -699,34 +695,6 @@ def cleanup_migration(job_id: str, req: CleanupRequest,
         return engine.cleanup(req.qtree, job=job)
 
     return _run_sync(job_id, "cleanup", target)
-
-
-@app.post("/api/v1/migrations/{job_id}/prune", response_model=ActionResult)
-def prune_migration(job_id: str, req: PruneRequest,
-                    principal: Principal = Depends(current_principal)):
-    """Delete, in each clone volume, the qtrees it inherited but does not own.
-
-    A FlexClone copies the whole parent volume, so every clone starts out
-    holding every qtree of the source. Once the volume move has detached a
-    clone from its parent, that surplus is occupied space and other clients'
-    data: this removes it. **Irreversible.**
-
-    Refused (409) without "confirm": true. The refusal names what would go.
-    Refused (422) while the volume move is still running — pruning then would
-    free nothing. The source volume is never touched.
-    """
-    job = _load_job_or_404(job_id)
-    params = _store.params_of(job)
-    _authorise(principal, "prune",
-               _requested_qtrees(params, req.qtrees_csv, req.mapping))
-    _ensure_feasible(params, "prune",
-                     lambda ch: ch.for_prune(job, req.qtrees_csv))
-
-    def target(logger):
-        engine = _engine_for(params, logger)
-        return engine.prune(req.qtrees_csv, job=job, confirm=req.confirm)
-
-    return _run_sync(job_id, "prune", target)
 
 
 @app.exception_handler(OntapError)

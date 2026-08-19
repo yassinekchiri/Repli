@@ -773,7 +773,8 @@ class PreflightChecker:
 
     def for_test(self, job: dict, qtrees: Sequence[str],
                  volume_map: Optional[Dict[str, str]] = None,
-                 qtree_map: Optional[Dict[str, str]] = None) -> PreflightReport:
+                 qtree_map: Optional[Dict[str, str]] = None,
+                 prune: bool = True) -> PreflightReport:
         p = self.p
         report = self._report("test")
         status = job.get("status", "unknown")
@@ -803,6 +804,8 @@ class PreflightChecker:
         normalised = self._check_qtrees(report, qtrees)
         self._check_volume_map(report, normalised, volume_map, job)
         self._check_qtree_map(report, normalised, qtree_map, job)
+        self._check_prune_plan(report, normalised, volume_map, qtree_map,
+                               job, prune)
 
         # The clone mirror PROD -> DR needs its own peering, policy and
         # schedule on the DR cluster.
@@ -817,7 +820,8 @@ class PreflightChecker:
     def for_clone(self, job: dict, qtrees: Sequence[str],
                   fresh: bool = False,
                   volume_map: Optional[Dict[str, str]] = None,
-                  qtree_map: Optional[Dict[str, str]] = None) -> PreflightReport:
+                  qtree_map: Optional[Dict[str, str]] = None,
+                  prune: bool = True) -> PreflightReport:
         p = self.p
         report = self._report("clone")
         promoting = bool(job.get("test_env") and job.get("clone_volumes")
@@ -883,6 +887,8 @@ class PreflightChecker:
                                    None if fresh else job)
             self._check_qtree_map(report, normalised, qtree_map,
                                   None if fresh else job)
+            self._check_prune_plan(report, normalised, volume_map, qtree_map,
+                                   None if fresh else job, prune)
             self._check_peering(report, p.dr_cluster, p.dr_vserver,
                                 p.dest_cluster, p.dest_vserver,
                                 "clone PROD -> clone DR")
@@ -1037,117 +1043,62 @@ class PreflightChecker:
     # ================================================================== #
     # ACTION: cleanup
     # ================================================================== #
-    def for_prune(self, job: dict, qtrees: Sequence[str]) -> PreflightReport:
-        """Deleting inherited qtrees: the guards that make it safe.
+    def _check_prune_plan(self, report: PreflightReport,
+                          qtrees: Sequence[str],
+                          volume_map: Optional[Dict[str, str]],
+                          qtree_map: Optional[Dict[str, str]],
+                          job: Optional[dict], enabled: bool):
+        """Announce what pruning will delete, before the clones exist.
 
-        Pruning before the volume move would free nothing (the clone still
-        shares its blocks with the parent) and would destroy data for no
-        gain, so an unfinished move is a hard refusal, not a warning.
+        A clone inherits exactly the qtrees the source volume holds, so the
+        plan is knowable up front — which is the point: the operator sees the
+        deletions listed before running the action, not afterwards.
         """
         p = self.p
-        report = self._report("prune")
+        volumes = dict((job or {}).get("volume_map") or {})
+        volumes.update({k: v for k, v in (volume_map or {}).items() if v})
+        renames = dict((job or {}).get("qtree_map") or {})
+        renames.update({k: v for k, v in (qtree_map or {}).items() if v})
 
-        recorded = dict(job.get("volume_map") or {})
-        self._add(report, "PRUNE_NO_CLONES",
-                  "Clone volumes are recorded for this job", bool(recorded),
-                  detail=f"{len(recorded)} clone volume(s) recorded"
-                         if recorded else "no volume_map on the job",
-                  hint="run 'clone' first: there is nothing to prune until "
-                       "the clones exist" if not recorded else "",
-                  target=job.get("job_id", ""))
-        if not recorded:
-            return report
+        if not enabled:
+            self._add(report, "PRUNE_DISABLED",
+                      "Clones keep every qtree of the source volume", False,
+                      severity=SEVERITY_WARNING,
+                      detail="pruning is switched off for this run",
+                      hint="each client's volume will also hold the other "
+                           "clients' qtrees")
+            return
 
-        self._add(report, "PRUNE_ON_TEST_ENV",
-                  "The clones are definitive, not a test environment",
-                  not job.get("test_env"),
-                  detail="test_env=true — these clones are still the "
-                         "time-limited test set" if job.get("test_env")
-                         else "definitive clones",
-                  hint="promote the test environment with 'clone' before "
-                       "pruning it" if job.get("test_env") else "",
-                  target=job.get("job_id", ""))
+        source, err = self._safe(
+            lambda: self.c.list_qtrees(p.source_cluster, p.source_vserver,
+                                       p.volume), None)
+        if source is None:
+            self._add(report, "PRUNE_SOURCE_UNREADABLE",
+                      "Source qtrees readable (to plan the pruning)", False,
+                      severity=SEVERITY_WARNING,
+                      detail=err or "could not list the source qtrees",
+                      hint="grant readonly on /api/storage/qtrees",
+                      target=f"{p.source_cluster} / {p.volume}")
+            return
 
-        normalised = self._check_qtrees(report, qtrees)
-        renames = dict(job.get("qtree_map") or {})
-
-        for qtree in normalised:
-            volume = recorded.get(qtree) or next(
-                (v for k, v in recorded.items() if k.lower() == qtree.lower()),
+        for qtree in qtrees:
+            volume = volumes.get(qtree) or next(
+                (v for k, v in volumes.items() if k.lower() == qtree.lower()),
                 None)
             if not volume:
-                self._add(report, "PRUNE_UNKNOWN_QTREE",
-                          f"'{qtree}' has a clone volume on this job", False,
-                          detail=f"no clone volume recorded for '{qtree}'",
-                          hint="prune only qtrees this job actually cloned")
-                continue
-
-            info, err = self._safe(
-                lambda v=volume: self.c.get_volume(p.dest_cluster,
-                                                   p.dest_vserver, v), None)
-            if info is None:
-                self._add(report, "PRUNE_VOLUME_UNREADABLE",
-                          f"PROD: volume '{volume}' readable", False,
-                          detail=err or "volume not found",
-                          target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
-                continue
-
-            # Still a clone -> the move has not split it: deleting now frees
-            # nothing and destroys data for no reason.
-            split = info.is_flexclone is False
-            self._add(report, "PRUNE_NOT_SPLIT",
-                      f"'{volume}' is detached from its parent", split,
-                      detail="still a FlexClone: the volume move has not "
-                             "split it yet" if not split
-                             else "split from its parent",
-                      hint="wait for the volume move to finish "
-                           "(volume move show), then prune" if not split else "",
-                      target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
-
-            moving = (info.move_state or "").lower() in (
-                "replicating", "cutover", "cutover_hard_deferred",
-                "cutover_soft_deferred", "queued", "paused")
-            self._add(report, "PRUNE_MOVE_RUNNING",
-                      f"'{volume}': no volume move in progress", not moving,
-                      detail=f"movement.state={info.move_state}" if moving
-                             else f"movement.state="
-                                  f"{info.move_state or 'none'}",
-                      hint="let the move finish before deleting anything"
-                           if moving else "",
-                      target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
-
-            # What exactly would be deleted, named in the report.
-            present, err = self._safe(
-                lambda v=volume: self.c.list_qtrees(p.dest_cluster,
-                                                    p.dest_vserver, v), None)
-            if present is None:
-                self._add(report, "PRUNE_QTREES_UNREADABLE",
-                          f"'{volume}': qtrees readable", False,
-                          severity=SEVERITY_WARNING,
-                          detail=err or "could not list the qtrees",
-                          target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
-                continue
+                continue                       # VOLUME_MAP_MISSING covers it
             kept = renames.get(qtree, qtree)
-            surplus = [q for q in present
-                       if q.lower() != kept.lower() and q not in ("", "-")]
+            surplus = [q for q in source
+                       if q.lower() != qtree.lower() and q not in ("", "-")]
             self._add(report, "PRUNE_PLAN",
-                      f"'{volume}': what would be deleted", True,
+                      f"'{volume}': inherited qtrees that will be DELETED",
+                      True,
                       severity=SEVERITY_WARNING if surplus else SEVERITY_ERROR,
                       detail=f"keeps '{kept}', deletes {len(surplus)}: "
                              f"{', '.join(surplus)}" if surplus
-                             else f"keeps '{kept}', nothing else present",
+                             else f"keeps '{kept}', the source holds nothing "
+                                  f"else",
                       target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
-
-            self._add(report, "PRUNE_KEEPS_ITS_OWN",
-                      f"'{volume}' still holds '{kept}' after pruning",
-                      kept.lower() in {q.lower() for q in present},
-                      detail=f"'{kept}' present in the clone"
-                             if kept.lower() in {q.lower() for q in present}
-                             else f"'{kept}' NOT found in '{volume}' — "
-                                  f"pruning would empty the volume",
-                      hint="check the qtree/rename mapping before pruning",
-                      target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
-        return report
 
     def for_cleanup(self, job: Optional[dict], qtree: str) -> PreflightReport:
         p = self.p

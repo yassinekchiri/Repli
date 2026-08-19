@@ -401,8 +401,7 @@ class ForbiddenError(Exception):
 
 
 # Actions a scoped (per-qtree) token may be granted.
-ACTIONS_QTREE_SCOPED = frozenset({"test", "clone", "acl", "cleanup",
-                                  "prune"})
+ACTIONS_QTREE_SCOPED = frozenset({"test", "clone", "acl", "cleanup"})
 # Read-only actions, always grantable to a scoped token.
 ACTIONS_READ = frozenset({"status", "preflight", "read"})
 # Actions that act on the whole cascade: super-admin only, never delegated.

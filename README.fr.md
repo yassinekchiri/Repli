@@ -39,7 +39,7 @@ netapp_migration/
 │   ├── ssh.py              # implémentation CLI ONTAP via SSH (fallback)
 │   └── dryrun.py           # simulation --dry-run (aucun cluster contacté)
 ├── core/
-│   ├── engine.py           # MigrationEngine : les 9 actions métier
+│   ├── engine.py           # MigrationEngine : les 8 actions métier
 │   └── jobs.py             # JobStore : fichiers de job JSON + checkpoints
 └── interfaces/
     ├── cli.py              # interface ligne de commande
@@ -92,7 +92,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 168 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 167 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -594,47 +594,38 @@ peut alors être omis. Trois modes :
       --qtrees q_fin,q_hr --fresh
   ```
 * **Flux complet** — pas d'environnement de test : snapshot dédié →
-  propagation cascade → FlexClones sur PROD et DR → SnapMirror entre
-  clones + resync → sélection automatique du meilleur aggregate →
+  propagation cascade → FlexClones sur PROD et DR → **élagage** → SnapMirror
+  entre clones + resync → sélection automatique du meilleur aggregate →
   `volume move` → sortie immédiate.
 
-### 3.6 prune — supprimer les qtrees que le clone ne possède pas (**destructif**)
+#### Élagage : un volume, les données d'un seul client
 
 Un FlexClone copie le volume parent **en entier** : le volume créé pour
-`q_fin` contient donc aussi `q_hr`, `q_ops` et tous les autres qtrees de la
-source. Une fois le `volume move` terminé et le clone détaché de son parent,
-ce surplus occupe réellement de l'espace — et ce sont les données d'autres
-clients dans le volume de ce client. `prune` les supprime.
+`q_fin` contient donc au départ `q_hr`, `q_ops` et tous les autres qtrees de
+la source — les données d'autres clients dans le volume de ce client, et N
+copies complètes pour N qtrees.
 
-```bash
-# 1. voir exactement ce qui partirait, sans rien modifier
-python3 netapp_cascade_migration.py --action prune --job-id <ID> \
-    --qtrees q_fin,q_hr
-# 2. même commande avec --yes pour supprimer réellement
-python3 netapp_cascade_migration.py --action prune --job-id <ID> \
-    --qtrees q_fin,q_hr --yes
+`clone` et `test` suppriment donc, dans chaque clone, tout qtree pour lequel
+il n'a pas été créé. Actif par défaut ; `--no-prune` (API : `"prune": false`)
+conserve tout, et le pré-vol émet alors un avertissement (`PRUNE_DISABLED`).
+
+L'opération a lieu juste après la création des clones — **avant** le miroir
+et **avant** le move — et c'est ce qui la rend efficace :
+
+* le clone DR reçoit les suppressions dès son premier resync : il ne porte
+  donc jamais le surplus non plus ;
+* le `volume move` ne déplace que ce qui reste.
+
+Garde-fous : **PROD uniquement** (le clone DR est en lecture seule), le
+**volume source n'est jamais touché**, le qtree pour lequel le volume a été
+créé n'est jamais supprimé, et un plan qui viderait un volume interrompt le
+run. Le pré-vol liste les suppressions avant qu'elles n'arrivent :
+
+```
+| WARN | 'vol_fin' : qtrees hérités qui seront SUPPRIMÉS | keeps 'q_fin', deletes 2: q_hr, q_ops |
 ```
 
-**Irréversible**, donc encadré :
-
-* rien ne se passe sans `--yes` (API : `"confirm": true`) ; le refus affiche
-  le tableau, volume par volume, de ce qui serait supprimé ;
-* refusé tant que le clone est encore attaché à son parent
-  (`PRUNE_NOT_SPLIT`) ou que son move est en cours (`PRUNE_MOVE_RUNNING`) —
-  supprimer alors détruirait des données sans libérer d'espace ;
-* refusé sur un environnement de **test** (`PRUNE_ON_TEST_ENV`) : promouvez-le
-  d'abord ;
-* le qtree pour lequel le volume a été créé n'est jamais supprimé, et le
-  pré-vol refuse un plan qui viderait le volume ;
-* **PROD uniquement** — les copies DR suivent à la prochaine mise à jour
-  SnapMirror ;
-* le **volume source n'est jamais touché**. La coupure d'accès source est une
-  action distincte (3.7), et elle ne supprime rien non plus.
-
-Relancer la commande est sans effet : un volume ne contenant déjà que son
-propre qtree n'a rien à supprimer.
-
-### 3.7 cleanup — coupure d'accès source
+### 3.6 cleanup — coupure d'accès source
 
 ```bash
 python3 netapp_cascade_migration.py --action cleanup \
@@ -642,7 +633,7 @@ python3 netapp_cascade_migration.py --action cleanup \
     --volume vol_prod_01 --qtree q_fin
 ```
 
-### 3.8 Options transverses
+### 3.7 Options transverses
 
 | Option | Rôle |
 |---|---|
@@ -843,11 +834,6 @@ create (pivot-only) ──> check-status ──> resume ──> check-status ...
               │                     propre (anciens clones de test à supprimer)
               └─ après expiration : suppression des clones de test,
                                     puis clone = flux complet
-                                                             │
-                                                             v
-                                                           prune
-                          (supprime, dans chaque clone, les qtrees hérités
-                           de la source qu'il ne possède pas)
                                                              │
                                                              v
                                                           cleanup

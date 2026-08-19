@@ -123,6 +123,10 @@ class QtreesRequest(BaseModel):
 class TestRequest(QtreesRequest):
     """test payload: qtrees + validity of the test environment."""
     validity_days: int = Field(7, ge=1, le=365)
+    # A clone copies the whole source volume. Left true, each clone keeps
+    # only the qtree it was created for; set false and it also holds the
+    # other clients' qtrees.
+    prune: bool = True
 
 
 class CloneRequest(QtreesRequest):
@@ -132,6 +136,8 @@ class CloneRequest(QtreesRequest):
     on a clean base (the old test clones are left to delete manually).
     """
     fresh: bool = False
+    # See TestRequest.prune.
+    prune: bool = True
 
 
 class AclRequest(BaseModel):
@@ -144,15 +150,6 @@ class AclRequest(BaseModel):
     @property
     def ad_groups_csv(self) -> str:
         return _csv(self.ad_groups) or ""
-
-
-class PruneRequest(QtreesRequest):
-    """prune payload: which clones to prune, plus an explicit go-ahead.
-
-    IRREVERSIBLE. Without confirm=true the API answers 409 with the list of
-    qtrees that would be deleted, so the caller can check before agreeing.
-    """
-    confirm: bool = False
 
 
 class CleanupRequest(BaseModel):
@@ -190,6 +187,7 @@ class PreflightActionRequest(BaseModel):
     ad_groups: Union[str, List[str], None] = None
     qtree: Optional[str] = None
     fresh: bool = False
+    prune: bool = True
 
     @property
     def qtrees_csv(self) -> str:

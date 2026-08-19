@@ -86,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--action", required=True,
                         choices=["create", "clone", "test", "acl", "cleanup",
-                                 "prune", "resume", "check-status", "retry",
+                                 "resume", "check-status", "retry",
                                  "tokens-init", "tokens-import",
                                  "tokens-list", "tokens-revoke",
                                  "tokens-set-scope", "api-unlock"])
@@ -130,10 +130,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="(clone) start from a clean base even if a test "
                              "environment exists: the full flow runs and the "
                              "old test clones are left to delete manually.")
+    parser.add_argument("--no-prune", action="store_true",
+                        help="(test / clone) keep, in each clone, the qtrees "
+                             "it inherited from the source volume. By default "
+                             "a clone keeps only the qtree it was created "
+                             "for — the others are deleted from the CLONE "
+                             "(never from the source).")
     parser.add_argument("--yes", action="store_true",
-                        help="(resume / prune) skip the interactive "
-                             "confirmation. For prune this authorises "
-                             "IRREVERSIBLE deletion — read the table first.")
+                        help="(resume) skip the interactive confirmation.")
     parser.add_argument("--volume-map",
                         help="(test / clone) CSV naming, per qtree, the target "
                              "volume and optionally the qtree's new name "
@@ -253,7 +257,7 @@ TOKEN_ACTIONS = ("tokens-init", "tokens-import", "tokens-list",
 # Which scope name guards each migration action.
 ACTION_SCOPE = {"create": "create", "resume": "resume", "retry": "retry",
                 "check-status": "status", "test": "test", "clone": "clone",
-                "acl": "acl", "cleanup": "cleanup", "prune": "prune"}
+                "acl": "acl", "cleanup": "cleanup"}
 
 
 def _prompt_token(prompt: str) -> str:
@@ -552,16 +556,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             if job is None:
                 engine.check_clone_prerequisites()
             engine.clone(args.qtrees, job=job, fresh=args.fresh,
-                         volume_map=volume_map, qtree_map=qtree_map)
+                         volume_map=volume_map, qtree_map=qtree_map,
+                         prune=not args.no_prune)
         elif args.action == "test":
             engine.test(args.qtrees, job=job,
                         validity_days=args.test_validity_days,
-                        volume_map=volume_map, qtree_map=qtree_map)
+                        volume_map=volume_map, qtree_map=qtree_map,
+                        prune=not args.no_prune)
         elif args.action == "acl":
             engine.acl(args.ad_groups, acl_path=args.acl_path,
                        acl_rights=args.acl_rights, job=job)
-        elif args.action == "prune":
-            engine.prune(args.qtrees, job=job, confirm=args.yes)
         elif args.action == "cleanup":
             engine.cleanup(args.qtree, job=job)
         logger.info("SUCCESS: action '%s' completed without error.", args.action)
