@@ -846,12 +846,23 @@ end of the run for manual deletion.
   getenforce 2>/dev/null
   ```
 
-  Three usual causes: the install directory is not traversable by the service
-  account (`chmod 755 /opt/netapp-migration` — installing under `umask 077`
-  used to produce exactly this); the filesystem is mounted `noexec` (install
-  elsewhere with `--prefix`); or SELinux mislabelled the tree
-  (`restorecon -R /opt/netapp-migration`). Re-running the installer detects
-  and reports all three, and repairs the first.
+  Four usual causes:
+
+  1. **The venv points at a private interpreter.** A venv is only a set of
+     symlinks to the Python it was built from. If `namei` shows the chain
+     ending in something like `/root/bin/.../python3.12`, and `/root` is
+     `dr-xr-x---`, the service account can never reach it. Root's `PATH` can
+     easily put an agent's bundled Python ahead of the system one. Rebuild on
+     a system interpreter — re-running the installer does it for you, or
+     force it with `--python /usr/bin/python3.12`.
+  2. The install directory is not traversable by the service account
+     (`chmod 755 /opt/netapp-migration`); installing under `umask 077` used
+     to produce exactly this.
+  3. The filesystem is mounted `noexec` — install elsewhere with `--prefix`.
+  4. SELinux mislabelled the tree — `restorecon -R /opt/netapp-migration`.
+
+  Re-running the installer detects and reports all four, and repairs the
+  first two by itself.
 * **Everything answers `503 {"error":"locked"}`**: the API is running but
   its token store has not been unlocked since the last start. Unlock it:
   `--action api-unlock --unlock-socket <prefix>/etc/unlock.sock`.

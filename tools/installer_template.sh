@@ -45,6 +45,7 @@ SERVICE_NAME="netapp-migration-api"
 API_HOST="127.0.0.1"
 API_PORT="8000"
 MIN_PY_MINOR=9
+PYTHON=""          # --python: force a base interpreter
 
 INDEX_URL=""
 EXTRA_INDEX_URL=""
@@ -105,6 +106,8 @@ Options:
   --extra-index-url URL additional pip index
   --trusted-host HOST   pip trusted host (repeatable, for a self-signed mirror)
   --pip-timeout SEC     per-request pip timeout  (default: ${PIP_TIMEOUT})
+  --python PATH         base interpreter for the venv (default: newest
+                        system Python 3.9+ the service account can reach)
   --no-service          do not install the systemd unit
   --no-tokens           do not initialise the token store now
   --no-tests            skip the test suite
@@ -130,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --extra-index-url) EXTRA_INDEX_URL="${2:?--extra-index-url needs a URL}"; shift 2 ;;
         --trusted-host)    TRUSTED_HOSTS+=("${2:?--trusted-host needs a host}"); shift 2 ;;
         --pip-timeout)     PIP_TIMEOUT="${2:?--pip-timeout needs seconds}"; shift 2 ;;
+        --python)          PYTHON="${2:?--python needs a path}"; shift 2 ;;
         --no-service)      INSTALL_SERVICE=0; shift ;;
         --no-tokens)       INIT_TOKENS=0; shift ;;
         --no-tests)        RUN_TESTS=0; shift ;;
@@ -164,17 +168,73 @@ if [[ ! -f "${SELF}" ]]; then
 fi
 ok "self-contained installer: ${SELF}"
 
-# Python interpreter: prefer the newest usable one on the machine.
-PYTHON=""
-for candidate in python3.12 python3.11 python3.10 python3.9 python3; do
-    command -v "${candidate}" >/dev/null 2>&1 || continue
-    major=$("${candidate}" -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)
-    minor=$("${candidate}" -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)
-    if (( major == 3 && minor >= MIN_PY_MINOR )); then
-        PYTHON="${candidate}"
-        break
+# A virtualenv is a set of symlinks to the interpreter it was built from, so
+# the SERVICE ACCOUNT has to be able to reach that interpreter — not just
+# root. An interpreter under /root (mode 0550) produces a venv that only root
+# can run, and systemd reports the useless "status=203/EXEC".
+reachable_by_others() {
+    local target mode dir
+    target=$(readlink -f "$1" 2>/dev/null) || return 1
+    mode=$(stat -Lc '%a' "${target}" 2>/dev/null) || return 1
+    (( (8#${mode} & 5) == 5 )) || return 1      # the binary: o+r and o+x
+    dir=$(dirname "${target}")
+    while :; do
+        mode=$(stat -Lc '%a' "${dir}" 2>/dev/null) || return 1
+        (( 8#${mode} & 1 )) || return 1         # every directory: o+x
+        [[ "${dir}" == "/" ]] && break
+        dir=$(dirname "${dir}")
+    done
+    return 0
+}
+
+python_version_ok() {
+    local major minor
+    major=$("$1" -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)
+    minor=$("$1" -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)
+    (( major == 3 && minor >= MIN_PY_MINOR ))
+}
+
+if [[ -n "${PYTHON}" ]]; then
+    # --python was given: honour it, but do not stay silent about a choice
+    # that cannot work for the service.
+    command -v "${PYTHON}" >/dev/null 2>&1 \
+        || die "no such interpreter: ${PYTHON}"
+    python_version_ok "${PYTHON}" \
+        || die "${PYTHON} is not a Python 3.${MIN_PY_MINOR}+"
+    if (( INSTALL_SERVICE )) && ! reachable_by_others "${PYTHON}"; then
+        warn "$(readlink -f "${PYTHON}") is not reachable by a non-root account"
+        info "the service would fail with status=203/EXEC"
     fi
-done
+else
+    # Absolute system locations first: root's PATH may put a private
+    # interpreter (an agent's bundled Python under /root, for instance)
+    # ahead of the system one.
+    PRIVATE_FALLBACK=""
+    for candidate in /usr/bin/python3.12 /usr/bin/python3.11 /usr/bin/python3.10 \
+                     /usr/bin/python3.9 /usr/bin/python3 \
+                     /usr/local/bin/python3 \
+                     python3.12 python3.11 python3.10 python3.9 python3; do
+        command -v "${candidate}" >/dev/null 2>&1 || continue
+        python_version_ok "${candidate}" || continue
+        if reachable_by_others "${candidate}"; then
+            PYTHON="${candidate}"
+            break
+        fi
+        [[ -n "${PRIVATE_FALLBACK}" ]] || PRIVATE_FALLBACK="${candidate}"
+    done
+
+    if [[ -z "${PYTHON}" && -n "${PRIVATE_FALLBACK}" ]]; then
+        warn "the only Python 3.${MIN_PY_MINOR}+ found is $(readlink -f "${PRIVATE_FALLBACK}")"
+        info "it sits in a directory no other account can traverse, so a"
+        info "service built on it cannot start (status=203/EXEC)."
+        if (( INSTALL_SERVICE )); then
+            die "install a system Python (dnf install python3 / apt-get install python3),
+       or pass --python /usr/bin/python3.X, or --no-service to run it as root"
+        fi
+        warn "continuing: no service is being installed"
+        PYTHON="${PRIVATE_FALLBACK}"
+    fi
+fi
 [[ -n "${PYTHON}" ]] || die "no Python 3.${MIN_PY_MINOR}+ found — install python3 first (this installer cannot download it)"
 PY_VERSION=$("${PYTHON}" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')
 ok "Python ${PY_VERSION} (${PYTHON})"
@@ -335,6 +395,19 @@ ok "directories ready (prefix 755, etc 700, jobs/logs 750)"
 # 6. Virtual environment and dependencies (online)
 # ----------------------------------------------------------------------------
 step "Creating the virtual environment"
+# A venv is only as usable as the interpreter it points at. One built earlier
+# from a private interpreter must be rebuilt, or re-running this installer
+# would "succeed" and leave the same unstartable service behind. Not gated on
+# --no-service: a venv only root can run is never what anyone wants, and the
+# service may well be added later. Only rebuild when the replacement is
+# actually better, otherwise an explicit --python would loop forever.
+if [[ -x "${PYBIN}" ]] && ! reachable_by_others "${PYBIN}" \
+        && reachable_by_others "${PYTHON}"; then
+    warn "the existing venv points at $(readlink -f "${PYBIN}" 2>/dev/null)"
+    info "no other account can reach it — rebuilding on ${PYTHON}"
+    rm -rf "${VENV}"
+fi
+
 if [[ -x "${PYBIN}" ]]; then
     ok "virtual environment already present — reusing it"
 else

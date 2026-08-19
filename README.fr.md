@@ -854,13 +854,26 @@ listés en fin de run pour suppression manuelle.
   getenforce 2>/dev/null
   ```
 
-  Trois causes habituelles : le répertoire d'installation n'est pas
-  traversable par le compte de service (`chmod 755 /opt/netapp-migration` —
-  une installation sous `umask 077` produisait exactement cela) ; le système
-  de fichiers est monté `noexec` (installer ailleurs avec `--prefix`) ; ou
-  SELinux a mal étiqueté l'arborescence
-  (`restorecon -R /opt/netapp-migration`). Relancer l'installeur détecte et
-  signale les trois, et répare la première.
+  Quatre causes habituelles :
+
+  1. **Le venv pointe vers un interpréteur privé.** Un venv n'est qu'un jeu
+     de liens vers le Python qui l'a créé. Si `namei` montre une chaîne qui
+     finit sur quelque chose comme `/root/bin/.../python3.12` et que `/root`
+     est en `dr-xr-x---`, le compte de service ne l'atteindra jamais. Le
+     `PATH` de root place volontiers le Python embarqué d'un agent avant
+     celui du système. Reconstruire sur un interpréteur système — relancer
+     l'installeur le fait pour vous, ou forcez-le avec
+     `--python /usr/bin/python3.12`.
+  2. Le répertoire d'installation n'est pas traversable par le compte de
+     service (`chmod 755 /opt/netapp-migration`) ; une installation sous
+     `umask 077` produisait exactement cela.
+  3. Le système de fichiers est monté `noexec` — installer ailleurs avec
+     `--prefix`.
+  4. SELinux a mal étiqueté l'arborescence —
+     `restorecon -R /opt/netapp-migration`.
+
+  Relancer l'installeur détecte et signale les quatre, et répare les deux
+  premières tout seul.
 * **Tout répond `503 {"error":"locked"}`** : l'API tourne mais son coffre
   n'a pas été déverrouillé depuis le dernier démarrage. Déverrouillez-la :
   `--action api-unlock --unlock-socket <prefix>/etc/unlock.sock`.
