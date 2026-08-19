@@ -843,6 +843,24 @@ listés en fin de run pour suppression manuelle.
   invite que personne ne pouvait voir ni renseigner en SSH. L'unité actuelle
   démarre verrouillée et ne pose aucune question ; si vous avez encore
   l'ancienne, réinstallez ou remplacez-la par celle de la section 4.4.
+* **`status=203/EXEC` — « Failed to execute command: Permission denied »** :
+  systemd n'a même pas pu lancer `<prefix>/.venv/bin/python`. Identifiez le
+  composant fautif du chemin :
+
+  ```bash
+  namei -l /opt/netapp-migration/.venv/bin/python   # le mode de chaque composant
+  sudo -u netappmig /opt/netapp-migration/.venv/bin/python -V
+  findmnt -no OPTIONS "$(df -P /opt/netapp-migration | awk 'NR==2{print $6}')"
+  getenforce 2>/dev/null
+  ```
+
+  Trois causes habituelles : le répertoire d'installation n'est pas
+  traversable par le compte de service (`chmod 755 /opt/netapp-migration` —
+  une installation sous `umask 077` produisait exactement cela) ; le système
+  de fichiers est monté `noexec` (installer ailleurs avec `--prefix`) ; ou
+  SELinux a mal étiqueté l'arborescence
+  (`restorecon -R /opt/netapp-migration`). Relancer l'installeur détecte et
+  signale les trois, et répare la première.
 * **Tout répond `503 {"error":"locked"}`** : l'API tourne mais son coffre
   n'a pas été déverrouillé depuis le dernier démarrage. Déverrouillez-la :
   `--action api-unlock --unlock-socket <prefix>/etc/unlock.sock`.

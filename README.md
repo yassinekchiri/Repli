@@ -835,6 +835,23 @@ end of the run for manual deletion.
   or answer over SSH. The current unit starts locked and never prompts; if
   you still have the old one, reinstall or replace it with the unit in
   section 4.4.
+* **`status=203/EXEC` — "Failed to execute command: Permission denied"**:
+  systemd could not even spawn `<prefix>/.venv/bin/python`. Find the guilty
+  path component:
+
+  ```bash
+  namei -l /opt/netapp-migration/.venv/bin/python   # every component's mode
+  sudo -u netappmig /opt/netapp-migration/.venv/bin/python -V
+  findmnt -no OPTIONS "$(df -P /opt/netapp-migration | awk 'NR==2{print $6}')"
+  getenforce 2>/dev/null
+  ```
+
+  Three usual causes: the install directory is not traversable by the service
+  account (`chmod 755 /opt/netapp-migration` — installing under `umask 077`
+  used to produce exactly this); the filesystem is mounted `noexec` (install
+  elsewhere with `--prefix`); or SELinux mislabelled the tree
+  (`restorecon -R /opt/netapp-migration`). Re-running the installer detects
+  and reports all three, and repairs the first.
 * **Everything answers `503 {"error":"locked"}`**: the API is running but
   its token store has not been unlocked since the last start. Unlock it:
   `--action api-unlock --unlock-socket <prefix>/etc/unlock.sock`.

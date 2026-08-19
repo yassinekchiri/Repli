@@ -23,6 +23,13 @@
 
 set -Eeuo pipefail
 
+# Hardened hosts often run with umask 077, which would create the install
+# directory unreadable to anyone but root — the service account could then not
+# even spawn the interpreter (systemd reports "status=203/EXEC, Permission
+# denied"). Everything secret gets an explicit umask 077 / chmod later on; the
+# rest must be traversable.
+umask 022
+
 # Empty when piped (`curl | bash`) — caught with a clear message below.
 SELF="${BASH_SOURCE[0]:-}"
 PAYLOAD_SHA256="@PAYLOAD_SHA256@"
@@ -178,12 +185,15 @@ ok "Python ${PY_VERSION} (${PYTHON})"
        RHEL/Rocky    : dnf install python3-libs"
 ok "venv module available"
 
-command -v systemctl >/dev/null 2>&1 || {
-    if (( INSTALL_SERVICE )); then
-        warn "systemd not found — the service will not be installed"
-        INSTALL_SERVICE=0
-    fi
-}
+# `systemctl` being on PATH is not enough: inside a container or a chroot it
+# is present but systemd is not PID 1, and every call fails. /run/systemd/system
+# exists only when systemd really is running the machine.
+if (( INSTALL_SERVICE )) \
+        && { ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; }; then
+    warn "systemd is not running this machine — the service will not be installed"
+    info "the API can still be started in the foreground (see the summary)"
+    INSTALL_SERVICE=0
+fi
 
 # ----------------------------------------------------------------------------
 # 2. Unpacking the embedded payload
@@ -313,9 +323,13 @@ for item in netapp_migration netapp_cascade_migration.py requirements.txt \
 done
 ok "code installed"
 
+# Explicit, not umask-dependent: the service account has to traverse every
+# component of ${PREFIX} to reach the interpreter and the code. A re-run over
+# a previously too-strict install repairs it.
+chmod 755 "${PREFIX}"
 chmod 700 "${ETC_DIR}"
 chmod 750 "${JOB_DIR}" "${LOG_DIR}"
-ok "directories ready (etc 700, jobs/logs 750)"
+ok "directories ready (prefix 755, etc 700, jobs/logs 750)"
 
 # ----------------------------------------------------------------------------
 # 6. Virtual environment and dependencies (online)
@@ -386,6 +400,77 @@ ok "package imports correctly"
 "${PYBIN}" "${PREFIX}/netapp_cascade_migration.py" --help >/dev/null \
     || die "the CLI does not start"
 ok "CLI responds"
+
+# Everything above ran as root. The service will not: check that the service
+# account can actually spawn the interpreter, or systemd will only say
+# "status=203/EXEC, Permission denied" at the first start.
+if (( INSTALL_SERVICE )) && id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+    # The service account has a nologin shell, so plain `su -` is out:
+    # runuser is the right tool, with `su -s /bin/sh` as the fallback where
+    # util-linux's runuser is missing.
+    if command -v runuser >/dev/null 2>&1; then
+        service_can_exec() {
+            runuser -u "${SERVICE_USER}" -- /bin/sh -c "$1" >/dev/null 2>&1
+        }
+    else
+        service_can_exec() {
+            su -s /bin/sh "${SERVICE_USER}" -c "$1" >/dev/null 2>&1
+        }
+    fi
+
+    # Two distinct failures, two distinct messages: spawning the interpreter
+    # is what systemd reports as 203/EXEC; reading the code is a later, much
+    # clearer error. The code is a directory under ${PREFIX}, not an installed
+    # package, so the import only resolves from there — exactly as the unit's
+    # WorkingDirectory arranges.
+    if service_can_exec "'${PYBIN}' -c 'pass'" \
+            && service_can_exec "cd '${PREFIX}' && '${PYBIN}' -c 'import netapp_migration'"; then
+        ok "${SERVICE_USER} can start the API"
+    else
+        if service_can_exec "'${PYBIN}' -c 'pass'"; then
+            warn "${SERVICE_USER} can run the interpreter but cannot import the code"
+            info "check the read permissions on ${PREFIX}/netapp_migration"
+        else
+            warn "${SERVICE_USER} CANNOT execute ${PYBIN}"
+            info "systemd would fail with: status=203/EXEC, Permission denied."
+        fi
+        info "Diagnosing:"
+
+        # 1. Path permissions, component by component.
+        if command -v namei >/dev/null 2>&1; then
+            namei -l "${PYBIN}" | sed 's/^/           /'
+        else
+            ls -ld "${PREFIX}" "${VENV}" "${VENV}/bin" "${PYBIN}" \
+                | sed 's/^/           /'
+        fi
+
+        # 2. A noexec mount makes every binary there unrunnable.
+        mount_point=$(df -P "${PREFIX}" | awk 'NR==2 {print $6}')
+        if findmnt -no OPTIONS "${mount_point}" 2>/dev/null | grep -q noexec; then
+            warn "${mount_point} is mounted noexec — nothing under it can be executed"
+            info "install elsewhere (--prefix) or remount without noexec"
+        fi
+
+        # 3. SELinux mislabels files copied into /opt on RHEL-family hosts.
+        if command -v getenforce >/dev/null 2>&1 \
+                && [[ "$(getenforce)" == "Enforcing" ]]; then
+            warn "SELinux is enforcing"
+            if command -v restorecon >/dev/null 2>&1; then
+                restorecon -R "${PREFIX}" 2>/dev/null || true
+                if service_can_exec "cd '${PREFIX}' && '${PYBIN}' -c 'import netapp_migration'"; then
+                    ok "fixed by restorecon -R ${PREFIX}"
+                else
+                    info "check the denial: ausearch -m avc -ts recent"
+                fi
+            else
+                info "run: restorecon -R ${PREFIX}  (policycoreutils)"
+            fi
+        fi
+
+        service_can_exec "cd '${PREFIX}' && '${PYBIN}' -c 'import netapp_migration'" \
+            || die "the service account cannot run the API — fix the cause above and re-run this installer"
+    fi
+fi
 
 if (( RUN_TESTS )); then
     # pytest.ini already carries -q; adding another would hide the summary.
@@ -481,8 +566,14 @@ RestrictSUIDSGID=true
 WantedBy=multi-user.target
 EOF
     chmod 644 "${UNIT}"
-    systemctl daemon-reload
-    ok "unit installed: ${UNIT}"
+    # Never fatal: the unit file is written and correct either way, and an
+    # install that succeeded must not be reported as aborted.
+    if systemctl daemon-reload 2>/dev/null; then
+        ok "unit installed: ${UNIT}"
+    else
+        warn "unit written but 'systemctl daemon-reload' failed"
+        info "run it yourself before starting the service"
+    fi
     info "deliberately NOT enabled at boot: the API needs the global token"
 fi
 
