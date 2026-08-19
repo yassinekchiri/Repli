@@ -236,6 +236,13 @@ class VolumeInfo:
     security_style: Optional[str] = None
     aggregate: Optional[str] = None
     uuid: Optional[str] = None          # REST only
+    # A FlexClone still attached to its parent. The volume move detaches it;
+    # until then the clone shares blocks with the parent and pruning it frees
+    # nothing. None means the transport could not tell.
+    is_flexclone: Optional[bool] = None
+    # ONTAP's volume-move state: 'success', 'failed', 'replicating',
+    # 'cutover'... Empty when no move was ever run on this volume.
+    move_state: str = ""
 
 
 @dataclass
@@ -394,7 +401,8 @@ class ForbiddenError(Exception):
 
 
 # Actions a scoped (per-qtree) token may be granted.
-ACTIONS_QTREE_SCOPED = frozenset({"test", "clone", "acl", "cleanup"})
+ACTIONS_QTREE_SCOPED = frozenset({"test", "clone", "acl", "cleanup",
+                                  "prune"})
 # Read-only actions, always grantable to a scoped token.
 ACTIONS_READ = frozenset({"status", "preflight", "read"})
 # Actions that act on the whole cascade: super-admin only, never delegated.

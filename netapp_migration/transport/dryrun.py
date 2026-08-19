@@ -33,8 +33,12 @@ class DryRunClient(OntapClient):
     # ---- Volumes ---------------------------------------------------------
     def get_volume(self, cluster, svm, volume) -> VolumeInfo:
         self._trace(cluster, f"volume show {svm}:{volume}")
+        # Simulated as already split and moved, so a prune rehearsal is not
+        # blocked by a guard that could never be satisfied in simulation.
         return VolumeInfo(name=volume, svm=svm, size_bytes=_FAKE_SIZE,
-                          security_style="ntfs", aggregate="aggr_dryrun_parent")
+                          security_style="ntfs",
+                          aggregate="aggr_dryrun_parent",
+                          is_flexclone=False, move_state="success")
 
     def volume_exists(self, cluster, svm, volume) -> bool:
         found = (cluster, svm, volume) in self._volumes
@@ -87,6 +91,9 @@ class DryRunClient(OntapClient):
 
     def rename_qtree(self, cluster, svm, volume, qtree, new_name):
         self._trace(cluster, f"qtree rename {volume}/{qtree} -> {new_name}")
+
+    def delete_qtree(self, cluster, svm, volume, qtree):
+        self._trace(cluster, f"qtree delete {volume}/{qtree} (force)")
 
     # ---- CIFS shares -----------------------------------------------------
     def find_cifs_shares(self, cluster, svm, path_fragment) -> List[str]:

@@ -326,6 +326,15 @@ class SshClient(OntapClient):
                   f"volume qtree rename -vserver {svm} -volume {volume} "
                   f"-qtree {qtree} -new-qtree-name {new_name}")
 
+    def delete_qtree(self, cluster, svm, volume, qtree):
+        """Delete a qtree and everything in it. Irreversible.
+
+        -force is required: ONTAP refuses to delete a qtree that holds data.
+        """
+        self._run(cluster,
+                  f"volume qtree delete -vserver {svm} -volume {volume} "
+                  f"-qtree {qtree} -force true")
+
     # ------------------------------------------------------------------ #
     # CIFS shares
     # ------------------------------------------------------------------ #

@@ -114,10 +114,12 @@ class FakeClient(OntapClient):
 
     # ---- helpers used by the tests ------------------------------------- #
     def add_volume(self, cluster, svm, volume, size=10 * 1024 ** 3,
-                   aggregate="aggr_x", security_style="ntfs"):
+                   aggregate="aggr_x", security_style="ntfs",
+                   is_flexclone=False, move_state=""):
         self.volumes[(cluster, svm, volume)] = VolumeInfo(
             name=volume, svm=svm, size_bytes=size,
-            security_style=security_style, aggregate=aggregate)
+            security_style=security_style, aggregate=aggregate,
+            is_flexclone=is_flexclone, move_state=move_state)
         self.junctions.setdefault((cluster, svm), []).append(f"/{volume}")
 
     def add_relationship(self, dest_path, state="snapmirrored",
@@ -148,9 +150,20 @@ class FakeClient(OntapClient):
         parent = self.volumes.get((cluster, svm, parent_volume))
         self.add_volume(cluster, svm, clone_name,
                         size=parent.size_bytes if parent else 0,
-                        aggregate=parent.aggregate if parent else "aggr_x")
+                        aggregate=parent.aggregate if parent else "aggr_x",
+                        is_flexclone=True)
+        # A FlexClone copies the WHOLE parent, qtrees included — which is
+        # exactly what makes pruning necessary.
+        source = self.qtrees.get(("SRC", "svm_source", parent_volume))
+        if source is None:
+            source = self.qtrees.get((cluster, svm, parent_volume), [])
+        self.qtrees[(cluster, svm, clone_name)] = list(source)
 
     def start_volume_move(self, cluster, svm, volume, dest_aggregate):
+        info = self.volumes.get((cluster, svm, volume))
+        if info is not None:                    # the move splits the clone
+            info.is_flexclone = False
+            info.move_state = "success"
         self.calls.append(f"volume_move {cluster} {svm}:{volume} "
                           f"-> {dest_aggregate}")
 
@@ -192,6 +205,13 @@ class FakeClient(OntapClient):
         qtrees = self.qtrees.setdefault((cluster, svm, volume), [])
         if qtree in qtrees:
             qtrees[qtrees.index(qtree)] = new_name
+
+    # ---- CIFS ----------------------------------------------------------- #
+    def delete_qtree(self, cluster, svm, volume, qtree):
+        self.calls.append(f"delete_qtree {cluster} {volume}/{qtree}")
+        qtrees = self.qtrees.get((cluster, svm, volume), [])
+        if qtree in qtrees:
+            qtrees.remove(qtree)
 
     # ---- CIFS ----------------------------------------------------------- #
     def find_cifs_shares(self, cluster, svm, path_fragment) -> List[str]:

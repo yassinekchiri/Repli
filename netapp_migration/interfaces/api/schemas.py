@@ -146,6 +146,15 @@ class AclRequest(BaseModel):
         return _csv(self.ad_groups) or ""
 
 
+class PruneRequest(QtreesRequest):
+    """prune payload: which clones to prune, plus an explicit go-ahead.
+
+    IRREVERSIBLE. Without confirm=true the API answers 409 with the list of
+    qtrees that would be deleted, so the caller can check before agreeing.
+    """
+    confirm: bool = False
+
+
 class CleanupRequest(BaseModel):
     qtree: str
 

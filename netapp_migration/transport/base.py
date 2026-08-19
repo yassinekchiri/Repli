@@ -81,6 +81,17 @@ class OntapClient(ABC):
     def rename_qtree(self, cluster: str, svm: str, volume: str,
                      qtree: str, new_name: str) -> None: ...
 
+    @abstractmethod
+    def delete_qtree(self, cluster: str, svm: str, volume: str,
+                     qtree: str) -> None:
+        """Delete a qtree AND ITS CONTENTS. Irreversible.
+
+        Only used to prune the qtrees a FlexClone inherited from its parent
+        volume but does not own. Every caller must have established first
+        that the volume is detached from its parent and that the qtree is
+        not the one the volume was created for.
+        """
+
     # ---- CIFS shares -----------------------------------------------------
     @abstractmethod
     def find_cifs_shares(self, cluster: str, svm: str,

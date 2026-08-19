@@ -175,7 +175,9 @@ class RestClient(OntapClient):
         body = self._request(cluster, "GET", "/storage/volumes",
                              params={"name": volume, "svm.name": svm,
                                      "fields": "uuid,size,nas.security_style,"
-                                               "aggregates.name"})
+                                               "aggregates.name,"
+                                               "clone.is_flexclone,"
+                                               "movement.state"})
         records = body.get("records", [])
         if not records:
             raise OntapError(cluster, f"volume show {svm}:{volume}",
@@ -188,6 +190,8 @@ class RestClient(OntapClient):
             security_style=(rec.get("nas", {}) or {}).get("security_style"),
             aggregate=aggregates[0]["name"] if aggregates else None,
             uuid=rec.get("uuid"),
+            is_flexclone=(rec.get("clone", {}) or {}).get("is_flexclone"),
+            move_state=(rec.get("movement", {}) or {}).get("state", "") or "",
         )
 
     def volume_exists(self, cluster: str, svm: str, volume: str) -> bool:
@@ -313,6 +317,18 @@ class RestClient(OntapClient):
         self._request(cluster, "PATCH",
                       f"/storage/qtrees/{vol_uuid}/{qtree_id}",
                       json_body={"name": new_name})
+
+    def delete_qtree(self, cluster, svm, volume, qtree):
+        """Delete a qtree and everything in it. Irreversible.
+
+        ONTAP runs this asynchronously and refuses a non-empty qtree without
+        force, so the deletion is waited to completion: returning before the
+        job finished would let the caller believe the space is already back.
+        """
+        vol_uuid, qtree_id = self._qtree_ref(cluster, svm, volume, qtree)
+        self._request(cluster, "DELETE",
+                      f"/storage/qtrees/{vol_uuid}/{qtree_id}",
+                      params={"force": "true"}, wait_job=True)
 
     # ------------------------------------------------------------------ #
     # CIFS shares

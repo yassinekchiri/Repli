@@ -86,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--action", required=True,
                         choices=["create", "clone", "test", "acl", "cleanup",
-                                 "resume", "check-status", "retry",
+                                 "prune", "resume", "check-status", "retry",
                                  "tokens-init", "tokens-import",
                                  "tokens-list", "tokens-revoke",
                                  "tokens-set-scope", "api-unlock"])
@@ -131,7 +131,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "environment exists: the full flow runs and the "
                              "old test clones are left to delete manually.")
     parser.add_argument("--yes", action="store_true",
-                        help="(resume) skip the interactive confirmation.")
+                        help="(resume / prune) skip the interactive "
+                             "confirmation. For prune this authorises "
+                             "IRREVERSIBLE deletion — read the table first.")
     parser.add_argument("--volume-map",
                         help="(test / clone) CSV naming, per qtree, the target "
                              "volume and optionally the qtree's new name "
@@ -251,7 +253,7 @@ TOKEN_ACTIONS = ("tokens-init", "tokens-import", "tokens-list",
 # Which scope name guards each migration action.
 ACTION_SCOPE = {"create": "create", "resume": "resume", "retry": "retry",
                 "check-status": "status", "test": "test", "clone": "clone",
-                "acl": "acl", "cleanup": "cleanup"}
+                "acl": "acl", "cleanup": "cleanup", "prune": "prune"}
 
 
 def _prompt_token(prompt: str) -> str:
@@ -558,6 +560,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.action == "acl":
             engine.acl(args.ad_groups, acl_path=args.acl_path,
                        acl_rights=args.acl_rights, job=job)
+        elif args.action == "prune":
+            engine.prune(args.qtrees, job=job, confirm=args.yes)
         elif args.action == "cleanup":
             engine.cleanup(args.qtree, job=job)
         logger.info("SUCCESS: action '%s' completed without error.", args.action)
