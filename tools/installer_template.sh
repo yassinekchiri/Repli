@@ -51,6 +51,7 @@ INDEX_URL=""
 EXTRA_INDEX_URL=""
 TRUSTED_HOSTS=()
 PIP_TIMEOUT=120
+PIP_CERT=""        # --cert: CA bundle for a private/corporate index
 PIP_RETRIES=10
 
 INSTALL_SERVICE=1
@@ -106,6 +107,8 @@ Options:
   --extra-index-url URL additional pip index
   --trusted-host HOST   pip trusted host (repeatable, for a self-signed mirror)
   --pip-timeout SEC     per-request pip timeout  (default: ${PIP_TIMEOUT})
+  --cert PATH           CA bundle for an index behind a private CA
+                        (e.g. /etc/pki/tls/certs/ca-bundle.crt)
   --python PATH         base interpreter for the venv (default: newest
                         system Python 3.9+ the service account can reach)
   --no-service          do not install the systemd unit
@@ -133,6 +136,7 @@ while [[ $# -gt 0 ]]; do
         --extra-index-url) EXTRA_INDEX_URL="${2:?--extra-index-url needs a URL}"; shift 2 ;;
         --trusted-host)    TRUSTED_HOSTS+=("${2:?--trusted-host needs a host}"); shift 2 ;;
         --pip-timeout)     PIP_TIMEOUT="${2:?--pip-timeout needs seconds}"; shift 2 ;;
+        --cert)            PIP_CERT="${2:?--cert needs a path}"; shift 2 ;;
         --python)          PYTHON="${2:?--python needs a path}"; shift 2 ;;
         --no-service)      INSTALL_SERVICE=0; shift ;;
         --no-tokens)       INIT_TOKENS=0; shift ;;
@@ -419,9 +423,55 @@ PIP_ARGS=(--disable-pip-version-check
           --timeout "${PIP_TIMEOUT}" --retries "${PIP_RETRIES}")
 [[ -n "${INDEX_URL}" ]]       && PIP_ARGS+=(--index-url "${INDEX_URL}")
 [[ -n "${EXTRA_INDEX_URL}" ]] && PIP_ARGS+=(--extra-index-url "${EXTRA_INDEX_URL}")
+[[ -n "${PIP_CERT}" ]]        && PIP_ARGS+=(--cert "${PIP_CERT}")
 for host in "${TRUSTED_HOSTS[@]+"${TRUSTED_HOSTS[@]}"}"; do
     PIP_ARGS+=(--trusted-host "${host}")
 done
+
+# A venv's pip trusts its own bundled CA store (pip/_vendor/certifi), NOT the
+# system trust store — so an internal mirror fronted by a corporate CA fails
+# with SSLCertVerificationError even though the system pip works fine. Find
+# the system bundle so we can point pip at it.
+system_ca_bundle() {
+    local candidate
+    for candidate in /etc/pki/tls/certs/ca-bundle.crt \
+                     /etc/ssl/certs/ca-certificates.crt \
+                     /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem; do
+        [[ -r "${candidate}" ]] && { printf '%s' "${candidate}"; return 0; }
+    done
+    return 1
+}
+
+# Runs pip, and retries once against the system CA bundle if — and only if —
+# the failure was a certificate one. Silent when nothing goes wrong.
+CERT_RETRIED=0
+pip_run() {
+    local log status bundle
+    log=$(mktemp)
+    if "${PYBIN}" -m pip install "${PIP_ARGS[@]}" "$@" >"${log}" 2>&1; then
+        rm -f "${log}"
+        return 0
+    fi
+    status=1
+    if (( ! CERT_RETRIED )) && [[ -z "${PIP_CERT}" ]] \
+            && grep -qE 'CERTIFICATE_VERIFY_FAILED|SSLCertVerificationError|SSLError' "${log}" \
+            && bundle=$(system_ca_bundle); then
+        CERT_RETRIED=1
+        warn "TLS verification failed against the package index"
+        info "a venv's pip trusts its own bundled CA store, not the system one;"
+        info "retrying with ${bundle}"
+        PIP_ARGS+=(--cert "${bundle}")
+        PIP_CERT="${bundle}"
+        if "${PYBIN}" -m pip install "${PIP_ARGS[@]}" "$@" >"${log}" 2>&1; then
+            ok "the system CA bundle works — recording it for this install"
+            rm -f "${log}"
+            return 0
+        fi
+    fi
+    cat "${log}" >&2
+    rm -f "${log}"
+    return "${status}"
+}
 
 step "Installing the dependencies (network)"
 info "an internal mirror behind a slow link needs the retries below;"
@@ -429,23 +479,22 @@ info "timeout ${PIP_TIMEOUT}s, ${PIP_RETRIES} retries per package"
 
 # pip itself first: an old pip rejects recent manylinux tags. Not fatal —
 # some mirrors do not carry pip.
-if "${PYBIN}" -m pip install --quiet "${PIP_ARGS[@]}" \
-        --upgrade pip setuptools wheel 2>/dev/null; then
+if pip_run --quiet --upgrade pip setuptools wheel; then
     ok "pip $("${PYBIN}" -m pip --version | awk '{print $2}') ready"
 else
     warn "could not upgrade pip — continuing with $("${PYBIN}" -m pip --version | awk '{print $2}')"
 fi
 
-"${PYBIN}" -m pip install "${PIP_ARGS[@]}" -r "${PREFIX}/requirements.txt" \
+pip_run -r "${PREFIX}/requirements.txt" \
     || die "dependency installation failed.
        Behind a proxy or an internal mirror, point pip at it:
          --index-url https://<mirror>/api/pypi/pypi/simple --trusted-host <mirror>
+       For a private CA:  --cert /etc/pki/tls/certs/ca-bundle.crt
        With no index at all, use install.sh with the bundled wheels/ instead."
 ok "runtime dependencies installed"
 
 if (( RUN_TESTS )) && [[ -f "${PREFIX}/requirements-dev.txt" ]]; then
-    if "${PYBIN}" -m pip install --quiet "${PIP_ARGS[@]}" \
-            -r "${PREFIX}/requirements-dev.txt"; then
+    if pip_run --quiet -r "${PREFIX}/requirements-dev.txt"; then
         ok "test dependencies installed"
     else
         warn "test dependencies unavailable — tests will be skipped"

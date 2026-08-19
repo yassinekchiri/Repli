@@ -157,7 +157,8 @@ bash install-standalone.sh --extract-only ./src    # just unpack the source
 ```
 
 It accepts the same options as `install.sh`, plus `--index-url`,
-`--extra-index-url`, `--trusted-host` and `--pip-timeout`. It must be run as
+`--extra-index-url`, `--trusted-host`, `--pip-timeout` and `--cert`
+(the CA bundle for an index behind a corporate CA — see section 6). It must be run as
 a **file**, not piped (`curl … | bash` leaves nothing to unpack from).
 
 Rebuilding it after a code change — the payload is a snapshot, so it goes
@@ -835,6 +836,36 @@ end of the run for manual deletion.
   or answer over SSH. The current unit starts locked and never prompts; if
   you still have the old one, reinstall or replace it with the unit in
   section 4.4.
+* **`SSLCertVerificationError` from the venv's pip, while the system pip
+  works**: the two do not trust the same certificates. A distro-packaged pip
+  is de-vendored — its `certifi` points at the **system** trust store, which
+  holds your corporate CA. A venv's pip carries its own bundled
+  `pip/_vendor/certifi/cacert.pem`: Mozilla roots only, no corporate CA.
+  Check it yourself:
+
+  ```bash
+  python3            -c 'from pip._vendor import certifi; print(certifi.where())'
+  .venv/bin/python   -c 'from pip._vendor import certifi; print(certifi.where())'
+  ```
+
+  Point pip at the system bundle — globally, so every venv on the host
+  benefits:
+
+  ```bash
+  sudo tee /etc/pip.conf >/dev/null <<'EOF'
+  [global]
+  cert = /etc/pki/tls/certs/ca-bundle.crt
+  EOF
+  ```
+
+  (Debian/Ubuntu: `/etc/ssl/certs/ca-certificates.crt`.) For one venv only,
+  `\.venv/bin/pip config set --site global.cert <bundle>`; for a single
+  command, `PIP_CERT=<bundle> pip install …` or `pip install --cert <bundle>`.
+  `install-standalone.sh` takes `--cert PATH`, and retries against the
+  detected system bundle by itself when it meets this error.
+
+  Prefer this to `--trusted-host`, which does not fix the trust problem — it
+  switches verification off.
 * **`status=203/EXEC` — "Failed to execute command: Permission denied"**:
   systemd could not even spawn `<prefix>/.venv/bin/python`. Find the guilty
   path component:

@@ -843,6 +843,36 @@ listés en fin de run pour suppression manuelle.
   invite que personne ne pouvait voir ni renseigner en SSH. L'unité actuelle
   démarre verrouillée et ne pose aucune question ; si vous avez encore
   l'ancienne, réinstallez ou remplacez-la par celle de la section 4.4.
+* **`SSLCertVerificationError` avec le pip du venv, alors que le pip système
+  fonctionne** : les deux ne font pas confiance aux mêmes certificats. Un pip
+  packagé par la distribution est « dé-vendorisé » — son `certifi` pointe sur
+  le magasin de confiance **système**, qui contient votre CA d'entreprise. Le
+  pip d'un venv embarque son propre `pip/_vendor/certifi/cacert.pem` :
+  racines Mozilla uniquement, pas de CA d'entreprise. À vérifier vous-même :
+
+  ```bash
+  python3            -c 'from pip._vendor import certifi; print(certifi.where())'
+  .venv/bin/python   -c 'from pip._vendor import certifi; print(certifi.where())'
+  ```
+
+  Pointez pip sur le magasin système — globalement, pour que tous les venvs
+  de la machine en profitent :
+
+  ```bash
+  sudo tee /etc/pip.conf >/dev/null <<'EOF'
+  [global]
+  cert = /etc/pki/tls/certs/ca-bundle.crt
+  EOF
+  ```
+
+  (Debian/Ubuntu : `/etc/ssl/certs/ca-certificates.crt`.) Pour un seul venv,
+  `.venv/bin/pip config set --site global.cert <bundle>` ; pour une seule
+  commande, `PIP_CERT=<bundle> pip install …` ou `pip install --cert
+  <bundle>`. `install-standalone.sh` accepte `--cert PATH`, et réessaie tout
+  seul avec le magasin système détecté quand il rencontre cette erreur.
+
+  À préférer à `--trusted-host`, qui ne corrige pas le problème de confiance
+  — il désactive la vérification.
 * **`status=203/EXEC` — « Failed to execute command: Permission denied »** :
   systemd n'a même pas pu lancer `<prefix>/.venv/bin/python`. Identifiez le
   composant fautif du chemin :
