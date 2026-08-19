@@ -92,7 +92,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 130 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 137 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -843,6 +843,19 @@ listés en fin de run pour suppression manuelle.
   invite que personne ne pouvait voir ni renseigner en SSH. L'unité actuelle
   démarre verrouillée et ne pose aucune question ; si vous avez encore
   l'ancienne, réinstallez ou remplacez-la par celle de la section 4.4.
+* **`500 Internal Server Error` sur une action, avec `JSONDecodeError` en bas
+  de la trace** : `creds.json` n'est pas du JSON valide. Le message donne la
+  ligne et la colonne — le plus souvent un `"` ou un `\` non échappé dans le
+  mot de passe. En JSON, un antislash s'écrit `\\` et un guillemet `\"` :
+
+  ```json
+  {"defaults": {"username": "mutrepli", "password": "pa\"ss\\word"}}
+  ```
+
+  Vérifiez le fichier avant de redémarrer :
+  `python3 -m json.tool /chemin/creds.json`. Les versions récentes répondent
+  `503 {"error":"configuration"}` en nommant le fichier, la ligne et la
+  correction, au lieu d'un 500.
 * **`SSLCertVerificationError` avec le pip du venv, alors que le pip système
   fonctionne** : les deux ne font pas confiance aux mêmes certificats. Un pip
   packagé par la distribution est « dé-vendorisé » — son `certifi` pointe sur

@@ -30,7 +30,7 @@ from typing import List, Optional
 from ..config import CredentialsResolver, job_dir
 from ..core.engine import MigrationEngine
 from ..core.jobs import JobStore, JobNotFound
-from ..models import (MigrationParams, OntapError, ConfirmationRequired,
+from ..models import (ConfigError, MigrationParams, OntapError, ConfirmationRequired,
                       PreflightFailed, AuthError, ForbiddenError, Principal,
                       SUPER_ADMIN)
 from ..security import csvio
@@ -508,8 +508,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         resolver = CredentialsResolver(args.config,
                                        username_override=args.api_user,
                                        insecure=args.insecure)
-    except FileNotFoundError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+    except ConfigError as exc:
+        # Same failure the API reports as 503: a file the operator must fix.
+        print(f"ERROR: {exc.message}", file=sys.stderr)
+        if exc.hint:
+            print(f"       {exc.hint}", file=sys.stderr)
         return 1
 
     # Target volume names chosen by the client (qtree -> volume).

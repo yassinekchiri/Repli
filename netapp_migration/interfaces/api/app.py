@@ -28,6 +28,7 @@ follow their console output and final state. One action at a time per job
 import logging
 import os
 import threading
+import traceback
 import uuid
 from typing import Callable, Dict, List, Optional
 
@@ -40,8 +41,9 @@ from fastapi.staticfiles import StaticFiles
 from ...config import CredentialsResolver, job_dir
 from ...core.engine import MigrationEngine
 from ...core.jobs import JobStore, JobNotFound
-from ...models import (MigrationParams, OntapError, ConfirmationRequired,
-                       PreflightFailed, AuthError, ForbiddenError, Principal)
+from ...models import (MigrationParams, OntapError, ConfigError,
+                       ConfirmationRequired, PreflightFailed, AuthError,
+                       ForbiddenError, Principal)
 from ...security.tokens import TokenStore
 from ...security import csvio
 from ...transport import build_client
@@ -101,6 +103,8 @@ def swagger_ui():
         swagger_css_url=f"/static/swagger-ui.css?v={_SWAGGER_UI_VERSION}",
         swagger_favicon_url="/static/favicon-32x32.png",
     )
+
+log = logging.getLogger("netapp_migration.api")
 
 _store = JobStore(job_dir())
 # Unlocked at startup by the launcher (serve.py) with the global token.
@@ -687,6 +691,59 @@ def cleanup_migration(job_id: str, req: CleanupRequest,
 @app.exception_handler(OntapError)
 def ontap_error_handler(_request, exc: OntapError):
     return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
+@app.exception_handler(ConfigError)
+def config_error_handler(_request, exc: ConfigError):
+    """503: the server is misconfigured; no cluster was contacted."""
+    log.error("configuration error: %s", exc.message)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": {"error": "configuration",
+                            "message": exc.message,
+                            "hint": exc.hint,
+                            "path": exc.path}})
+
+
+@app.exception_handler(OSError)
+def os_error_handler(_request, exc: OSError):
+    """503: the server cannot use its own filesystem (job dir, logs...).
+
+    Almost always a permission or ownership problem after an install, so it
+    is worth naming the file rather than returning an opaque 500.
+    """
+    log.error("filesystem error: %s", exc)
+    target = getattr(exc, "filename", "") or ""
+    return JSONResponse(
+        status_code=503,
+        content={"detail": {"error": "filesystem",
+                            "message": f"{exc.strerror or exc}"
+                                       + (f": {target}" if target else ""),
+                            "hint": "check that the API account owns the job "
+                                    "directory and can write it "
+                                    "($NETAPP_MIGRATION_JOB_DIR)",
+                            "path": target}})
+
+
+@app.exception_handler(Exception)
+def unexpected_error_handler(_request, exc: Exception):
+    """Last resort: never let a bare traceback be the API's answer.
+
+    The full traceback goes to the server log with a reference the caller can
+    quote; the caller gets a stable JSON shape naming the exception type,
+    which is enough to tell a bug from a misconfiguration.
+    """
+    reference = uuid.uuid4().hex[:12]
+    log.error("unhandled %s [ref %s]\n%s", type(exc).__name__, reference,
+                 "".join(traceback.format_exception(type(exc), exc,
+                                                    exc.__traceback__)))
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {"error": "internal",
+                            "message": f"{type(exc).__name__}: {exc}",
+                            "reference": reference,
+                            "hint": "the full traceback is in the API log "
+                                    f"under reference {reference}"}})
 
 
 # =============================================================================

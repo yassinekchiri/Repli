@@ -23,7 +23,7 @@ import json
 import os
 from typing import Optional
 
-from .models import ClusterCredentials, OntapError
+from .models import ClusterCredentials, ConfigError, OntapError
 
 ENV_CONFIG = "NETAPP_MIGRATION_CONFIG"
 ENV_USER = "NETAPP_API_USER"
@@ -47,11 +47,38 @@ class CredentialsResolver:
         self._username_override = username_override
         self._insecure = insecure
         path = config_path or os.environ.get(ENV_CONFIG)
+        self.path = path
         if path:
+            # Every failure below is an operator problem with a specific file,
+            # so it is raised as ConfigError with the path and the fix — never
+            # as a bare OSError that would surface as an opaque HTTP 500.
             if not os.path.isfile(path):
-                raise FileNotFoundError(f"Config file not found: {path}")
-            with open(path, "r", encoding="utf-8") as fh:
-                self._config = json.load(fh)
+                raise ConfigError(
+                    f"credentials file not found: {path}",
+                    hint=f"create it (see README section 2.3), or point "
+                         f"${ENV_CONFIG} at the right file",
+                    path=path)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    self._config = json.load(fh)
+            except json.JSONDecodeError as exc:
+                raise ConfigError(
+                    f"credentials file is not valid JSON: {path} "
+                    f"(line {exc.lineno}, column {exc.colno}: {exc.msg})",
+                    hint="a trailing comma or an unquoted value is the usual "
+                         "cause; check with: python3 -m json.tool " + path,
+                    path=path) from exc
+            except OSError as exc:
+                raise ConfigError(
+                    f"cannot read the credentials file {path}: {exc.strerror}",
+                    hint="the API account must be able to read it "
+                         "(mode 600, owned by the service user)",
+                    path=path) from exc
+            if not isinstance(self._config, dict):
+                raise ConfigError(
+                    f"credentials file must contain a JSON object: {path}",
+                    hint='expected {"defaults": {...}, "clusters": {...}}',
+                    path=path)
 
     def __call__(self, cluster: str) -> ClusterCredentials:
         defaults = self._config.get("defaults", {}) or {}

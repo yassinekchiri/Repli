@@ -36,6 +36,21 @@ class OntapError(Exception):
         return msg
 
 
+class ConfigError(Exception):
+    """The tool is misconfigured: no credentials file, or an unusable one.
+
+    Distinct from OntapError, which means a cluster answered badly. This one
+    never reaches a cluster at all, so it must be reported as an operator
+    problem with the file to fix — not as a storage failure.
+    """
+
+    def __init__(self, message: str, hint: str = "", path: str = ""):
+        self.message = message
+        self.hint = hint
+        self.path = path
+        super().__init__(message)
+
+
 class ConfirmationRequired(Exception):
     """Raised by the engine when an action needs an explicit human go-ahead.
 
