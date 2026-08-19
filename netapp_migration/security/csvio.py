@@ -24,7 +24,7 @@ Two files travel between the super admin and the tool:
 
 import csv
 import io
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from ..models import AuthError
 
@@ -34,6 +34,13 @@ SCOPE_COLUMNS = ("qtree", "token", "actions")
 SCOPE_OUTPUT_COLUMNS = ("qtree", "token", "actions", "label", "token_id",
                         "status")
 VOLUME_MAP_COLUMNS = ("qtree", "volume")
+# Third column, optional: the name the qtree takes inside the clone volume.
+# Left out or empty, the qtree keeps the name it has on the source.
+CLONE_MAP_COLUMNS = ("qtree", "volume", "new_qtree")
+# ONTAP rejects these outright; catching them here turns a cluster-side
+# failure halfway through a run into a refusal before anything is created.
+_ILLEGAL_QTREE_CHARS = set('/\\:*?"<>|')
+_MAX_QTREE_NAME = 64
 
 
 def _norm(name: str) -> str:
@@ -125,13 +132,34 @@ def render_scope_csv(results: Sequence[dict]) -> str:
 # Volume-map CSV
 # =============================================================================
 
-def parse_volume_map_csv(text: str) -> Dict[str, str]:
-    """Rows of qtree,volume -> {qtree: target volume name}."""
+def validate_qtree_name(name: str, where: str = "") -> str:
+    """Reject a qtree name ONTAP would refuse, saying why."""
+    prefix = f"{where}: " if where else ""
+    if not name:
+        raise ValueError(f"{prefix}the qtree name is empty")
+    bad = sorted(_ILLEGAL_QTREE_CHARS & set(name))
+    if bad:
+        raise ValueError(f"{prefix}qtree name '{name}' contains "
+                         f"{' '.join(repr(c) for c in bad)} — ONTAP allows "
+                         f"none of / \\ : * ? \" < > |")
+    if len(name) > _MAX_QTREE_NAME:
+        raise ValueError(f"{prefix}qtree name '{name}' is {len(name)} "
+                         f"characters, the maximum is {_MAX_QTREE_NAME}")
+    return name
+
+
+def parse_clone_map_csv(text: str) -> Dict[str, dict]:
+    """Rows of qtree,volume[,new_qtree] -> {qtree: {volume, new_qtree}}.
+
+    The third column is optional, both as a header and per row: an empty
+    new_qtree means the qtree keeps its current name inside the clone.
+    """
     rows = _read_rows(text, VOLUME_MAP_COLUMNS, "volume map")
-    mapping: Dict[str, str] = {}
-    volumes = {}
+    mapping: Dict[str, dict] = {}
+    volumes: Dict[str, str] = {}
     for row in rows:
         qtree, volume = row.get("qtree", ""), row.get("volume", "")
+        new_qtree = row.get("new_qtree", "")
         if not qtree:
             raise ValueError(f"line {row['_line']}: the qtree column is empty")
         if not volume:
@@ -145,17 +173,56 @@ def parse_volume_map_csv(text: str) -> Dict[str, str]:
                 f"line {row['_line']}: volume name '{volume}' is already used "
                 f"for qtree '{volumes[volume.lower()]}' — each qtree needs a "
                 f"distinct target volume")
+        if new_qtree:
+            validate_qtree_name(new_qtree, f"line {row['_line']}")
         volumes[volume.lower()] = qtree
-        mapping[qtree] = volume
+        mapping[qtree] = {"volume": volume, "new_qtree": new_qtree}
     return mapping
 
 
-def render_volume_map_csv(mapping: Dict[str, str]) -> str:
+def parse_volume_map_csv(text: str) -> Dict[str, str]:
+    """Rows of qtree,volume -> {qtree: target volume name}.
+
+    The volume half of parse_clone_map_csv, kept for callers that do not
+    care about renaming.
+    """
+    return {qtree: entry["volume"]
+            for qtree, entry in parse_clone_map_csv(text).items()}
+
+
+def split_clone_map(mapping: Optional[Dict[str, dict]]):
+    """{qtree: {volume, new_qtree}} -> ({qtree: volume}, {qtree: new_qtree}).
+
+    Two flat dicts is what the engine and the job files carry: it keeps job
+    files written by older versions readable, since they only ever held the
+    volume half.
+    """
+    volumes: Dict[str, str] = {}
+    renames: Dict[str, str] = {}
+    for qtree, entry in (mapping or {}).items():
+        if isinstance(entry, str):                 # tolerate the flat form
+            volumes[qtree] = entry
+            continue
+        if entry.get("volume"):
+            volumes[qtree] = entry["volume"]
+        if entry.get("new_qtree"):
+            renames[qtree] = entry["new_qtree"]
+    return volumes, renames
+
+
+def render_volume_map_csv(mapping: Dict[str, str],
+                          renames: Optional[Dict[str, str]] = None) -> str:
+    """Render the map; the third column appears only when a rename exists."""
+    renames = renames or {}
+    columns = CLONE_MAP_COLUMNS if renames else VOLUME_MAP_COLUMNS
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
-    writer.writerow(VOLUME_MAP_COLUMNS)
+    writer.writerow(columns)
     for qtree, volume in mapping.items():
-        writer.writerow([qtree, volume])
+        row = [qtree, volume]
+        if renames:
+            row.append(renames.get(qtree, ""))
+        writer.writerow(row)
     return out.getvalue()
 
 

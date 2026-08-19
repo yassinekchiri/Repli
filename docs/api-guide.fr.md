@@ -255,17 +255,27 @@ Puis lancez :
 
 ![Exécution de test](images/14-test.png)
 
-`volume_map` donne, pour chaque qtree, le nom du volume à créer — c'est le
-client qui le choisit, rien n'est généré automatiquement. C'est obligatoire :
-un qtree sans nom échoue au pré-vol avec `VOLUME_MAP_MISSING`. Un `clone`
-ultérieur hérite du mapping enregistré dans le fichier de job par `test`, il
-n'est donc à répéter que s'il change. Trois formes sont acceptées, au choix :
+`volume_map` donne, pour chaque qtree, le nom du volume à créer et —
+facultativement — le nom que prend le qtree lui-même dans ce volume. C'est le
+client qui choisit les deux, rien n'est généré automatiquement. Le volume est
+obligatoire : un qtree sans volume échoue au pré-vol avec
+`VOLUME_MAP_MISSING`. Le renommage est optionnel : sans lui, le qtree garde
+son nom d'origine. Un `clone` ultérieur hérite de ce que `test` a enregistré
+dans le fichier de job, il n'est donc à répéter que s'il change. Quatre
+formes sont acceptées, au choix :
 
 ```json
 {"volume_map": {"q_finance": "vol_fin_prod"}}
-{"volume_map": [{"qtree": "q_finance", "volume": "vol_fin_prod"}]}
-{"volume_map": "qtree,volume\nq_finance,vol_fin_prod\n"}
+{"volume_map": {"q_finance": {"volume": "vol_fin_prod", "new_qtree": "finance"}}}
+{"volume_map": [{"qtree": "q_finance", "volume": "vol_fin_prod", "new_qtree": "finance"}]}
+{"volume_map": "qtree,volume,new_qtree\nq_finance,vol_fin_prod,finance\n"}
 ```
+
+Le renommage est appliqué sur le **clone PROD uniquement** (le clone DR est
+une destination de miroir, donc en lecture seule) et **avant** la création du
+miroir entre clones, pour que le premier resync porte le nouveau nom jusqu'à
+la DR. Un nom déjà utilisé par le volume source est refusé en amont avec
+`QTREE_NAME_TAKEN` — un clone hérite de tous les qtrees de son parent.
 
 `validity_days` (7 par défaut) enregistre la date d'expiration de
 l'environnement de test.

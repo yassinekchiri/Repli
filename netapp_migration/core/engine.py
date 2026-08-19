@@ -661,9 +661,13 @@ class MigrationEngine:
             self.log.info("         '%s'  created on PROD and DR.", clone_vol)
 
     def _save_clone_metadata(self, job: Optional[dict],
-                             volume_map: Dict[str, str], qtrees: List[str]):
+                             volume_map: Dict[str, str], qtrees: List[str],
+                             renames: Optional[Dict[str, str]] = None):
         if job is not None:
             job["volume_map"] = {q: volume_map[q] for q in qtrees}
+            if renames:
+                job["qtree_map"] = {q: renames[q] for q in qtrees
+                                    if q in renames}
             job["clone_volumes"] = [volume_map[q] for q in qtrees]
             job["test_env"] = False    # definitive clones, not a test env
             self.jobs.save(job)
@@ -691,6 +695,48 @@ class MigrationEngine:
                     f"volume_map field of the API request)")
             resolved[qtree] = name
         return resolved
+
+    def _resolve_qtree_map(self, qtrees: List[str],
+                           qtree_map: Optional[Dict[str, str]],
+                           job: Optional[dict]) -> Dict[str, str]:
+        """New qtree name per qtree, chosen by the client. Optional.
+
+        A qtree absent from the map keeps the name it has on the source.
+        Falls back to what a previous test run recorded, so a promotion
+        reuses the very same names.
+        """
+        mapping = dict((job or {}).get("qtree_map") or {})
+        mapping.update({k: v for k, v in (qtree_map or {}).items() if v})
+        resolved = {}
+        for qtree in qtrees:
+            name = mapping.get(qtree) or next(
+                (v for k, v in mapping.items() if k.lower() == qtree.lower()),
+                None)
+            if name and name != qtree:
+                resolved[qtree] = name
+        return resolved
+
+    def _rename_qtrees_in_clones(self, qtrees: List[str],
+                                 volumes: Dict[str, str],
+                                 renames: Dict[str, str]):
+        """Rename inside the PROD clones only.
+
+        The DR clone is a SnapMirror destination, hence read-only: renaming
+        there is impossible and unnecessary. Done BEFORE the clone mirror is
+        established so the very first resync carries the new name to DR,
+        instead of leaving the two sides differing until the next update.
+        """
+        if not renames:
+            return
+        p = self.p
+        for qtree in qtrees:
+            new_name = renames.get(qtree)
+            if not new_name:
+                continue
+            self.c.rename_qtree(p.dest_cluster, p.dest_vserver,
+                                volumes[qtree], qtree, new_name)
+            self.log.info("         '%s'  qtree %s -> %s.",
+                          volumes[qtree], qtree, new_name)
 
     def _promote_test_env(self, qtrees_arg: str, job: dict) -> dict:
         """Promote the existing TEST environment to the definitive one.
@@ -791,7 +837,8 @@ class MigrationEngine:
     # =====================================================================
     def clone(self, qtrees_arg: str, job: Optional[dict] = None,
               fresh: bool = False,
-              volume_map: Optional[Dict[str, str]] = None) -> dict:
+              volume_map: Optional[Dict[str, str]] = None,
+              qtree_map: Optional[Dict[str, str]] = None) -> dict:
         """Definitive clones.
 
         Three modes:
@@ -812,7 +859,7 @@ class MigrationEngine:
             # set, or a clone on an unhealthy cascade, is refused up front.
             self._preflight(self.checker.for_clone(
                 job, self._resolve_qtrees(qtrees_arg), fresh=fresh,
-                volume_map=volume_map))
+                volume_map=volume_map, qtree_map=qtree_map))
             if job.get("test_env") and job.get("clone_volumes"):
                 if not fresh:
                     return self._promote_test_env(qtrees_arg, job)
@@ -837,8 +884,10 @@ class MigrationEngine:
         snap_name = f"clone_migr_{stamp}"
         mapping = self._resolve_volume_map(
             qtrees, volume_map, None if fresh else job)
-        self._log_table(["Qtree", "Target volume"],
-                        [[q, mapping[q]] for q in qtrees])
+        renames = self._resolve_qtree_map(
+            qtrees, qtree_map, None if fresh else job)
+        self._log_table(["Qtree", "Target volume", "Qtree in the clone"],
+                        [[q, mapping[q], renames.get(q, q)] for q in qtrees])
 
         # Steps 1-3: snapshot + cascade propagation + verification.
         self._propagate_snapshot(snap_name, step_offset=1, total_steps=7)
@@ -846,6 +895,12 @@ class MigrationEngine:
         # Step 4: FlexClones on PROD and DR.
         self.log.info(">> [4/7]  Creating FlexClone volumes on PROD and DR")
         self._create_clones_on_both(qtrees, snap_name, mapping)
+
+        # Step 4b: rename inside the PROD clones, before the mirror exists,
+        # so the first resync carries the new names to DR.
+        if renames:
+            self.log.info(">> [4/7]  Renaming qtrees inside the PROD clones")
+            self._rename_qtrees_in_clones(qtrees, mapping, renames)
 
         # Step 5: SnapMirror between the clones + resync.
         self.log.info(">> [5/7]  SnapMirror (clone PROD -> clone DR) + resync")
@@ -887,15 +942,15 @@ class MigrationEngine:
             self.log.info("         '%s'  move launched  PROD -> %s  /  "
                           "DR -> %s.", clone_vol, prod_aggr, dr_aggr)
 
-        self._save_clone_metadata(job, mapping, qtrees)
+        self._save_clone_metadata(job, mapping, qtrees, renames)
 
         self.log.info("=" * 60)
         self.log.info("  Volume moves launched for %d clone(s). Exiting.",
                       len(qtrees))
         self.log.info("")
-        self._log_table(["Qtree", "Clone volume", "PROD aggregate",
-                         "DR aggregate"],
-                        [[q, mapping[q], prod_aggr, dr_aggr]
+        self._log_table(["Qtree", "Clone volume", "Qtree in the clone",
+                         "PROD aggregate", "DR aggregate"],
+                        [[q, mapping[q], renames.get(q, q), prod_aggr, dr_aggr]
                          for q in qtrees])
         self.log.info("")
         self.log.info("  Monitor moves: volume move show -vserver %s / %s",
@@ -916,6 +971,7 @@ class MigrationEngine:
                                   svm, vol, svm, vol)
         self.log.info("=" * 60)
         return {"volume_map": {q: mapping[q] for q in qtrees},
+                "qtree_map": dict(renames),
                 "clone_volumes": [mapping[q] for q in qtrees],
                 "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr,
                 "abandoned_test_env": old_test_env}
@@ -925,7 +981,8 @@ class MigrationEngine:
     # =====================================================================
     def test(self, qtrees_arg: str, job: Optional[dict] = None,
              validity_days: int = 7,
-             volume_map: Optional[Dict[str, str]] = None) -> dict:
+             volume_map: Optional[Dict[str, str]] = None,
+             qtree_map: Optional[Dict[str, str]] = None) -> dict:
         """Full TEST environment: everything except the split / volume move.
 
         Builds the exact future production layout so the client can validate
@@ -958,14 +1015,16 @@ class MigrationEngine:
         # qtrees existing and unique, peering/policy for the clone mirror.
         qtrees = self._resolve_qtrees(qtrees_arg)
         self._preflight(self.checker.for_test(job or {}, qtrees,
-                                              volume_map=volume_map))
+                                              volume_map=volume_map,
+                                              qtree_map=qtree_map))
         self.log.info("Qtrees (%d): %s", len(qtrees), ", ".join(qtrees))
 
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         snap_name = f"test_migr_{stamp}"
         mapping = self._resolve_volume_map(qtrees, volume_map, job)
-        self._log_table(["Qtree", "Target volume"],
-                        [[q, mapping[q]] for q in qtrees])
+        renames = self._resolve_qtree_map(qtrees, qtree_map, job)
+        self._log_table(["Qtree", "Target volume", "Qtree in the clone"],
+                        [[q, mapping[q], renames.get(q, q)] for q in qtrees])
 
         # Steps 1-3: snapshot + cascade propagation + verification.
         self._propagate_snapshot(snap_name, step_offset=1, total_steps=6)
@@ -973,6 +1032,13 @@ class MigrationEngine:
         # Step 4: FlexClones on future PROD and future DR.
         self.log.info(">> [4/6]  Creating thin FlexClone volumes on PROD and DR")
         self._create_clones_on_both(qtrees, snap_name, mapping)
+
+        # Step 4b: rename inside the PROD clones, before the mirror exists,
+        # so the first resync carries the new names to DR. The test
+        # environment must show the client the names production will have.
+        if renames:
+            self.log.info(">> [4/6]  Renaming qtrees inside the PROD clones")
+            self._rename_qtrees_in_clones(qtrees, mapping, renames)
 
         # Step 5: SnapMirror between the clones + resync (like production).
         self.log.info(">> [5/6]  SnapMirror (clone PROD -> clone DR) + resync")
@@ -997,6 +1063,7 @@ class MigrationEngine:
         expires = created + datetime.timedelta(days=validity_days)
         if job is not None:
             job["volume_map"] = {q: mapping[q] for q in qtrees}
+            job["qtree_map"] = {q: renames[q] for q in qtrees if q in renames}
             job["clone_volumes"] = [mapping[q] for q in qtrees]
             job["test_env"] = True
             job["test_qtrees"] = qtrees

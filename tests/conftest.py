@@ -185,7 +185,13 @@ class FakeClient(OntapClient):
         self.calls.append(f"export_policy {volume}/{qtree}={policy}")
 
     def rename_qtree(self, cluster, svm, volume, qtree, new_name):
-        self.calls.append(f"rename_qtree {volume}/{qtree} -> {new_name}")
+        # Cluster included: renaming must happen on PROD only — the DR
+        # clone is a mirror destination and therefore read-only.
+        self.calls.append(f"rename_qtree {cluster} {volume}/{qtree} "
+                          f"-> {new_name}")
+        qtrees = self.qtrees.setdefault((cluster, svm, volume), [])
+        if qtree in qtrees:
+            qtrees[qtrees.index(qtree)] = new_name
 
     # ---- CIFS ----------------------------------------------------------- #
     def find_cifs_shares(self, cluster, svm, path_fragment) -> List[str]:

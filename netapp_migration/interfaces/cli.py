@@ -133,8 +133,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", action="store_true",
                         help="(resume) skip the interactive confirmation.")
     parser.add_argument("--volume-map",
-                        help="(test / clone) CSV mapping each qtree to the "
-                             "target volume name: header 'qtree,volume'.")
+                        help="(test / clone) CSV naming, per qtree, the target "
+                             "volume and optionally the qtree's new name "
+                             "inside it: header 'qtree,volume[,new_qtree]'.")
 
     # Authentication
     parser.add_argument("--token",
@@ -515,17 +516,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"       {exc.hint}", file=sys.stderr)
         return 1
 
-    # Target volume names chosen by the client (qtree -> volume).
+    # Names chosen by the client: the target volume per qtree, and
+    # optionally the name the qtree takes inside it.
     volume_map = None
+    qtree_map = None
     if args.volume_map:
         try:
-            volume_map = csvio.parse_volume_map_csv(
+            clone_map = csvio.parse_clone_map_csv(
                 csvio.read_file(args.volume_map))
         except (OSError, ValueError) as exc:
             logger.error("Cannot read --volume-map: %s", exc)
             return 1
+        volume_map, qtree_map = csvio.split_clone_map(clone_map)
         logger.info("Volume mapping: %s",
                     ", ".join(f"{k} -> {v}" for k, v in volume_map.items()))
+        if qtree_map:
+            logger.info("Qtree renaming: %s",
+                        ", ".join(f"{k} -> {v}" for k, v in qtree_map.items()))
 
     client = build_client(params, logger, resolver)
     engine = MigrationEngine(client, params, store, logger)
@@ -543,11 +550,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             if job is None:
                 engine.check_clone_prerequisites()
             engine.clone(args.qtrees, job=job, fresh=args.fresh,
-                         volume_map=volume_map)
+                         volume_map=volume_map, qtree_map=qtree_map)
         elif args.action == "test":
             engine.test(args.qtrees, job=job,
                         validity_days=args.test_validity_days,
-                        volume_map=volume_map)
+                        volume_map=volume_map, qtree_map=qtree_map)
         elif args.action == "acl":
             engine.acl(args.ad_groups, acl_path=args.acl_path,
                        acl_rights=args.acl_rights, job=job)

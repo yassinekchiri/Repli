@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 from ..models import (CheckResult, MigrationParams, OntapError,
                       PreflightReport, SEVERITY_ERROR, SEVERITY_WARNING,
                       SnapMirrorInfo)
+from ..security import csvio
 from ..transport.base import OntapClient
 from .jobs import CREATE_STATUS_ORDER
 
@@ -410,6 +411,79 @@ class PreflightChecker:
                           target=target)
         return normalised
 
+    def _check_qtree_map(self, report: PreflightReport,
+                         qtrees: Sequence[str],
+                         qtree_map: Optional[Dict[str, str]],
+                         job: Optional[dict]):
+        """Renaming a qtree inside its clone: optional, but must be possible.
+
+        The clone is a copy of the source volume, so it starts out holding
+        every qtree the source holds. A new name that already exists there
+        would make ONTAP refuse the rename halfway through the run, after
+        the clones have been created — hence the check up front.
+        """
+        p = self.p
+        mapping = dict((job or {}).get("qtree_map") or {})
+        mapping.update({k: v for k, v in (qtree_map or {}).items() if v})
+        lowered = {k.lower(): v for k, v in mapping.items()}
+
+        renames: Dict[str, str] = {}
+        for qtree in qtrees:
+            name = mapping.get(qtree) or lowered.get(qtree.lower())
+            if name and name != qtree:
+                renames[qtree] = name
+        if not renames:
+            return                      # renaming is opt-in: nothing to check
+
+        for qtree, name in sorted(renames.items()):
+            try:
+                csvio.validate_qtree_name(name)
+                legal, why = True, ""
+            except ValueError as exc:
+                legal, why = False, str(exc)
+            self._add(report, "QTREE_NAME_ILLEGAL",
+                      f"'{name}' is a valid qtree name", legal,
+                      detail=why or f"qtree '{qtree}' -> '{name}'",
+                      hint="ONTAP forbids / \\ : * ? \" < > | and names "
+                           "longer than 64 characters" if not legal else "")
+
+        # Two qtrees of the same source volume renamed identically would
+        # collide the moment they landed in the same clone; they land in
+        # different clones here, but the source names must still be distinct.
+        collisions = sorted({v for v in renames.values()
+                             if list(renames.values()).count(v) > 1})
+        self._add(report, "QTREE_NAME_DUPLICATE",
+                  "New qtree names are distinct", not collisions,
+                  detail=f"reused: {', '.join(collisions)}" if collisions
+                         else "all distinct",
+                  hint="give each qtree its own new name" if collisions else "")
+
+        # A clone inherits every qtree of the source volume: the new name
+        # must not be one of them, or the rename cannot happen.
+        existing, err = self._safe(
+            lambda: self.c.list_qtrees(p.source_cluster, p.source_vserver,
+                                       p.volume), None)
+        if existing is None:
+            self._add(report, "QTREE_LIST_UNREADABLE",
+                      "Source qtrees readable", False,
+                      severity=SEVERITY_WARNING,
+                      detail=err or "could not list the source qtrees",
+                      hint="grant readonly on /api/storage/qtrees",
+                      target=f"{p.source_cluster} / {p.volume}")
+            return
+        present = {q.lower() for q in existing}
+        for qtree, name in sorted(renames.items()):
+            free = name.lower() not in present or name.lower() == qtree.lower()
+            self._add(report, "QTREE_NAME_TAKEN",
+                      f"'{name}' is free inside the clone", free,
+                      detail=f"the source volume already holds a qtree named "
+                             f"'{name}'" if not free
+                             else f"qtree '{qtree}' -> '{name}'",
+                      hint="the clone inherits every qtree of the source "
+                           "volume: pick a name none of them uses"
+                           if not free else "",
+                      target=f"{p.dest_cluster} / {p.volume}")
+
     def _check_volume_map(self, report: PreflightReport,
                           qtrees: Sequence[str],
                           volume_map: Optional[Dict[str, str]],
@@ -698,7 +772,8 @@ class PreflightChecker:
                                            job["dr_dest_path"], "DR")
 
     def for_test(self, job: dict, qtrees: Sequence[str],
-                 volume_map: Optional[Dict[str, str]] = None) -> PreflightReport:
+                 volume_map: Optional[Dict[str, str]] = None,
+                 qtree_map: Optional[Dict[str, str]] = None) -> PreflightReport:
         p = self.p
         report = self._report("test")
         status = job.get("status", "unknown")
@@ -727,6 +802,7 @@ class PreflightChecker:
 
         normalised = self._check_qtrees(report, qtrees)
         self._check_volume_map(report, normalised, volume_map, job)
+        self._check_qtree_map(report, normalised, qtree_map, job)
 
         # The clone mirror PROD -> DR needs its own peering, policy and
         # schedule on the DR cluster.
@@ -740,7 +816,8 @@ class PreflightChecker:
 
     def for_clone(self, job: dict, qtrees: Sequence[str],
                   fresh: bool = False,
-                  volume_map: Optional[Dict[str, str]] = None) -> PreflightReport:
+                  volume_map: Optional[Dict[str, str]] = None,
+                  qtree_map: Optional[Dict[str, str]] = None) -> PreflightReport:
         p = self.p
         report = self._report("clone")
         promoting = bool(job.get("test_env") and job.get("clone_volumes")
@@ -804,6 +881,8 @@ class PreflightChecker:
             normalised = self._check_qtrees(report, qtrees)
             self._check_volume_map(report, normalised, volume_map,
                                    None if fresh else job)
+            self._check_qtree_map(report, normalised, qtree_map,
+                                  None if fresh else job)
             self._check_peering(report, p.dr_cluster, p.dr_vserver,
                                 p.dest_cluster, p.dest_vserver,
                                 "clone PROD -> clone DR")

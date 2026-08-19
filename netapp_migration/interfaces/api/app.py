@@ -518,6 +518,7 @@ def preflight_action(job_id: str, action: str,
     params = _store.params_of(job)
     req = req or PreflightActionRequest()
     mapping = req.mapping
+    renames = req.qtree_mapping
     qtree_list = req.qtrees_csv
 
     # Checking feasibility is itself scoped: a token may only probe what it
@@ -542,10 +543,11 @@ def preflight_action(job_id: str, action: str,
     elif action == "retry":
         report = checker.for_retry(job)
     elif action == "test":
-        report = checker.for_test(job, qtree_list, volume_map=mapping)
+        report = checker.for_test(job, qtree_list, volume_map=mapping,
+                                  qtree_map=renames)
     elif action == "clone":
         report = checker.for_clone(job, qtree_list, fresh=req.fresh,
-                                   volume_map=mapping)
+                                   volume_map=mapping, qtree_map=renames)
     elif action == "acl":
         report = checker.for_acl(job, req.acl_path or "", req.ad_groups_list,
                                  "full-control")
@@ -607,16 +609,18 @@ def test_migration(job_id: str, req: TestRequest,
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
     mapping = req.mapping
+    renames = req.qtree_mapping
     _authorise(principal, "test", _requested_qtrees(params, req.qtrees_csv,
                                                     mapping))
     _ensure_feasible(params, "test",
                      lambda ch: ch.for_test(job, req.qtrees_csv,
-                                            volume_map=mapping))
+                                            volume_map=mapping,
+                                            qtree_map=renames))
 
     def target(logger):
         engine = _engine_for(params, logger)
         engine.test(req.qtrees_csv, job=job, validity_days=req.validity_days,
-                    volume_map=mapping)
+                    volume_map=mapping, qtree_map=renames)
 
     _run_in_background(job_id, "test", target)
     return ActionAccepted(job_id=job_id, action="test",
@@ -637,17 +641,19 @@ def clone_migration(job_id: str, req: CloneRequest,
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
     mapping = req.mapping or dict(job.get("volume_map") or {})
+    renames = req.qtree_mapping or dict(job.get("qtree_map") or {})
     _authorise(principal, "clone", _requested_qtrees(params, req.qtrees_csv,
                                                      mapping))
     _ensure_feasible(params, "clone",
                      lambda ch: ch.for_clone(job, req.qtrees_csv,
                                              fresh=req.fresh,
-                                             volume_map=mapping))
+                                             volume_map=mapping,
+                                             qtree_map=renames))
 
     def target(logger):
         engine = _engine_for(params, logger)
         engine.clone(req.qtrees_csv, job=job, fresh=req.fresh,
-                     volume_map=mapping)
+                     volume_map=mapping, qtree_map=renames)
 
     _run_in_background(job_id, "clone", target)
     return ActionAccepted(job_id=job_id, action="clone",

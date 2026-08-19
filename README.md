@@ -91,7 +91,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 137 tests, offline, no cluster contacted
+python3 -m pytest            # 152 tests, offline, no cluster contacted
 ```
 
 ---
@@ -508,14 +508,25 @@ python3 netapp_cascade_migration.py --action test --job-id <ID> \
     --qtrees q_fin,q_hr --volume-map volumes.csv --test-validity-days 7
 ```
 
-`--volume-map` is a CSV naming the target volume of each qtree — the client
-chooses these names, nothing is generated:
+`--volume-map` is a CSV naming, for each qtree, the volume to create and —
+optionally — the name the qtree itself takes inside that volume. The client
+chooses both; nothing is generated:
 
 ```csv
-qtree,volume
-q_fin,vol_finance_prod
-q_hr,vol_rh_prod
+qtree,volume,new_qtree
+q_fin,vol_finance_prod,finance
+q_hr,vol_rh_prod,
 ```
+
+The third column is optional, as a header and per row: leave it empty and the
+qtree keeps the name it has on the source. A two-column file written for an
+earlier version still works.
+
+The rename happens on the **PROD clone only** — the DR clone is a SnapMirror
+destination and therefore read-only — and **before** the clone mirror is
+established, so the first resync carries the new name to DR. A name that the
+source volume already uses is refused by the pre-flight (`QTREE_NAME_TAKEN`)
+before anything is created: a clone inherits every qtree of its parent.
 
 Builds the **complete** target environment **except the split / volume
 move**: FlexClones `v_<qtree>_<uid>` on the future PROD **and** the future

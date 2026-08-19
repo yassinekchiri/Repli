@@ -251,17 +251,26 @@ Then run it:
 
 ![Running test](images/14-test.png)
 
-`volume_map` gives, for each qtree, the name of the volume to create — the
-client chooses it, nothing is auto-generated. It is required: a qtree without
-a name fails pre-flight with `VOLUME_MAP_MISSING`. A later `clone` inherits
-the mapping recorded in the job file by `test`, so it only needs repeating
-when it changes. Three shapes are accepted, pick whichever is convenient:
+`volume_map` gives, for each qtree, the name of the volume to create and —
+optionally — the name the qtree itself takes inside that volume. The client
+chooses both; nothing is auto-generated. The volume is required: a qtree
+without one fails pre-flight with `VOLUME_MAP_MISSING`. The rename is
+opt-in: leave it out and the qtree keeps its source name. A later `clone`
+inherits what `test` recorded in the job file, so it only needs repeating
+when it changes. Four shapes are accepted, pick whichever is convenient:
 
 ```json
 {"volume_map": {"q_finance": "vol_fin_prod"}}
-{"volume_map": [{"qtree": "q_finance", "volume": "vol_fin_prod"}]}
-{"volume_map": "qtree,volume\nq_finance,vol_fin_prod\n"}
+{"volume_map": {"q_finance": {"volume": "vol_fin_prod", "new_qtree": "finance"}}}
+{"volume_map": [{"qtree": "q_finance", "volume": "vol_fin_prod", "new_qtree": "finance"}]}
+{"volume_map": "qtree,volume,new_qtree\nq_finance,vol_fin_prod,finance\n"}
 ```
+
+The rename is applied on the **PROD clone only** (the DR clone is a mirror
+destination, hence read-only) and **before** the clone mirror is created, so
+the first resync carries the new name to DR. A name the source volume already
+uses is refused up front with `QTREE_NAME_TAKEN` — a clone inherits every
+qtree of its parent.
 
 `validity_days` (default 7) records when the test environment expires.
 

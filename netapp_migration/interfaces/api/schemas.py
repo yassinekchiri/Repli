@@ -39,37 +39,70 @@ class ResumeRequest(BaseModel):
     confirm: bool = False
 
 
-def _mapping(value) -> Dict[str, str]:
-    """Accept {"q": "vol"} or [{"qtree": "q", "volume": "vol"}] or CSV text."""
+def _clone_map(value) -> Dict[str, dict]:
+    """Normalise every accepted shape into {qtree: {volume, new_qtree}}.
+
+    The rename half is optional everywhere: a plain string value, or a row
+    without new_qtree, means the qtree keeps the name it has on the source.
+    """
     if not value:
         return {}
-    if isinstance(value, dict):
-        return {str(k).strip(): str(v).strip() for k, v in value.items()}
     if isinstance(value, str):
-        from ...security.csvio import parse_volume_map_csv
-        return parse_volume_map_csv(value)
-    out: Dict[str, str] = {}
+        from ...security.csvio import parse_clone_map_csv
+        return parse_clone_map_csv(value)
+
+    out: Dict[str, dict] = {}
+    if isinstance(value, dict):
+        for qtree, entry in value.items():
+            key = str(qtree).strip()
+            if isinstance(entry, dict):
+                volume = (entry.get("volume") or entry.get("volume_name") or "")
+                rename = (entry.get("new_qtree") or entry.get("qtree")
+                          or entry.get("qtree_name") or "")
+            else:
+                volume, rename = str(entry), ""
+            out[key] = {"volume": str(volume).strip(),
+                        "new_qtree": str(rename).strip()}
+        return out
+
     for item in value:
-        if isinstance(item, dict):
-            qtree = item.get("qtree") or item.get("q")
-            volume = item.get("volume") or item.get("volume_name")
-            if qtree and volume:
-                out[str(qtree).strip()] = str(volume).strip()
+        if not isinstance(item, dict):
+            continue
+        qtree = item.get("qtree") or item.get("q")
+        volume = item.get("volume") or item.get("volume_name")
+        rename = item.get("new_qtree") or item.get("qtree_name") or ""
+        if qtree and volume:
+            out[str(qtree).strip()] = {"volume": str(volume).strip(),
+                                       "new_qtree": str(rename).strip()}
     return out
+
+
+def _mapping(value) -> Dict[str, str]:
+    """The volume half only, for callers that do not rename."""
+    return {qtree: entry["volume"]
+            for qtree, entry in _clone_map(value).items()
+            if entry.get("volume")}
 
 
 class QtreesRequest(BaseModel):
     """Payload of the qtree-scoped actions.
 
-    volume_map gives the target volume name chosen by the client for each
-    qtree. Three shapes are accepted:
+    volume_map says, per qtree, the name of the volume to create and —
+    optionally — the name the qtree itself takes inside that volume. Leave
+    the second one out and the qtree keeps its source name.
 
         {"volume_map": {"q_fin": "vol_finance_prod"}}
-        {"volume_map": [{"qtree": "q_fin", "volume": "vol_finance_prod"}]}
-        {"volume_map": "qtree,volume\nq_fin,vol_finance_prod\n"}
+
+        {"volume_map": {"q_fin": {"volume": "vol_finance_prod",
+                                  "new_qtree": "finance"}}}
+
+        {"volume_map": [{"qtree": "q_fin", "volume": "vol_finance_prod",
+                         "new_qtree": "finance"}]}
+
+        {"volume_map": "qtree,volume,new_qtree\nq_fin,vol_finance_prod,finance\n"}
     """
     qtrees: Union[str, List[str]]
-    volume_map: Union[Dict[str, str], List[dict], str, None] = None
+    volume_map: Union[Dict[str, Union[str, dict]], List[dict], str, None] = None
 
     @property
     def qtrees_csv(self) -> str:
@@ -78,6 +111,13 @@ class QtreesRequest(BaseModel):
     @property
     def mapping(self) -> Dict[str, str]:
         return _mapping(self.volume_map)
+
+    @property
+    def qtree_mapping(self) -> Dict[str, str]:
+        """{qtree: new name inside the clone}; empty when nothing is renamed."""
+        return {qtree: entry["new_qtree"]
+                for qtree, entry in _clone_map(self.volume_map).items()
+                if entry.get("new_qtree")}
 
 
 class TestRequest(QtreesRequest):
@@ -136,7 +176,7 @@ class PreflightCreateRequest(CreateMigrationRequest):
 class PreflightActionRequest(BaseModel):
     """Optional body of POST /migrations/{id}/preflight/{action}."""
     qtrees: Union[str, List[str], None] = None
-    volume_map: Union[Dict[str, str], List[dict], str, None] = None
+    volume_map: Union[Dict[str, Union[str, dict]], List[dict], str, None] = None
     acl_path: Optional[str] = None
     ad_groups: Union[str, List[str], None] = None
     qtree: Optional[str] = None
@@ -149,6 +189,12 @@ class PreflightActionRequest(BaseModel):
     @property
     def mapping(self) -> Dict[str, str]:
         return _mapping(self.volume_map)
+
+    @property
+    def qtree_mapping(self) -> Dict[str, str]:
+        return {qtree: entry["new_qtree"]
+                for qtree, entry in _clone_map(self.volume_map).items()
+                if entry.get("new_qtree")}
 
     @property
     def ad_groups_list(self) -> List[str]:
