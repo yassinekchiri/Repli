@@ -6,6 +6,7 @@ purpose: this one installs nothing. It carries every tracked file except the
 wheels/ directory, unpacks itself into a directory of your choosing, and
 stops.
 
+    python3 tools/build_standalone_installer.py   # first: it is embedded
     python3 tools/build_selfextract.py
 
 `git ls-files` decides *which* paths ship, so build artefacts, caches and
