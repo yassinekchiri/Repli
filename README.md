@@ -51,9 +51,13 @@ netapp_cascade_migration.py # CLI entry point (historical compatibility)
 requirements.txt
 install.sh                  # installer, offline, needs the checkout + wheels/
 install-standalone.sh       # installer, ONE self-contained file (generated)
+repo-selfextract.sh         # the whole repo in one file, extracts only (generated)
 tools/
+├── payload.py              # shared packing machinery for both of the above
 ├── installer_template.sh   # body of install-standalone.sh
-├── build_standalone_installer.py  # embeds the source into that body
+├── build_standalone_installer.py
+├── selfextract_template.sh # body of repo-selfextract.sh
+├── build_selfextract.py
 └── capture_swagger_guide.py     # regenerates docs/api-guide.md screenshots
 docs/
 ├── api-guide.md            # illustrated Swagger UI walkthrough (+ .fr.md)
@@ -165,6 +169,40 @@ python3 tools/build_standalone_installer.py
 
 The build is deterministic: an unchanged tree produces a byte-identical
 script, so `git status` stays quiet when nothing really changed.
+
+### 2.2a-bis Moving the repository itself (no install)
+
+`repo-selfextract.sh` carries the **whole repository** in one runnable file —
+everything except `wheels/` and the git history. It installs nothing: it
+unpacks and stops. Use it to get the sources onto a machine that cannot reach
+the code repository, when what you want is the tree rather than a running
+service.
+
+```bash
+bash repo-selfextract.sh                  # extract into ./netapp-migration
+bash repo-selfextract.sh --into /opt/src  # somewhere else
+bash repo-selfextract.sh --list           # show the contents, extract nothing
+bash repo-selfextract.sh --check          # verify integrity only
+bash repo-selfextract.sh --sha256         # print the payload digest
+```
+
+It refuses to extract into a non-empty directory unless you pass `--force`,
+verifies its payload's SHA-256 before writing anything, and rejects archive
+members with absolute or traversing paths. It needs only `bash`, `tar` and
+coreutils; where those are missing it falls back to `python3`.
+
+The extracted copy is a **snapshot, not a clone** — there is no `.git`, so
+commits made in it cannot be pushed back.
+
+Rebuild after changing the code:
+
+```bash
+python3 tools/build_selfextract.py
+```
+
+`git ls-files` decides which paths ship (so caches and build artefacts stay
+out), and the content comes from the working tree — an uncommitted edit to a
+tracked file is included as it stands.
 
 ### 2.2b Manual install
 

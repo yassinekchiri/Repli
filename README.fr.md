@@ -51,9 +51,13 @@ netapp_cascade_migration.py # point d'entrée CLI (compatibilité historique)
 requirements.txt
 install.sh                  # installeur hors-ligne, exige le checkout + wheels/
 install-standalone.sh       # installeur en UN seul fichier autonome (généré)
+repo-selfextract.sh         # tout le dépôt en un fichier, extraction seule (généré)
 tools/
+├── payload.py              # mécanique d'empaquetage partagée par les deux
 ├── installer_template.sh   # corps de install-standalone.sh
-├── build_standalone_installer.py  # y embarque les sources
+├── build_standalone_installer.py
+├── selfextract_template.sh # corps de repo-selfextract.sh
+├── build_selfextract.py
 └── capture_swagger_guide.py     # régénère les captures de docs/api-guide.fr.md
 docs/
 ├── api-guide.md            # parcours illustré de Swagger UI (+ .fr.md)
@@ -170,6 +174,40 @@ python3 tools/build_standalone_installer.py
 La construction est déterministe : un arbre inchangé produit un script
 identique à l'octet près, `git status` reste donc silencieux si rien n'a
 réellement changé.
+
+### 2.2a-bis Transporter le dépôt lui-même (sans installer)
+
+`repo-selfextract.sh` embarque **tout le dépôt** dans un seul fichier
+exécutable — tout sauf `wheels/` et l'historique git. Il n'installe rien : il
+déballe, et s'arrête. À utiliser pour amener les sources sur une machine qui
+n'a pas accès au dépôt de code, quand c'est l'arborescence que l'on veut et
+non un service qui tourne.
+
+```bash
+bash repo-selfextract.sh                  # extrait dans ./netapp-migration
+bash repo-selfextract.sh --into /opt/src  # ailleurs
+bash repo-selfextract.sh --list           # liste le contenu, n'extrait rien
+bash repo-selfextract.sh --check          # vérifie l'intégrité seulement
+bash repo-selfextract.sh --sha256         # affiche l'empreinte de la charge utile
+```
+
+Il refuse d'extraire dans un répertoire non vide sauf avec `--force`, vérifie
+le SHA-256 de sa charge utile avant d'écrire quoi que ce soit, et rejette les
+entrées d'archive au chemin absolu ou remontant. Il ne demande que `bash`,
+`tar` et coreutils ; à défaut, il bascule sur `python3`.
+
+La copie extraite est un **instantané, pas un clone** — il n'y a pas de
+`.git`, les commits qui y seraient faits ne peuvent pas être repoussés.
+
+Régénération après une modification du code :
+
+```bash
+python3 tools/build_selfextract.py
+```
+
+`git ls-files` décide quels chemins partent (les caches et artefacts de build
+restent donc dehors), et le contenu est lu dans l'arbre de travail : une
+modification non commitée d'un fichier suivi est incluse telle quelle.
 
 ### 2.2b Installation manuelle
 
