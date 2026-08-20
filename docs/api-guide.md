@@ -251,26 +251,93 @@ Then run it:
 
 ![Running test](images/14-test.png)
 
-`volume_map` gives, for each qtree, the name of the volume to create and —
-optionally — the name the qtree itself takes inside that volume. The client
-chooses both; nothing is auto-generated. The volume is required: a qtree
-without one fails pre-flight with `VOLUME_MAP_MISSING`. The rename is
-opt-in: leave it out and the qtree keeps its source name. A later `clone`
-inherits what `test` recorded in the job file, so it only needs repeating
-when it changes. Four shapes are accepted, pick whichever is convenient:
+#### Writing `volume_map`
+
+It answers two questions per qtree: **which volume to create**, and **what
+the qtree is called inside it**. You choose both; nothing is generated.
+
+The short form gives the volume only, and the qtree keeps its source name:
 
 ```json
-{"volume_map": {"q_finance": "vol_fin_prod"}}
-{"volume_map": {"q_finance": {"volume": "vol_fin_prod", "new_qtree": "finance"}}}
+{
+  "qtrees": "q_finance,q_hr",
+  "volume_map": {
+    "q_finance": "vol_fin_prod",
+    "q_hr":      "vol_rh_prod"
+  }
+}
+```
+
+The full form adds the new qtree name. The two styles mix freely — here
+`q_finance` is renamed and `q_hr` is not:
+
+```json
+{
+  "qtrees": "q_finance,q_hr",
+  "volume_map": {
+    "q_finance": { "volume": "vol_fin_prod", "new_qtree": "finance" },
+    "q_hr":      { "volume": "vol_rh_prod" }
+  }
+}
+```
+
+`new_qtree` omitted, empty, or equal to the source name all mean the same
+thing: no rename. Two further shapes are accepted if they suit your caller
+better — a list, or the CSV as a JSON string:
+
+```json
 {"volume_map": [{"qtree": "q_finance", "volume": "vol_fin_prod", "new_qtree": "finance"}]}
 {"volume_map": "qtree,volume,new_qtree\nq_finance,vol_fin_prod,finance\n"}
 ```
 
+What the pre-flight enforces, and the code it answers with:
+
+| Rule | Refusal |
+|---|---|
+| Every qtree listed in `qtrees` has an entry | `VOLUME_MAP_MISSING` |
+| `volume` is present and free on PROD **and** DR | `VOLUME_ALREADY_EXISTS` |
+| No two qtrees share a volume name | `VOLUME_MAP_DUPLICATE` |
+| `volume` is a legal ONTAP volume name | `VOLUME_NAME_ILLEGAL` |
+| `new_qtree` has none of `/ \ : * ? " < > |`, ≤ 64 characters | `QTREE_NAME_ILLEGAL` |
+| `new_qtree` is not already a qtree of the source volume | `QTREE_NAME_TAKEN` |
+| No two qtrees take the same new name | `QTREE_NAME_DUPLICATE` |
+
+Keys are matched case-insensitively against the qtrees you listed. A `clone`
+run after a `test` **inherits** the mapping recorded in the job file — send
+it again only when it changes.
+
 The rename is applied on the **PROD clone only** (the DR clone is a mirror
 destination, hence read-only) and **before** the clone mirror is created, so
-the first resync carries the new name to DR. A name the source volume already
-uses is refused up front with `QTREE_NAME_TAKEN` — a clone inherits every
-qtree of its parent.
+the first resync carries the new name to DR.
+
+#### Pruning: one volume, one client's data
+
+A FlexClone copies the **whole** parent volume, so the volume created for
+`q_finance` starts out holding `q_hr`, `q_ops` and every other qtree of the
+source — other clients' data inside this client's volume.
+
+`test` and `clone` therefore delete, in each clone, every qtree it did not
+come for. This is **on by default**; send `"prune": false` to keep
+everything, and the pre-flight will warn (`PRUNE_DISABLED`).
+
+It happens right after the clones are created, before the mirror and before
+the volume move, so the DR clone never holds the surplus either and the move
+relocates only what is left. **PROD only**, and the **source volume is never
+touched**. The pre-flight lists the deletions in advance:
+
+```json
+{
+  "code": "PRUNE_PLAN",
+  "severity": "warning",
+  "detail": "keeps 'q_finance', deletes 2: q_hr, q_ops",
+  "target": "clu-prod-01 / svm_prod:vol_fin_prod"
+}
+```
+
+> That entry does not appear in the screenshots above: this walkthrough runs
+> in dry-run, where the job never reaches `completed` and the source qtrees
+> are simulated, so the mapping checks stop earlier. Run the same call
+> against a real job to see it.
 
 `validity_days` (default 7) records when the test environment expires.
 

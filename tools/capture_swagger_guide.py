@@ -279,21 +279,27 @@ def capture(page, store, scoped_token, unlock_socket):
             params={"job_id": job_id})
 
     # -- 7. per-qtree actions ----------------------------------------------
+    # The bodies below deliberately show the full volume_map: the volume to
+    # create AND the name the qtree takes inside it. The screenshots are how
+    # most people will learn the format, so they show the whole thing.
+    full_map = {"q_finance": {"volume": "vol_fin_prod",
+                              "new_qtree": "finance"}}
+
+    # The pre-flight report is where PRUNE_PLAN announces the deletions, so
+    # this one screenshot teaches the mapping and the pruning at once.
     ui.step("preflight-test", "post",
             "/api/v1/migrations/{job_id}/preflight/{action}",
             params={"job_id": job_id, "action": "test"},
             body=json.dumps({"qtrees": "q_finance",
-                             "volume_map": {"q_finance": "vol_fin_prod"}},
-                            indent=2))
+                             "volume_map": full_map}, indent=2))
     ui.step("test", "post", "/api/v1/migrations/{job_id}/test",
             params={"job_id": job_id},
             body=json.dumps({"qtrees": "q_finance", "validity_days": 7,
-                             "volume_map": {"q_finance": "vol_fin_prod"}},
-                            indent=2))
+                             "volume_map": full_map}, indent=2))
     ui.step("clone", "post", "/api/v1/migrations/{job_id}/clone",
             params={"job_id": job_id},
             body=json.dumps({"qtrees": "q_finance", "fresh": False,
-                             "volume_map": {"q_finance": "vol_fin_prod"}},
+                             "prune": True, "volume_map": full_map},
                             indent=2))
     ui.step("acl", "post", "/api/v1/migrations/{job_id}/acl",
             params={"job_id": job_id},
@@ -308,7 +314,9 @@ def capture(page, store, scoped_token, unlock_socket):
             "/api/v1/migrations/{job_id}/test",
             params={"job_id": job_id},
             body=json.dumps({"qtrees": "q_hr",
-                             "volume_map": {"q_hr": "vol_hr_prod"}}, indent=2))
+                             "volume_map": {"q_hr": {
+                                 "volume": "vol_hr_prod",
+                                 "new_qtree": "rh"}}}, indent=2))
     ui.step("scoped-forbidden-action", "post", "/api/v1/migrations",
             body=json.dumps(CREATE_BODY, indent=2))
 

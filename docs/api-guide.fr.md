@@ -255,27 +255,94 @@ Puis lancez :
 
 ![Exécution de test](images/14-test.png)
 
-`volume_map` donne, pour chaque qtree, le nom du volume à créer et —
-facultativement — le nom que prend le qtree lui-même dans ce volume. C'est le
-client qui choisit les deux, rien n'est généré automatiquement. Le volume est
-obligatoire : un qtree sans volume échoue au pré-vol avec
-`VOLUME_MAP_MISSING`. Le renommage est optionnel : sans lui, le qtree garde
-son nom d'origine. Un `clone` ultérieur hérite de ce que `test` a enregistré
-dans le fichier de job, il n'est donc à répéter que s'il change. Quatre
-formes sont acceptées, au choix :
+#### Écrire `volume_map`
+
+Il répond à deux questions par qtree : **quel volume créer**, et **comment le
+qtree s'appelle à l'intérieur**. C'est vous qui choisissez les deux, rien
+n'est généré.
+
+La forme courte ne donne que le volume, et le qtree garde son nom d'origine :
 
 ```json
-{"volume_map": {"q_finance": "vol_fin_prod"}}
-{"volume_map": {"q_finance": {"volume": "vol_fin_prod", "new_qtree": "finance"}}}
+{
+  "qtrees": "q_finance,q_hr",
+  "volume_map": {
+    "q_finance": "vol_fin_prod",
+    "q_hr":      "vol_rh_prod"
+  }
+}
+```
+
+La forme complète ajoute le nouveau nom du qtree. Les deux styles se mélangent
+librement — ici `q_finance` est renommé, `q_hr` non :
+
+```json
+{
+  "qtrees": "q_finance,q_hr",
+  "volume_map": {
+    "q_finance": { "volume": "vol_fin_prod", "new_qtree": "finance" },
+    "q_hr":      { "volume": "vol_rh_prod" }
+  }
+}
+```
+
+`new_qtree` absent, vide, ou égal au nom d'origine veulent tous dire la même
+chose : pas de renommage. Deux autres formes sont acceptées si elles
+conviennent mieux à votre client — une liste, ou le CSV en chaîne JSON :
+
+```json
 {"volume_map": [{"qtree": "q_finance", "volume": "vol_fin_prod", "new_qtree": "finance"}]}
 {"volume_map": "qtree,volume,new_qtree\nq_finance,vol_fin_prod,finance\n"}
 ```
 
-Le renommage est appliqué sur le **clone PROD uniquement** (le clone DR est
-une destination de miroir, donc en lecture seule) et **avant** la création du
-miroir entre clones, pour que le premier resync porte le nouveau nom jusqu'à
-la DR. Un nom déjà utilisé par le volume source est refusé en amont avec
-`QTREE_NAME_TAKEN` — un clone hérite de tous les qtrees de son parent.
+Ce que le pré-vol vérifie, et le code qu'il renvoie :
+
+| Règle | Refus |
+|---|---|
+| Chaque qtree listé dans `qtrees` a une entrée | `VOLUME_MAP_MISSING` |
+| `volume` est présent et libre sur PROD **et** DR | `VOLUME_ALREADY_EXISTS` |
+| Deux qtrees ne partagent pas un nom de volume | `VOLUME_MAP_DUPLICATE` |
+| `volume` est un nom de volume ONTAP légal | `VOLUME_NAME_ILLEGAL` |
+| `new_qtree` sans `/ \ : * ? " < > |`, ≤ 64 caractères | `QTREE_NAME_ILLEGAL` |
+| `new_qtree` n'est pas déjà un qtree du volume source | `QTREE_NAME_TAKEN` |
+| Deux qtrees ne prennent pas le même nouveau nom | `QTREE_NAME_DUPLICATE` |
+
+Les clés sont comparées sans tenir compte de la casse. Un `clone` lancé après
+un `test` **hérite** du mapping enregistré dans le fichier de job : ne le
+renvoyez que s'il change.
+
+Le renommage s'applique au **clone PROD uniquement** (le clone DR est une
+destination de miroir, donc en lecture seule) et **avant** la création du
+miroir, pour que le premier resync porte le nouveau nom jusqu'à la DR.
+
+#### Élagage : un volume, les données d'un seul client
+
+Un FlexClone copie le volume parent **en entier** : le volume créé pour
+`q_finance` contient donc au départ `q_hr`, `q_ops` et tous les autres qtrees
+de la source — les données d'autres clients dans le volume de ce client.
+
+`test` et `clone` suppriment donc, dans chaque clone, tout qtree pour lequel
+il n'a pas été créé. **Actif par défaut** ; envoyez `"prune": false` pour tout
+conserver, et le pré-vol émettra un avertissement (`PRUNE_DISABLED`).
+
+L'opération a lieu juste après la création des clones, avant le miroir et
+avant le volume move : le clone DR ne porte donc jamais le surplus, et le
+move ne déplace que ce qui reste. **PROD uniquement**, et le **volume source
+n'est jamais touché**. Le pré-vol liste les suppressions à l'avance :
+
+```json
+{
+  "code": "PRUNE_PLAN",
+  "severity": "warning",
+  "detail": "keeps 'q_finance', deletes 2: q_hr, q_ops",
+  "target": "clu-prod-01 / svm_prod:vol_fin_prod"
+}
+```
+
+> Cette entrée n'apparaît pas sur les captures ci-dessus : ce parcours tourne
+> en dry-run, où le job n'atteint jamais `completed` et où les qtrees source
+> sont simulés, donc les contrôles du mapping s'arrêtent plus tôt. Lancez le
+> même appel sur un job réel pour la voir.
 
 `validity_days` (7 par défaut) enregistre la date d'expiration de
 l'environnement de test.
