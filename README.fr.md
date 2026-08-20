@@ -93,7 +93,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 167 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 179 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -871,6 +871,50 @@ Checkpoints du fichier de job (`--action retry` reprend au dernier atteint) :
 started → space_checked → volumes_created → relationships_created
         → pivot_initialized → dest_initialized → completed
 ```
+
+#### Ce qu'un job dit de ce qui s'est passé
+
+`status` est, et n'a jamais été, que le **point de reprise de la cascade
+create** (`started` → … → `completed`). Aucune autre action ne l'écrit : il
+ne dit donc rien de la réussite d'un `clone` ultérieur — un job dont le clone
+a échoué affiche toujours `completed`, parce que la réplication, elle, est
+bien terminée.
+
+Chaque action enregistre donc son propre résultat à côté :
+
+```json
+"last_action": {
+  "action": "clone",
+  "state": "failed",
+  "started_at": "2026-08-20T15:21:36",
+  "ended_at": "2026-08-20T15:21:41",
+  "error": "OntapError: [PRD] DELETE /storage/qtrees/... -> HTTP 400: ..."
+},
+"history": [ ... les 20 derniers ... ]
+```
+
+| `state` | Signification |
+|---|---|
+| `running` | démarrée, non terminée — un processus tué en route reste ici |
+| `success` | terminée, rien n'a été levé |
+| `failed` | échec ; `error` porte ce qu'a répondu le cluster |
+| `refused` | le pré-vol a dit non — **rien n'a été modifié** |
+| `needs_confirmation` | en attente d'un accord explicite |
+| `unknown` | fichier de job écrit avant l'existence de ce champ |
+
+`check-status` affiche les deux, et ne s'enregistre volontairement **pas**
+lui-même : regarder un job ne doit pas effacer ce qu'on vient y chercher.
+
+```
+  Created: 2026-08-20T15:21:36  |  Cascade: completed
+  Last action  : clone -> FAILED   (2026-08-20T15:21:41)
+                 OntapError: [PRD] DELETE /storage/qtrees/... -> HTTP 400: ...
+```
+
+L'API renvoie la même chose sous `outcome` sur `GET /migrations/{id}` et sur
+chaque ligne de `GET /migrations`. C'est lu dans le **fichier** de job : cela
+survit donc à un redémarrage de l'API, contrairement à `last_run`, qui est
+en mémoire.
 
 Après `test`, le fichier de job contient `clone_uid`, `clone_volumes`,
 `test_env`, `test_created_at` et `test_expires_at` ; la promotion par

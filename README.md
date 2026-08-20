@@ -92,7 +92,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 167 tests, offline, no cluster contacted
+python3 -m pytest            # 179 tests, offline, no cluster contacted
 ```
 
 ---
@@ -861,6 +861,48 @@ Job-file checkpoints (`--action retry` resumes at the last one reached):
 started → space_checked → volumes_created → relationships_created
         → pivot_initialized → dest_initialized → completed
 ```
+
+#### How a job reports what happened
+
+`status` is, and only ever was, the **create-cascade checkpoint**
+(`started` → … → `completed`). No other action writes to it, so it says
+nothing about whether a later `clone` worked — a job whose clone failed
+still reads `completed`, because the replication really is complete.
+
+Every action therefore records its own outcome next to it:
+
+```json
+"last_action": {
+  "action": "clone",
+  "state": "failed",
+  "started_at": "2026-08-20T15:21:36",
+  "ended_at": "2026-08-20T15:21:41",
+  "error": "OntapError: [PRD] DELETE /storage/qtrees/... -> HTTP 400: ..."
+},
+"history": [ ... the last 20 ... ]
+```
+
+| `state` | Meaning |
+|---|---|
+| `running` | started, not finished — a process killed mid-run stays here |
+| `success` | finished, nothing raised |
+| `failed` | it broke; `error` carries what the cluster said |
+| `refused` | the pre-flight said no — **nothing was changed** |
+| `needs_confirmation` | waiting for an explicit go-ahead |
+| `unknown` | job file written before this existed |
+
+`check-status` prints both, and deliberately does **not** record itself:
+looking at a job must not erase the outcome you are looking for.
+
+```
+  Created: 2026-08-20T15:21:36  |  Cascade: completed
+  Last action  : clone -> FAILED   (2026-08-20T15:21:41)
+                 OntapError: [PRD] DELETE /storage/qtrees/... -> HTTP 400: ...
+```
+
+The API returns the same under `outcome` on `GET /migrations/{id}` and on
+each row of `GET /migrations`. It is read from the job **file**, so it
+survives a restart of the API — unlike `last_run`, which is in memory.
 
 After `test`, the job file contains `clone_uid`, `clone_volumes`,
 `test_env`, `test_created_at` and `test_expires_at`; promotion through

@@ -17,6 +17,8 @@ single-file script:
 """
 
 import datetime
+import functools
+import inspect
 import logging
 import time
 from typing import Dict, List, Optional
@@ -24,12 +26,72 @@ from typing import Dict, List, Optional
 from ..models import (MigrationParams, OntapError, ConfirmationRequired,
                       PreflightFailed, PreflightReport, SnapMirrorInfo)
 from ..transport.base import OntapClient
-from .jobs import JobStore, CREATE_STATUS_ORDER
+from .jobs import (JobStore, CREATE_STATUS_ORDER, ACTION_SUCCESS,
+                   ACTION_FAILED, ACTION_REFUSED, ACTION_NEEDS_CONFIRMATION)
 from .preflight import PreflightChecker
+
+
+def _classify(exc: BaseException):
+    """How an action ended, and the one line worth keeping about it."""
+    if isinstance(exc, ConfirmationRequired):
+        return ACTION_NEEDS_CONFIRMATION, str(exc)
+    if isinstance(exc, PreflightFailed):
+        return ACTION_REFUSED, exc.report.summary()
+    return ACTION_FAILED, f"{type(exc).__name__}: {exc}"
+
+
+def records(action: str):
+    """Write the outcome of an action into its job file.
+
+    The job's `status` is the create-cascade checkpoint and nothing else: a
+    clone that fails does not un-replicate the cascade, so `status` stays
+    'completed' and, on its own, would suggest everything went fine. This
+    records what actually happened, per action, next to it.
+
+    The job is found by NAME in the call, so every action's signature works
+    whether the caller passes it positionally or by keyword. An action that
+    creates its own job (`create`) publishes it through self._recording.
+    """
+    def decorator(fn):
+        signature = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            job = bound.arguments.get("job")
+            began = datetime.datetime.now().isoformat(timespec="seconds")
+
+            self._recording = None
+            entry = self.jobs.start_action(job, action) if job else None
+            try:
+                result = fn(*bound.args, **bound.kwargs)
+            except BaseException as exc:
+                target = job or self._recording
+                if target:
+                    state, message = _classify(exc)
+                    self.jobs.finish_action(
+                        target,
+                        entry or self.jobs.start_action(target, action, began),
+                        state, message)
+                raise
+            target = job or self._recording
+            if target:
+                self.jobs.finish_action(
+                    target,
+                    entry or self.jobs.start_action(target, action, began),
+                    ACTION_SUCCESS)
+            return result
+        return wrapper
+    return decorator
 
 
 class MigrationEngine:
     """Drives one migration (one source volume) through all its actions."""
+
+    # Set by an action that creates its own job, so @records can file the
+    # outcome against it.
+    _recording: Optional[dict] = None
 
     def __init__(self, client: OntapClient, params: MigrationParams,
                  jobstore: JobStore, logger: logging.Logger):
@@ -218,6 +280,7 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'create'
     # =====================================================================
+    @records("create")
     def create(self, create_mode: str = "full",
                job: Optional[dict] = None) -> dict:
         """Initialise the cascade. A pre-created job record may be passed
@@ -235,6 +298,8 @@ class MigrationEngine:
 
         if job is None:
             job = self.jobs.create(p, create_mode)
+        # Publish it: @records had nothing to file against until now.
+        self._recording = job
         self.job_id = job["job_id"]
         self.log.info("Job ID: %s", self.job_id)
         pivot_path, prod_path, dr_path = self._paths()
@@ -302,6 +367,7 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'resume'
     # =====================================================================
+    @records("resume")
     def resume(self, job: dict, confirm: bool = False) -> dict:
         p = self.p
         self.job_id = job["job_id"]
@@ -370,6 +436,29 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'check-status'
     # =====================================================================
+    def _log_last_action(self, job: dict) -> None:
+        """Say how the last action went, next to the cascade state.
+
+        `status` only ever moves through the create checkpoints, so on its
+        own it would present a job whose last clone blew up as 'completed'.
+        """
+        outcome = self.jobs.outcome(job)
+        action, state = outcome["last_action"], outcome["last_action_state"]
+        if not action:
+            return
+        line = (f"  Last action  : {action} -> {state.upper()}"
+                f"   ({outcome['last_action_at']})")
+        if state in (ACTION_FAILED, ACTION_REFUSED):
+            self.log.warning(line)
+            if outcome["last_action_error"]:
+                self.log.warning("                 %s",
+                                 outcome["last_action_error"])
+        else:
+            self.log.info(line)
+
+    # Deliberately NOT recorded: check-status changes nothing, and filing
+    # itself as the "last action" would overwrite — and hide — the outcome
+    # the operator ran it to see.
     def check_status(self, job: dict, persist: bool = True) -> dict:
         """Live replication state; also returned as a structured dict.
 
@@ -386,16 +475,19 @@ class MigrationEngine:
 
         self.log.info("=" * 60)
         self.log.info("  ACTION: check-status  |  Job %s", self.job_id)
-        self.log.info("  Created: %s  |  Status: %s",
+        self.log.info("  Created: %s  |  Cascade: %s",
                       job.get("created_at", "unknown"), status)
+        self._log_last_action(job)
         self.log.info("=" * 60)
 
         result = {"job_id": self.job_id, "status": status,
-                  "completed": status == "completed", "legs": []}
+                  "completed": status == "completed", "legs": [],
+                  **self.jobs.outcome(job)}
 
         if status == "completed":
             self._log_arch(pivot_note="idle", prod_note="idle", dr_note="idle")
-            self.log.info("  Job %s already completed.", self.job_id)
+            self.log.info("  Replication cascade complete for job %s.",
+                          self.job_id)
             return result
 
         def leg(role, cluster, path) -> dict:
@@ -486,6 +578,7 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'retry'
     # =====================================================================
+    @records("retry")
     def retry(self, job: dict) -> dict:
         """Re-enter 'create' at the last successful checkpoint."""
         p = self.p
@@ -835,6 +928,7 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'clone'
     # =====================================================================
+    @records("clone")
     def clone(self, qtrees_arg: str, job: Optional[dict] = None,
               fresh: bool = False,
               volume_map: Optional[Dict[str, str]] = None,
@@ -997,6 +1091,7 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'test'
     # =====================================================================
+    @records("test")
     def test(self, qtrees_arg: str, job: Optional[dict] = None,
              validity_days: int = 7,
              volume_map: Optional[Dict[str, str]] = None,
@@ -1138,6 +1233,7 @@ class MigrationEngine:
     # =====================================================================
     # ACTION 'acl'
     # =====================================================================
+    @records("acl")
     def acl(self, ad_groups: str, acl_path: str,
             acl_rights: str = "full-control",
             job: Optional[dict] = None) -> dict:
@@ -1230,6 +1326,7 @@ class MigrationEngine:
                           volume, len(surplus), ", ".join(surplus))
         return deleted
 
+    @records("cleanup")
     def cleanup(self, qtree: str, job: Optional[dict] = None) -> dict:
         """Cut source access for one qtree (export-policy, CIFS, rename)."""
         p = self.p

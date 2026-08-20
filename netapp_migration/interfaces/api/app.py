@@ -432,7 +432,11 @@ def list_migrations(principal: Principal = Depends(current_principal)):
                 or owned & {q.lower() for q in (j.get("test_qtrees") or [])}]
     return {"count": len(jobs),
             "jobs": [{"job_id": j.get("job_id"),
+                      # The cascade checkpoint AND how the last action went:
+                      # a completed cascade says nothing about a clone that
+                      # failed afterwards.
                       "status": j.get("status"),
+                      **JobStore.outcome(j),
                       "created_at": j.get("created_at"),
                       "volume": j.get("params", {}).get("volume")}
                      for j in jobs]}
@@ -450,7 +454,9 @@ def get_migration(job_id: str, logs: int = 50,
         last_run = {"action": run["action"], "state": run["state"],
                     "error": run["error"], "logs": tail,
                     "preflight": run.get("preflight")}
-    return {"job": job, "last_run": last_run}
+    # `outcome` is read from the job FILE, so it survives a restart of the
+    # API — unlike last_run, which lives in memory for the current process.
+    return {"job": job, "outcome": JobStore.outcome(job), "last_run": last_run}
 
 
 @app.get("/api/v1/migrations/{job_id}/status")
