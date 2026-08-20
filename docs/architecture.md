@@ -189,7 +189,7 @@ flowchart LR
 | `POST` | `/api/v1/migrations/{id}/test` | build the test environment | `202` `422` |
 | `POST` | `/api/v1/migrations/{id}/clone` | definitive clones (promotion / fresh / full) | `202` `422` |
 | `POST` | `/api/v1/migrations/{id}/acl` | force AD-group DACLs on one path | `200` `422` |
-| `POST` | `/api/v1/migrations/{id}/cleanup` | cut source access for one qtree | `200` `422` |
+| `POST` | `/api/v1/migrations/{id}/cleanup` | cut source access for one, several or all migrated qtrees | `200` `422` |
 
 ### Status codes and what they mean
 
@@ -252,7 +252,7 @@ consume by automation.
 | `clone` (full/fresh) | same as `test`, plus the move-target aggregate check; `--fresh` warns that the old test clones are abandoned |
 | `acl` | path provided, absolute, no traversal, **not `/`**; path belongs to a **clone volume of this job**; path resolves on the PROD SVM; volume security style is NTFS/mixed; AD group syntax |
 | `test` / `clone` naming | **every qtree has an explicit target volume name**; names are distinct; each is a legal ONTAP volume name; each is free on PROD **and** DR |
-| `cleanup` | qtree **non-empty** and existing on the source; no path separator; migration `completed`; clones promoted (warning); **explicit preview of the exact CIFS shares** that will be deleted |
+| `cleanup` | at least one qtree, existing on the source, no duplicate, no path separator; migration `completed`; the qtree is in the job's `volume_map` and the migrated volume is present on PROD **and** DR; not already cleaned up (`_MIG_`); the new name is free; clones promoted (warning); **explicit preview of the exact CIFS shares** that will be deleted |
 
 ---
 
@@ -411,7 +411,7 @@ flowchart LR
     G -->|"yes"| H["clone<br/>= promotion"]
     G -->|"no"| I["delete test clones<br/>fix, test again"]
     I --> E
-    H --> J["cleanup<br/>per migrated qtree"]
+    H --> J["cleanup<br/>one, several or all<br/>migrated qtrees"]
     A -.->|"on failure"| R["retry"]
     R --> B
     K["acl — independent,<br/>any destination path"] -.-> F

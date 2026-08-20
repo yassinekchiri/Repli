@@ -29,6 +29,7 @@ from ..models import (CheckResult, MigrationParams, OntapError,
 from ..security import csvio
 from ..transport.base import OntapClient
 from .jobs import CREATE_STATUS_ORDER
+from .naming import MIGRATED_MARK, migrated_qtree_name
 
 # ONTAP volume names: letters, digits, underscore; 203 characters maximum.
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1100,40 +1101,43 @@ class PreflightChecker:
                                   f"else",
                       target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
 
-    def for_cleanup(self, job: Optional[dict], qtree: str) -> PreflightReport:
+    def for_cleanup(self, job: Optional[dict],
+                    qtrees: Sequence[str]) -> PreflightReport:
+        """Cutting client access to the source: the most sensitive action.
+
+        Everything it does is reversible on paper — no data is deleted — but
+        it makes a share disappear for real users, so every qtree is checked
+        on its own and one bad qtree refuses the whole run.
+        """
         p = self.p
         report = self._report("cleanup")
+        # A bare string would iterate character by character — accept it and
+        # split, rather than silently checking 'q', '_', 'f'...
+        if isinstance(qtrees, str):
+            qtrees = qtrees.split(",")
+        names = [q.strip() for q in qtrees if q and q.strip()]
 
-        name = (qtree or "").strip()
-        self._add(report, "CLEANUP_QTREE_MISSING", "A qtree is provided",
-                  bool(name), detail="empty qtree name" if not name else name,
-                  hint="pass --qtree <name>; an empty value would match "
-                       "every CIFS share of the SVM")
-        if not name:
+        self._add(report, "CLEANUP_QTREE_MISSING", "At least one qtree given",
+                  bool(names),
+                  detail=f"{len(names)} qtree(s)" if names else "none",
+                  hint="pass --qtrees q1,q2 (or 'all'); an empty value would "
+                       "match every CIFS share of the SVM")
+        if not names:
             return report
 
+        separators = [n for n in names if "/" in n]
         self._add(report, "CLEANUP_QTREE_SEPARATOR",
-                  "Qtree name has no path separator", "/" not in name,
-                  detail=name, hint="pass the qtree name, not a path")
+                  "Qtree names carry no path separator", not separators,
+                  detail=", ".join(separators) if separators else "all clean",
+                  hint="pass qtree names, not paths")
 
-        available, err = self._safe(
-            lambda: self.c.list_qtrees(p.source_cluster, p.source_vserver,
-                                       p.volume), None)
-        target = f"{p.source_cluster} / {p.source_vserver}:{p.volume}"
-        if available is None:
-            self._add(report, "QTREES_UNREADABLE", "Source qtrees readable",
-                      False, detail=err, target=target)
-        else:
-            exists = name in available
-            self._add(report, "CLEANUP_QTREE_NOT_FOUND",
-                      "Qtree exists on the source volume", exists,
-                      detail=f"source has: {', '.join(available) or 'none'}"
-                             if not exists else name,
-                      hint="check the qtree name (it may already have been "
-                           "renamed by a previous cleanup)" if not exists else "",
-                      target=target)
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        self._add(report, "CLEANUP_QTREE_DUPLICATE", "No duplicate qtree",
+                  not duplicates,
+                  detail=", ".join(duplicates) if duplicates else "all distinct")
 
-        # Cutting the source is only safe once the target is really in place.
+        # -- The migration must really have happened ------------------------
+        volumes = dict((job or {}).get("volume_map") or {})
         if job:
             status = job.get("status", "unknown")
             promoted = bool(job.get("clone_promoted_at"))
@@ -1146,8 +1150,8 @@ class PreflightChecker:
             self._add(report, "CLEANUP_CLONES_NOT_PROMOTED",
                       "Definitive clones have been promoted", promoted,
                       detail="clone_promoted_at is not set on this job"
-                             if not promoted else
-                             job.get("clone_promoted_at", ""),
+                             if not promoted
+                             else job.get("clone_promoted_at", ""),
                       hint="run action 'clone' and let the volume moves finish "
                            "before cutting the source",
                       target=job.get("job_id", ""),
@@ -1156,27 +1160,131 @@ class PreflightChecker:
             self._add(report, "CLEANUP_NO_JOB_CONTEXT",
                       "Migration state can be verified", False,
                       detail="no job id provided: the tool cannot confirm the "
-                             "migration finished",
+                             "migration finished, nor where the data went",
                       hint="pass --job-id so the migration state is checked",
                       severity=SEVERITY_WARNING)
 
-        # Show exactly which shares would be deleted (no guessing).
-        shares, err = self._safe(
-            lambda: self.c.find_cifs_shares(p.source_cluster,
-                                            p.source_vserver, f"/{name}"),
-            None)
-        if shares is None:
-            self._add(report, "CIFS_SHARES_UNREADABLE",
-                      "CIFS shares readable", False, detail=err,
-                      hint="grant readonly on /api/protocols/cifs/shares",
-                      target=p.source_cluster, severity=SEVERITY_WARNING)
+        available, err = self._safe(
+            lambda: self.c.list_qtrees(p.source_cluster, p.source_vserver,
+                                       p.volume), None)
+        source = f"{p.source_cluster} / {p.source_vserver}:{p.volume}"
+        if available is None:
+            self._add(report, "QTREES_UNREADABLE", "Source qtrees readable",
+                      False, detail=err, target=source)
+            return report
+
+        present = {q.lower(): q for q in available}
+
+        # -- The export policy the qtrees will be moved onto ----------------
+        exists, err = self._safe(
+            lambda: self.c.export_policy_exists(p.source_cluster,
+                                                p.source_vserver,
+                                                p.noaccess_policy), None)
+        if exists is None:
+            self._add(report, "EXPORT_POLICY_UNREADABLE",
+                      "Export policies readable", False,
+                      severity=SEVERITY_WARNING, detail=err,
+                      hint="grant readonly on /api/protocols/nfs/export-policies",
+                      target=f"{p.source_cluster} / {p.source_vserver}")
         else:
-            self._add(report, "CLEANUP_SHARES_PREVIEW",
-                      "CIFS shares that will be deleted", True,
-                      detail=", ".join(shares) if shares
-                             else "none matched this qtree",
-                      target=f"{p.source_cluster} / {p.source_vserver}",
-                      severity=SEVERITY_WARNING if shares else SEVERITY_ERROR)
+            self._add(report, "EXPORT_POLICY_ABSENT",
+                      f"Export policy '{p.noaccess_policy}' exists", True,
+                      severity=SEVERITY_WARNING if not exists else SEVERITY_ERROR,
+                      detail="present" if exists
+                             else "missing — it will be created with no rule, "
+                                  "which denies every client",
+                      target=f"{p.source_cluster} / {p.source_vserver}")
+
+        # -- Then each qtree, one at a time ---------------------------------
+        for name in names:
+            target = f"{source}/{name}"
+
+            found = name.lower() in present
+            already = MIGRATED_MARK in name
+            self._add(report, "CLEANUP_QTREE_NOT_FOUND",
+                      f"'{name}' exists on the source volume", found,
+                      detail=f"source holds: {', '.join(available) or 'none'}"
+                             if not found else name,
+                      hint="a previous cleanup may already have renamed it "
+                           "(look for a name carrying "
+                           f"'{MIGRATED_MARK}')" if not found else "",
+                      target=target)
+            if not found:
+                continue
+
+            self._add(report, "CLEANUP_ALREADY_DONE",
+                      f"'{name}' has not been cleaned up already", not already,
+                      detail=f"the name already carries "
+                             f"'{MIGRATED_MARK}'" if already
+                             else "not marked as migrated",
+                      hint="this qtree looks like it was already cut"
+                           if already else "",
+                      target=target)
+
+            # Where did its data go? Cutting access to something that was
+            # never cloned would strand the client with nothing.
+            volume = volumes.get(name) or next(
+                (v for k, v in volumes.items() if k.lower() == name.lower()),
+                "")
+            self._add(report, "CLEANUP_QTREE_NOT_MIGRATED",
+                      f"'{name}' was migrated by this job", bool(volume),
+                      detail=f"-> {volume}" if volume
+                             else "this qtree is not in the job's volume_map",
+                      hint="clone it first: cutting the source of a qtree that "
+                           "has no copy would leave the client with nothing"
+                           if not volume else "",
+                      target=target)
+
+            # And is that copy actually there, on both destinations?
+            for cluster, svm, role in ((p.dest_cluster, p.dest_vserver, "PROD"),
+                                       (p.dr_cluster, p.dr_vserver, "DR")):
+                if not volume:
+                    break
+                there, err = self._safe(
+                    lambda c=cluster, sv=svm, v=volume:
+                        self.c.volume_exists(c, sv, v), None)
+                if there is None:
+                    self._add(report, "CLEANUP_TARGET_UNREADABLE",
+                              f"{role}: '{volume}' readable", False,
+                              severity=SEVERITY_WARNING, detail=err,
+                              target=f"{cluster} / {svm}:{volume}")
+                    continue
+                self._add(report, "CLEANUP_TARGET_MISSING",
+                          f"{role}: the migrated volume '{volume}' is there",
+                          there,
+                          detail="present" if there else "volume not found",
+                          hint="the copy must exist before the source is cut"
+                               if not there else "",
+                          target=f"{cluster} / {svm}:{volume}")
+
+            # The new name has to be legal and free.
+            renames = dict((job or {}).get("qtree_map") or {})
+            new_name = migrated_qtree_name(
+                name, (job or {}).get("job_id", ""), volume,
+                renames.get(name, ""))
+            free = new_name.lower() not in present
+            self._add(report, "CLEANUP_NEW_NAME_TAKEN",
+                      f"'{name}' can be renamed to '{new_name}'", free,
+                      detail=new_name if free
+                             else f"'{new_name}' already exists on the volume",
+                      target=target)
+
+            # Exactly which shares disappear. Never a guess.
+            shares, err = self._safe(
+                lambda n=name: self.c.find_cifs_shares(
+                    p.source_cluster, p.source_vserver, f"/{n}"), None)
+            if shares is None:
+                self._add(report, "CIFS_SHARES_UNREADABLE",
+                          "CIFS shares readable", False, detail=err,
+                          hint="grant readonly on /api/protocols/cifs/shares",
+                          target=p.source_cluster, severity=SEVERITY_WARNING)
+            else:
+                self._add(report, "CLEANUP_SHARES_PREVIEW",
+                          f"'{name}': CIFS shares that will be DELETED", True,
+                          severity=SEVERITY_WARNING,
+                          detail=", ".join(shares) if shares
+                                 else "none matched this qtree",
+                          target=f"{p.source_cluster} / {p.source_vserver}")
         return report
 
 

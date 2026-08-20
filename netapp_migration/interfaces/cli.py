@@ -113,8 +113,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="(resume / check-status / retry / clone / test / "
                              "acl) job ID of a previous create run.")
     parser.add_argument("--qtrees",
-                        help="(clone / test / acl) CSV list 'q1,q2' or 'all'.")
-    parser.add_argument("--qtree", help="(cleanup) single target qtree.")
+                        help="(clone / test / cleanup) CSV list 'q1,q2' or "
+                             "'all'.")
+    parser.add_argument("--qtree",
+                        help="(cleanup) one qtree — the singular form of "
+                             "--qtrees, kept for existing scripts.")
     parser.add_argument("--ad-groups",
                         help="(acl) CSV AD groups, e.g. 'DOM\\\\grp1,DOM\\\\grp2'.")
     parser.add_argument("--acl-path",
@@ -567,7 +570,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             engine.acl(args.ad_groups, acl_path=args.acl_path,
                        acl_rights=args.acl_rights, job=job)
         elif args.action == "cleanup":
-            engine.cleanup(args.qtree, job=job)
+            engine.cleanup(args.qtrees or args.qtree, job=job)
         logger.info("SUCCESS: action '%s' completed without error.", args.action)
         return 0
 

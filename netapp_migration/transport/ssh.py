@@ -321,6 +321,21 @@ class SshClient(OntapClient):
                   f"volume qtree modify -vserver {svm} -volume {volume} "
                   f"-qtree {qtree} -export-policy {policy}")
 
+    def export_policy_exists(self, cluster, svm, policy) -> bool:
+        r = self._run(cluster,
+                      f"vserver export-policy show -vserver {svm} "
+                      f"-policyname {policy}", allow_failure=True)
+        if r.exit_code != 0:
+            return False
+        text = f"{r.stdout}{r.stderr}".lower()
+        return "no entries matching" not in text and "does not exist" not in text
+
+    def create_export_policy(self, cluster, svm, policy):
+        """Created with no rule: an empty policy denies every client."""
+        self._run(cluster,
+                  f"vserver export-policy create -vserver {svm} "
+                  f"-policyname {policy}")
+
     def rename_qtree(self, cluster, svm, volume, qtree, new_name):
         self._run(cluster,
                   f"volume qtree rename -vserver {svm} -volume {volume} "

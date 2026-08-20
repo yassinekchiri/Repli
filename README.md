@@ -92,7 +92,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 179 tests, offline, no cluster contacted
+python3 -m pytest            # 206 tests, offline, no cluster contacted
 ```
 
 ---
@@ -329,6 +329,7 @@ security login rest-role create -role mutrepli_rest -api /api/storage/qtrees -ac
 security login rest-role create -role mutrepli_rest -api /api/storage/aggregates -access readonly
 security login rest-role create -role mutrepli_rest -api /api/snapmirror/relationships -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/shares -access all
+security login rest-role create -role mutrepli_rest -api /api/protocols/nfs/export-policies -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/file-security/permissions -access all
 security login rest-role create -role mutrepli_rest -api /api/svm/svms -access readonly
 security login rest-role create -role mutrepli_rest -api /api/cluster/jobs -access readonly
@@ -353,6 +354,7 @@ security login role create -role mutrepli_cli -cmddirname "volume" -access all
 security login role create -role mutrepli_cli -cmddirname "snapmirror" -access all
 security login role create -role mutrepli_cli -cmddirname "storage aggregate" -access readonly
 security login role create -role mutrepli_cli -cmddirname "vserver cifs share" -access all
+security login role create -role mutrepli_cli -cmddirname "vserver export-policy" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver security file-directory" -access all
 ```
 
@@ -641,11 +643,74 @@ before anything happens:
 
 ### 3.6 cleanup — cut source access
 
+The last action, and the only one users notice immediately: it makes the
+source shares disappear. Like `clone`, it takes **one, several, or all**
+qtrees.
+
 ```bash
-python3 netapp_cascade_migration.py --action cleanup \
+python3 netapp_cascade_migration.py --action cleanup --job-id <ID> \
     --source-cluster ... --pivot-cluster ... --dest-cluster ... \
-    --volume vol_prod_01 --qtree q_fin
+    --volume vol_prod_01 --qtrees q_fin,q_hr        # or --qtrees all
 ```
+
+`--qtree` (singular) is still accepted as an alias.
+
+For **each** qtree, on the **source only**:
+
+1. **Export policy** — the qtree is moved onto the no-access policy
+   (`--noaccess-policy`, default `ep_noaccess`). If that policy does not
+   exist it is **created with no rule at all**, which is how ONTAP denies
+   every client.
+2. **CIFS shares** — every share pointing at the qtree is deleted, so
+   Windows clients stop reaching the old copy. The pre-flight names them
+   first; the run never guesses.
+3. **Rename** — the qtree is renamed to say where its data went:
+
+   ```
+   q_finance  ->  q_finance_MIG_2da725__vol_fin_prod__finance
+                            └ job    └ new volume  └ new qtree name
+   ```
+
+   The destination qtree is left out when the name did not change. ONTAP
+   caps qtree names at 64 characters, so the original name is trimmed first
+   — the marker and the job reference are what make the qtree identifiable
+   and are kept last.
+
+**No data is deleted.** The qtree stays in place, unreachable and marked, so
+a rollback is still possible. Removing it for good is a separate, manual
+decision.
+
+The run is recorded on the job (`cleaned_up`, `cleaned_up_at`), and the
+pre-flight uses that to refuse a second pass.
+
+#### What the pre-flight refuses
+
+This is the most sensitive action in the tool, so it is also the most
+checked. Any of these stops the run before a single call is made:
+
+| Code | Refuses when |
+|---|---|
+| `CLEANUP_QTREE_MISSING` | no qtree given (an empty value would match every share of the SVM) |
+| `CLEANUP_QTREE_SEPARATOR` | a path was passed instead of a qtree name |
+| `CLEANUP_QTREE_DUPLICATE` | the same qtree appears twice |
+| `CLEANUP_MIGRATION_INCOMPLETE` | the job is not `completed` |
+| `CLEANUP_QTREE_NOT_FOUND` | the qtree is not on the source volume |
+| `CLEANUP_ALREADY_DONE` | the name already carries `_MIG_` |
+| `CLEANUP_QTREE_NOT_MIGRATED` | the qtree is not in the job's `volume_map` — cutting a source with no copy would leave the client with nothing |
+| `CLEANUP_TARGET_MISSING` | the migrated volume is absent on PROD or DR |
+| `CLEANUP_NEW_NAME_TAKEN` | the new name already exists on the volume |
+
+And these warn without stopping: `CLEANUP_CLONES_NOT_PROMOTED` (no
+`clone_promoted_at`), `CLEANUP_NO_JOB_CONTEXT` (no `--job-id`, so nothing
+can be verified), `EXPORT_POLICY_ABSENT` (it will be created),
+`CLEANUP_SHARES_PREVIEW` — the exact list of shares that will disappear:
+
+```
+| WARN | 'q_fin': CIFS shares that will be DELETED | fin_share, fin_archive |
+```
+
+One bad qtree refuses the whole run: the checks are read on their own, and a
+partially cut set of clients is worse than none.
 
 ### 3.7 Cross-cutting options
 
@@ -701,7 +766,7 @@ screenshot of every step.
 | `POST` | `/api/v1/migrations/{id}/test` | full test env (clones + mirror, time-limited) | `202` (background) |
 | `POST` | `/api/v1/migrations/{id}/clone` | definitive clones (test promotion, or `fresh` / full flow) | `202` (background) |
 | `POST` | `/api/v1/migrations/{id}/acl` | force AD-group DACLs on a path | `200` |
-| `POST` | `/api/v1/migrations/{id}/cleanup` | cut source access | `200` |
+| `POST` | `/api/v1/migrations/{id}/cleanup` | cut source access for one, several or all migrated qtrees | `200` |
 | `GET`  | `/api/v1/health` | service availability | `200` |
 
 Long actions (`create`, `retry`, `test`, `clone`) answer `202` immediately
@@ -759,9 +824,9 @@ curl -s -X POST $BASE/migrations/$JOB/clone \
 curl -s -X POST $BASE/migrations/$JOB/clone \
      -H 'Content-Type: application/json' -d '{"qtrees": "all", "fresh": true}'
 
-# Cut source access for a migrated qtree
+# Cut source access for migrated qtrees (one, several, or "all")
 curl -s -X POST $BASE/migrations/$JOB/cleanup \
-     -H 'Content-Type: application/json' -d '{"qtree": "q_fin"}'
+     -H 'Content-Type: application/json' -d '{"qtrees": "q_fin,q_hr"}'
 ```
 
 ### 4.4 systemd service

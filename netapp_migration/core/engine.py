@@ -26,6 +26,7 @@ from typing import Dict, List, Optional
 from ..models import (MigrationParams, OntapError, ConfirmationRequired,
                       PreflightFailed, PreflightReport, SnapMirrorInfo)
 from ..transport.base import OntapClient
+from .naming import migrated_qtree_name
 from .jobs import (JobStore, CREATE_STATUS_ORDER, ACTION_SUCCESS,
                    ACTION_FAILED, ACTION_REFUSED, ACTION_NEEDS_CONFIRMATION)
 from .preflight import PreflightChecker
@@ -1326,38 +1327,100 @@ class MigrationEngine:
                           volume, len(surplus), ", ".join(surplus))
         return deleted
 
-    @records("cleanup")
-    def cleanup(self, qtree: str, job: Optional[dict] = None) -> dict:
-        """Cut source access for one qtree (export-policy, CIFS, rename)."""
+    def _ensure_noaccess_policy(self) -> bool:
+        """The no-access export policy must exist before it is applied.
+
+        Created with NO rules: an empty policy denies every client, which is
+        the whole point. Returns True when it had to be created.
+        """
         p = self.p
+        if self.c.export_policy_exists(p.source_cluster, p.source_vserver,
+                                       p.noaccess_policy):
+            return False
+        self.c.create_export_policy(p.source_cluster, p.source_vserver,
+                                    p.noaccess_policy)
+        self.log.info("         Export policy '%s' created with no rule "
+                      "(denies every client).", p.noaccess_policy)
+        return True
+
+    @records("cleanup")
+    def cleanup(self, qtrees_arg: str, job: Optional[dict] = None) -> dict:
+        """Cut source access for one, several or all migrated qtrees.
+
+        Per qtree, on the SOURCE only:
+          1. the no-access export policy (created if missing, with no rule);
+          2. every CIFS share pointing at the qtree is deleted;
+          3. the qtree is renamed to say where its data went.
+
+        No data is deleted: the qtree stays in place, unreachable and marked,
+        so a rollback is still possible. Removing it for good is a separate,
+        manual decision.
+        """
+        p = self.p
+        if job is not None:
+            self.job_id = job["job_id"]
+        # Not resolved when empty: the pre-flight gives a far better answer
+        # than "no Qtree to process" from the resolver.
+        qtrees = (self._resolve_qtrees(qtrees_arg)
+                  if (qtrees_arg or "").strip() else [])
+        self._preflight(self.checker.for_cleanup(job, qtrees))
+
+        volumes = dict((job or {}).get("volume_map") or {})
+        renames = dict((job or {}).get("qtree_map") or {})
+
         self.log.info("=" * 60)
-        self.log.info("  ACTION: cleanup  |  source qtree '%s'", qtree)
+        self.log.info("  ACTION: cleanup  |  cutting source access")
         self.log.info("=" * 60)
 
-        # Qtree non-empty and existing, migration confirmed complete, and an
-        # explicit preview of the CIFS shares that will be deleted.
-        self._preflight(self.checker.for_cleanup(job, qtree))
-        qtree = qtree.strip()
+        plan = []
+        for qtree in qtrees:
+            volume = volumes.get(qtree) or next(
+                (v for k, v in volumes.items() if k.lower() == qtree.lower()),
+                "")
+            plan.append((qtree, volume,
+                         migrated_qtree_name(qtree, self.job_id or "",
+                                             volume,
+                                             renames.get(qtree, ""))))
+        self._log_table(["Qtree", "Migrated to volume", "Renamed to"],
+                        [[q, v or "(unknown)", n] for q, v, n in plan])
 
-        self.c.set_qtree_export_policy(p.source_cluster, p.source_vserver,
-                                       p.volume, qtree, p.noaccess_policy)
-        self.log.info("Export-policy '%s' applied to qtree '%s'.",
-                      p.noaccess_policy, qtree)
+        created_policy = self._ensure_noaccess_policy()
 
-        shares = self.c.find_cifs_shares(p.source_cluster, p.source_vserver,
-                                         f"/{qtree}")
-        if not shares:
-            self.log.info("No CIFS share associated with qtree '%s'.", qtree)
-        for share in shares:
-            self.c.delete_cifs_share(p.source_cluster, p.source_vserver, share)
-            self.log.info("CIFS share '%s' deleted.", share)
+        results = []
+        for qtree, volume, new_name in plan:
+            self.c.set_qtree_export_policy(p.source_cluster, p.source_vserver,
+                                           p.volume, qtree, p.noaccess_policy)
+            self.log.info("         '%s'  export-policy -> %s", qtree,
+                          p.noaccess_policy)
 
-        today = datetime.datetime.now().strftime("%d_%m_%Y")
-        new_name = f"{qtree}_tobedeleted_migratedtosfs_{today}"
-        self.c.rename_qtree(p.source_cluster, p.source_vserver, p.volume,
-                            qtree, new_name)
-        self.log.info("Source qtree renamed: '%s' -> '%s'.", qtree, new_name)
+            shares = self.c.find_cifs_shares(p.source_cluster,
+                                             p.source_vserver, f"/{qtree}")
+            for share in shares:
+                self.c.delete_cifs_share(p.source_cluster, p.source_vserver,
+                                         share)
+                self.log.info("         '%s'  CIFS share '%s' deleted.",
+                              qtree, share)
+            if not shares:
+                self.log.info("         '%s'  no CIFS share.", qtree)
 
-        self.log.info("ACTION 'cleanup' complete for qtree '%s'.", qtree)
-        return {"qtree": qtree, "renamed_to": new_name,
-                "deleted_shares": shares}
+            self.c.rename_qtree(p.source_cluster, p.source_vserver, p.volume,
+                                qtree, new_name)
+            self.log.info("         '%s'  renamed -> '%s'", qtree, new_name)
+            results.append({"qtree": qtree, "volume": volume,
+                            "renamed_to": new_name, "deleted_shares": shares})
+
+        if job is not None:
+            job["cleaned_up"] = {r["qtree"]: r["renamed_to"] for r in results}
+            job["cleaned_up_at"] = datetime.datetime.now().isoformat(
+                timespec="seconds")
+            self.jobs.save(job)
+
+        self.log.info("=" * 60)
+        self.log.info("  Source access cut for %d qtree(s). No data deleted:",
+                      len(results))
+        self.log.info("  the qtrees stay in place, renamed and unreachable.")
+        self.log.info("=" * 60)
+        return {"qtrees": [r["qtree"] for r in results],
+                "results": results,
+                "export_policy": p.noaccess_policy,
+                "export_policy_created": created_policy}

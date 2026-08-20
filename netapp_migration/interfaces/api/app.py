@@ -18,7 +18,7 @@ Endpoint map (prefix /api/v1):
     POST /migrations/{job_id}/test      thin FlexClones         -> 202 (background)
     POST /migrations/{job_id}/clone     real clones + vol move  -> 202 (background)
     POST /migrations/{job_id}/acl       force AD-group DACLs
-    POST /migrations/{job_id}/cleanup   cut source access
+    POST /migrations/{job_id}/cleanup   cut source access (1..n qtrees)
 
 Long actions run in a background thread; poll GET /migrations/{job_id} to
 follow their console output and final state. One action at a time per job
@@ -535,7 +535,8 @@ def preflight_action(job_id: str, action: str,
     elif action == "acl":
         _authorise(principal, "acl", _qtrees_of_path(job, req.acl_path or ""))
     elif action == "cleanup":
-        _authorise(principal, "cleanup", [req.qtree] if req.qtree else [])
+        _authorise(principal, "cleanup",
+                   _requested_qtrees(params, req.qtrees_csv, {}))
     else:
         _authorise(principal, action)
 
@@ -559,7 +560,9 @@ def preflight_action(job_id: str, action: str,
         report = checker.for_acl(job, req.acl_path or "", req.ad_groups_list,
                                  "full-control")
     elif action == "cleanup":
-        report = checker.for_cleanup(job, req.qtree or "")
+        report = checker.for_cleanup(
+            job, [q.strip() for q in (req.qtrees_csv or "").split(",")
+                  if q.strip()])
     else:
         raise HTTPException(
             status_code=400,
@@ -691,14 +694,28 @@ def acl_migration(job_id: str, req: AclRequest,
 @app.post("/api/v1/migrations/{job_id}/cleanup", response_model=ActionResult)
 def cleanup_migration(job_id: str, req: CleanupRequest,
                       principal: Principal = Depends(current_principal)):
-    """Cut source access for one qtree (export-policy, CIFS, rename)."""
+    """Cut source access for one, several or all migrated qtrees.
+
+    Per qtree, on the SOURCE only: the no-access export policy (created with
+    no rule if missing), every CIFS share pointing at it deleted, and the
+    qtree renamed to record where its data went.
+
+    No data is deleted. The pre-flight refuses a qtree this job never
+    migrated — cutting the source of something with no copy would leave the
+    client with nothing.
+    """
     job = _load_job_or_404(job_id)
     params = _store.params_of(job)
-    _authorise(principal, "cleanup", [req.qtree] if req.qtree else [])
+    _authorise(principal, "cleanup",
+               _requested_qtrees(params, req.qtrees_csv, {}))
+    _ensure_feasible(params, "cleanup",
+                     lambda ch: ch.for_cleanup(
+                         job, [q.strip() for q in req.qtrees_csv.split(",")
+                               if q.strip()]))
 
     def target(logger) -> dict:
         engine = _engine_for(params, logger)
-        return engine.cleanup(req.qtree, job=job)
+        return engine.cleanup(req.qtrees_csv, job=job)
 
     return _run_sync(job_id, "cleanup", target)
 

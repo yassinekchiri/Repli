@@ -93,7 +93,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 179 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 206 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -335,6 +335,7 @@ security login rest-role create -role mutrepli_rest -api /api/storage/qtrees -ac
 security login rest-role create -role mutrepli_rest -api /api/storage/aggregates -access readonly
 security login rest-role create -role mutrepli_rest -api /api/snapmirror/relationships -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/shares -access all
+security login rest-role create -role mutrepli_rest -api /api/protocols/nfs/export-policies -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/file-security/permissions -access all
 security login rest-role create -role mutrepli_rest -api /api/svm/svms -access readonly
 security login rest-role create -role mutrepli_rest -api /api/cluster/jobs -access readonly
@@ -359,6 +360,7 @@ security login role create -role mutrepli_cli -cmddirname "volume" -access all
 security login role create -role mutrepli_cli -cmddirname "snapmirror" -access all
 security login role create -role mutrepli_cli -cmddirname "storage aggregate" -access readonly
 security login role create -role mutrepli_cli -cmddirname "vserver cifs share" -access all
+security login role create -role mutrepli_cli -cmddirname "vserver export-policy" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver security file-directory" -access all
 ```
 
@@ -651,11 +653,76 @@ run. Le pré-vol liste les suppressions avant qu'elles n'arrivent :
 
 ### 3.6 cleanup — coupure d'accès source
 
+La dernière action, et la seule que les utilisateurs voient immédiatement :
+elle fait disparaître les partages source. Comme `clone`, elle accepte **un,
+plusieurs ou tous** les qtrees.
+
 ```bash
-python3 netapp_cascade_migration.py --action cleanup \
+python3 netapp_cascade_migration.py --action cleanup --job-id <ID> \
     --source-cluster ... --pivot-cluster ... --dest-cluster ... \
-    --volume vol_prod_01 --qtree q_fin
+    --volume vol_prod_01 --qtrees q_fin,q_hr        # ou --qtrees all
 ```
+
+`--qtree` (singulier) reste accepté comme alias.
+
+Pour **chaque** qtree, sur la **source uniquement** :
+
+1. **Export policy** — le qtree est basculé sur la policy no-access
+   (`--noaccess-policy`, défaut `ep_noaccess`). Si elle n'existe pas, elle
+   est **créée sans aucune règle** : c'est ainsi qu'ONTAP refuse tous les
+   clients.
+2. **Partages CIFS** — tout partage pointant vers le qtree est supprimé, afin
+   que les clients Windows cessent d'atteindre l'ancienne copie. Le pré-vol
+   les nomme d'abord ; le run ne devine jamais.
+3. **Renommage** — le qtree est renommé pour dire où sont parties ses
+   données :
+
+   ```
+   q_finance  ->  q_finance_MIG_2da725__vol_fin_prod__finance
+                            └ job    └ nouveau volume └ nouveau qtree
+   ```
+
+   Le qtree de destination est omis quand le nom n'a pas changé. ONTAP limite
+   les noms de qtree à 64 caractères : le nom d'origine est tronqué en
+   premier, le marqueur et la référence du job en dernier — ce sont eux qui
+   rendent le qtree identifiable.
+
+**Aucune donnée n'est supprimée.** Le qtree reste en place, inaccessible et
+marqué : un retour arrière est toujours possible. Le supprimer définitivement
+est une décision distincte et manuelle.
+
+Le run est enregistré sur le job (`cleaned_up`, `cleaned_up_at`), et le
+pré-vol s'en sert pour refuser un second passage.
+
+#### Ce que le pré-vol refuse
+
+C'est l'action la plus sensible de l'outil, c'est donc la plus contrôlée.
+Chacun de ces points interrompt le run avant le moindre appel :
+
+| Code | Refuse quand |
+|---|---|
+| `CLEANUP_QTREE_MISSING` | aucun qtree fourni (une valeur vide correspondrait à tous les partages du SVM) |
+| `CLEANUP_QTREE_SEPARATOR` | un chemin a été passé à la place d'un nom de qtree |
+| `CLEANUP_QTREE_DUPLICATE` | le même qtree apparaît deux fois |
+| `CLEANUP_MIGRATION_INCOMPLETE` | le job n'est pas `completed` |
+| `CLEANUP_QTREE_NOT_FOUND` | le qtree n'est pas sur le volume source |
+| `CLEANUP_ALREADY_DONE` | le nom porte déjà `_MIG_` |
+| `CLEANUP_QTREE_NOT_MIGRATED` | le qtree n'est pas dans le `volume_map` du job — couper une source sans copie laisserait le client sans rien |
+| `CLEANUP_TARGET_MISSING` | le volume migré est absent sur PROD ou DR |
+| `CLEANUP_NEW_NAME_TAKEN` | le nouveau nom existe déjà sur le volume |
+
+Et ceux-ci avertissent sans bloquer : `CLEANUP_CLONES_NOT_PROMOTED` (pas de
+`clone_promoted_at`), `CLEANUP_NO_JOB_CONTEXT` (pas de `--job-id`, donc rien
+n'est vérifiable), `EXPORT_POLICY_ABSENT` (elle sera créée),
+`CLEANUP_SHARES_PREVIEW` — la liste exacte des partages qui vont
+disparaître :
+
+```
+| WARN | 'q_fin' : partages CIFS qui seront SUPPRIMÉS | fin_share, fin_archive |
+```
+
+Un seul qtree en faute refuse tout le run : les contrôles se lisent d'un
+bloc, et un ensemble de clients coupé à moitié est pire que rien.
 
 ### 3.7 Options transverses
 
@@ -711,7 +778,7 @@ réelle à chaque étape.
 | `POST` | `/api/v1/migrations/{id}/test` | env de test complet (clones + miroir, limité dans le temps) | `202` (fond) |
 | `POST` | `/api/v1/migrations/{id}/clone` | clones définitifs (promotion du test, ou `fresh` / flux complet) | `202` (fond) |
 | `POST` | `/api/v1/migrations/{id}/acl` | forçage DACL groupes AD sur un path | `200` |
-| `POST` | `/api/v1/migrations/{id}/cleanup` | coupure accès source | `200` |
+| `POST` | `/api/v1/migrations/{id}/cleanup` | coupure accès source pour un, plusieurs ou tous les qtrees migrés | `200` |
 | `GET`  | `/api/v1/health` | disponibilité du service | `200` |
 
 Les actions longues (`create`, `retry`, `test`, `clone`) répondent `202`

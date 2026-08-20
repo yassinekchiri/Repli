@@ -82,6 +82,20 @@ class OntapClient(ABC):
                      qtree: str, new_name: str) -> None: ...
 
     @abstractmethod
+    def export_policy_exists(self, cluster: str, svm: str,
+                             policy: str) -> bool:
+        """Is this export policy defined on the SVM?"""
+
+    @abstractmethod
+    def create_export_policy(self, cluster: str, svm: str,
+                             policy: str) -> None:
+        """Create an export policy with NO rules.
+
+        No rules is the point: an empty policy denies every client, which is
+        exactly what 'cut the source access' means.
+        """
+
+    @abstractmethod
     def delete_qtree(self, cluster: str, svm: str, volume: str,
                      qtree: str) -> None:
         """Delete a qtree AND ITS CONTENTS. Irreversible.

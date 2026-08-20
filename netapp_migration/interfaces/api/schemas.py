@@ -153,7 +153,17 @@ class AclRequest(BaseModel):
 
 
 class CleanupRequest(BaseModel):
-    qtree: str
+    """cleanup payload: one, several or all qtrees.
+
+    `qtree` (singular) is the previous shape and still works; `qtrees` takes
+    a CSV string, a list, or "all".
+    """
+    qtrees: Union[str, List[str], None] = None
+    qtree: Optional[str] = None
+
+    @property
+    def qtrees_csv(self) -> str:
+        return _csv(self.qtrees) or (self.qtree or "")
 
 
 class ActionAccepted(BaseModel):

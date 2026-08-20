@@ -306,6 +306,17 @@ class RestClient(OntapClient):
         rec = records[0]
         return rec["volume"]["uuid"], rec["id"]
 
+    def export_policy_exists(self, cluster, svm, policy) -> bool:
+        body = self._request(cluster, "GET", "/protocols/nfs/export-policies",
+                             params={"name": policy, "svm.name": svm,
+                                     "fields": "name"})
+        return bool(body.get("records"))
+
+    def create_export_policy(self, cluster, svm, policy):
+        """Create it empty: no 'rules' key means no rule, means no access."""
+        self._request(cluster, "POST", "/protocols/nfs/export-policies",
+                      json_body={"name": policy, "svm": {"name": svm}})
+
     def set_qtree_export_policy(self, cluster, svm, volume, qtree, policy):
         vol_uuid, qtree_id = self._qtree_ref(cluster, svm, volume, qtree)
         self._request(cluster, "PATCH",

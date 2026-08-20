@@ -44,6 +44,7 @@ REST_GRANTS=(
     "/api/storage/aggregates|readonly"
     "/api/snapmirror/relationships|all"
     "/api/protocols/cifs/shares|all"
+    "/api/protocols/nfs/export-policies|all"
     "/api/protocols/file-security/permissions|all"
     "/api/svm/svms|readonly"
     "/api/cluster/jobs|readonly"
@@ -58,6 +59,7 @@ CLI_GRANTS=(
     "snapmirror|all"
     "storage aggregate|readonly"
     "vserver cifs share|all"
+    "vserver export-policy|all"
     "vserver security file-directory|all"
 )
 

@@ -86,6 +86,13 @@ class DryRunClient(OntapClient):
         self._trace(cluster, f"qtree list {svm}:{volume}")
         return ["qtree_dryrun1", "qtree_dryrun2"]
 
+    def export_policy_exists(self, cluster, svm, policy) -> bool:
+        self._trace(cluster, f"export-policy exists? {svm}:{policy} -> yes")
+        return True
+
+    def create_export_policy(self, cluster, svm, policy):
+        self._trace(cluster, f"export-policy create {svm}:{policy} (no rules)")
+
     def set_qtree_export_policy(self, cluster, svm, volume, qtree, policy):
         self._trace(cluster, f"qtree modify {volume}/{qtree} export-policy={policy}")
 

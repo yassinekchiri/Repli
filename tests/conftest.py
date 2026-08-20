@@ -106,6 +106,9 @@ class FakeClient(OntapClient):
         self.qtrees: Dict[tuple, List[str]] = {
             ("SRC", "svm_source", "vol_prod_01"): ["q_fin", "q_hr", "q_ops"],
         }
+        # Export policies per (cluster, svm). ep_noaccess deliberately
+        # absent by default: cleanup has to create it.
+        self.export_policies: Dict[tuple, set] = {}
         self.shares: Dict[tuple, Dict[str, str]] = {
             ("SRC", "svm_source"): {"fin_share": "/vol_prod_01/q_fin",
                                     "hr_share": "/vol_prod_01/q_hr"},
@@ -207,6 +210,13 @@ class FakeClient(OntapClient):
             qtrees[qtrees.index(qtree)] = new_name
 
     # ---- CIFS ----------------------------------------------------------- #
+    def export_policy_exists(self, cluster, svm, policy) -> bool:
+        return policy in self.export_policies.get((cluster, svm), set())
+
+    def create_export_policy(self, cluster, svm, policy):
+        self.calls.append(f"create_export_policy {cluster} {svm}:{policy}")
+        self.export_policies.setdefault((cluster, svm), set()).add(policy)
+
     def delete_qtree(self, cluster, svm, volume, qtree):
         self.calls.append(f"delete_qtree {cluster} {volume}/{qtree}")
         qtrees = self.qtrees.get((cluster, svm, volume), [])
