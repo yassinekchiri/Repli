@@ -49,6 +49,7 @@ netapp_migration/
 
 netapp_cascade_migration.py # CLI entry point (historical compatibility)
 requirements.txt
+setup-ontap-account.sh      # ONTAP side: creates the service account + roles
 install.sh                  # installer, offline, needs the checkout + wheels/
 install-standalone.sh       # installer, ONE self-contained file (generated)
 repo-selfextract.sh         # the whole repo in one file, extracts only (generated)
@@ -295,8 +296,29 @@ mkdir -p "$NETAPP_MIGRATION_JOB_DIR"
 
 ### 2.5 Creating the ONTAP service account `mutrepli` (least privilege)
 
-Run the following **on every cluster of the topology** (source, pivot,
-PROD, DR), from the cluster admin CLI. The role only grants the commands
+`setup-ontap-account.sh` does all of this for one cluster, idempotently:
+
+```bash
+./setup-ontap-account.sh                    # asks for the cluster, then the password
+./setup-ontap-account.sh --cluster clu01    # asks for the password only
+./setup-ontap-account.sh --check            # report what exists, change nothing
+./setup-ontap-account.sh --dry-run          # print every command, run none
+```
+
+It assumes **your own** administrative SSH access to the cluster already
+works (key or agent) — it only ever runs `ssh <cluster> <ONTAP command>` and
+never asks for your password. The password for the new account is read from
+the terminal twice, hidden, and handed straight to the cluster: never on a
+command line, never in a file, never in the script's output.
+
+Re-running it is safe: existing roles, grants and logins are detected and
+kept. `--account`, `--rest-role`, `--cli-role` and `--vserver` override the
+defaults; `--no-ssh-login` creates REST access only.
+
+Run it once per cluster of the topology (source, pivot, PROD, DR).
+
+The commands it issues are below, should you prefer to run them by hand
+from the cluster admin CLI. The role only grants the commands
 / endpoints the tool actually uses; everything else stays denied.
 
 **REST role (used by the default `rest` transport):**

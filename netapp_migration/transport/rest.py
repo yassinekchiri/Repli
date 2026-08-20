@@ -321,14 +321,19 @@ class RestClient(OntapClient):
     def delete_qtree(self, cluster, svm, volume, qtree):
         """Delete a qtree and everything in it. Irreversible.
 
-        ONTAP runs this asynchronously and refuses a non-empty qtree without
-        force, so the deletion is waited to completion: returning before the
-        job finished would let the caller believe the space is already back.
+        No 'force' parameter: unlike the CLI's `volume qtree delete -force`,
+        the REST endpoint takes none and answers
+        `HTTP 400: Unexpected Argument "force"` if given one (verified on
+        9.16.1). The REST delete removes the qtree with its contents on its
+        own.
+
+        Waited to completion: ONTAP runs it as a job, and returning early
+        would let the caller believe the space is already back.
         """
         vol_uuid, qtree_id = self._qtree_ref(cluster, svm, volume, qtree)
         self._request(cluster, "DELETE",
                       f"/storage/qtrees/{vol_uuid}/{qtree_id}",
-                      params={"force": "true"}, wait_job=True)
+                      wait_job=True)
 
     # ------------------------------------------------------------------ #
     # CIFS shares

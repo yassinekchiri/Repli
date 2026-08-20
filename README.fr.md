@@ -49,6 +49,7 @@ netapp_migration/
 
 netapp_cascade_migration.py # point d'entrée CLI (compatibilité historique)
 requirements.txt
+setup-ontap-account.sh      # côté ONTAP : crée le compte de service + les rôles
 install.sh                  # installeur hors-ligne, exige le checkout + wheels/
 install-standalone.sh       # installeur en UN seul fichier autonome (généré)
 repo-selfextract.sh         # tout le dépôt en un fichier, extraction seule (généré)
@@ -299,8 +300,31 @@ mkdir -p "$NETAPP_MIGRATION_JOB_DIR"
 
 ### 2.5 Créer le compte de service ONTAP `mutrepli` (moindre privilège)
 
-À exécuter **sur chaque cluster de la topologie** (source, pivot, PROD,
-DR), depuis la CLI admin du cluster. Le rôle n'autorise que les commandes
+`setup-ontap-account.sh` fait tout cela pour un cluster, de façon idempotente :
+
+```bash
+./setup-ontap-account.sh                    # demande le cluster, puis le mot de passe
+./setup-ontap-account.sh --cluster clu01    # ne demande que le mot de passe
+./setup-ontap-account.sh --check            # rapporte l'existant, ne modifie rien
+./setup-ontap-account.sh --dry-run          # affiche les commandes, n'en lance aucune
+```
+
+Il suppose que **votre propre** accès SSH administrateur au cluster
+fonctionne déjà (clé ou agent) — il ne fait jamais que
+`ssh <cluster> <commande ONTAP>` et ne demande jamais votre mot de passe.
+Celui du nouveau compte est saisi au terminal, deux fois, masqué, et remis
+directement au cluster : jamais en ligne de commande, jamais dans un
+fichier, jamais dans la sortie du script.
+
+Le relancer est sans risque : rôles, droits et logins existants sont
+détectés et conservés. `--account`, `--rest-role`, `--cli-role` et
+`--vserver` remplacent les valeurs par défaut ; `--no-ssh-login` ne crée que
+l'accès REST.
+
+À lancer une fois par cluster de la topologie (source, pivot, PROD, DR).
+
+Les commandes qu'il exécute sont ci-dessous, si vous préférez les passer à
+la main depuis la CLI admin du cluster. Le rôle n'autorise que les commandes
 / endpoints réellement utilisés par l'outil ; tout le reste est refusé.
 
 **Rôle REST (utilisé par le transport `rest` par défaut) :**
