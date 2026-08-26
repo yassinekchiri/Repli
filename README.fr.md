@@ -78,8 +78,9 @@ détaillés de la migration.
 Chaque action vérifie ses prérequis sur les clusters **avant** de toucher à
 quoi que ce soit : SVMs, volumes, aggregates et capacité, peering
 cluster/SVM, visibilité de la policy et du schedule SnapMirror, état des
-relations, existence des qtrees, périmètre du chemin ACL, prévisualisation
-des partages CIFS pour cleanup. Une action refusée ne modifie rien et
+relations, existence des qtrees, export policies et les clients qu'elles
+portent, périmètre du chemin ACL, prévisualisation des partages CIFS pour
+cleanup. Une action refusée ne modifie rien et
 détaille chaque contrôle en échec avec ce qui a été observé et comment le
 corriger (tableau en CLI, HTTP 422). Interroger sans exécuter :
 
@@ -93,7 +94,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 206 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 234 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -649,6 +650,52 @@ run. Le pré-vol liste les suppressions avant qu'elles n'arrivent :
 
 ```
 | WARN | 'vol_fin' : qtrees hérités qui seront SUPPRIMÉS | keeps 'q_fin', deletes 2: q_hr, q_ops |
+```
+
+#### Export policies : les clients suivent leurs données
+
+Une export policy est un **objet du SVM**. Elle ne voyage pas avec les
+données. Un FlexClone hérite du *nom* de la policy de son volume parent, et
+ce nom ne veut rien dire sur le SVM de destination — le qtree migré pointe
+alors vers une policy absente, ou pire, appartenant à quelqu'un d'autre. Dans
+les deux cas l'accès NFS du client casse dès que la source est coupée.
+
+`clone` et `test` lisent donc, pour chaque qtree **à la source**, l'export
+policy qui lui est appliquée et les règles de cette policy — les client
+matches — puis créent `ep_<qtree de destination>` sur **PROD et DR** avec les
+mêmes règles :
+
+```
+| Qtree | Source policy | Policy on PROD + DR | Clients carried over  |
+| q_fin | ep_prod_nfs   | ep_finance          | 10.0.0.0/8, @admins   |
+```
+
+La policy porte le nom du qtree **tel qu'il existe à la destination** : quand
+le client a renommé `q_fin` en `finance` via la carte des qtrees, la policy
+s'appelle `ep_finance`, car c'est ce nom qu'un exploitant voit sur le cluster.
+
+Elle est **appliquée sur PROD uniquement**, avant que le miroir des clones
+n'existe, afin que le premier resync porte l'affectation jusqu'à DR. Sur DR
+la policy est seulement *créée* — le clone DR est une destination SnapMirror
+en lecture seule et ne peut pas y être modifié, mais l'objet doit exister sous
+le même nom, sinon l'affectation répliquée ne résout plus rien le jour où DR
+est activé.
+
+Une policy existante portant ce nom est **réutilisée, jamais réécrite** :
+elle peut appartenir à quelque chose que ce job ignore. Le pré-vol le
+signale (`EXPORT_POLICY_NAME_TAKEN`) et annonce tout le plan avant exécution :
+
+```
+| PASS | 'q_fin': policy 'ep_finance' on PROD and DR   | ep_prod_nfs -> ep_finance (2 rule(s)) |
+| PASS | 'q_fin': source policy 'ep_prod_nfs' grants…  | 2 rule(s), clients: 10.0.0.0/8, @admins |
+```
+
+Une policy source **sans aucune règle** n'est pas une erreur — certains
+qtrees sont réellement CIFS uniquement — mais ce n'est jamais silencieux,
+puisque la destination refuserait alors tous les clients NFS :
+
+```
+| WARN | 'q_ops': source policy 'default' grants at least one client | policy 'default' has no rule — 'ep_q_ops' will deny every NFS client |
 ```
 
 ### 3.6 cleanup — coupure d'accès source

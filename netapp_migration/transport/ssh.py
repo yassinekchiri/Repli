@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ..models import (OntapError, VolumeInfo, AggregateInfo, SnapMirrorInfo,
-                      SvmInfo, PeerInfo)
+                      SvmInfo, PeerInfo, ExportRule)
 from .base import OntapClient
 
 # Typical error patterns returned by the ONTAP CLI even when the SSH exit
@@ -90,6 +90,44 @@ def parse_qtree_list(stdout: str) -> List[str]:
         if name and name not in ('""', "-"):
             qtrees.append(name)
     return qtrees
+
+
+def _split_list_field(value: Optional[str]) -> List[str]:
+    """'sys, krb5' / 'any' / '-' -> a list of plain strings."""
+    if not value or value.strip() in ("-", '""'):
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def parse_export_rules(stdout: str) -> List[ExportRule]:
+    """Parse `vserver export-policy rule show -instance` into ExportRules.
+
+    One -instance block per rule. Blocks that carry no rule index are
+    headers or blank noise and are skipped.
+    """
+    rules: List[ExportRule] = []
+    for block in re.split(r"\n\s*\n", stdout):
+        fields = parse_instance(block)
+        index = get_instance_field(fields, "rule index")
+        if index is None:
+            continue
+        clients = get_instance_field(fields, "client match hostname, ip "
+                                             "address, netgroup, or domain",
+                                     "client match spec", "client match")
+        rules.append(ExportRule(
+            clients=_split_list_field(clients),
+            ro_rule=_split_list_field(
+                get_instance_field(fields, "ro access rule")),
+            rw_rule=_split_list_field(
+                get_instance_field(fields, "rw access rule")),
+            superuser=_split_list_field(
+                get_instance_field(fields, "superuser security types")),
+            protocols=_split_list_field(
+                get_instance_field(fields, "access protocol")),
+            anonymous_user=get_instance_field(
+                fields, "user id to which anonymous users are mapped") or "",
+            index=int(index) if index.isdigit() else None))
+    return rules
 
 
 def parse_cifs_shares_for_path(stdout: str, fragment: str) -> List[str]:
@@ -321,6 +359,14 @@ class SshClient(OntapClient):
                   f"volume qtree modify -vserver {svm} -volume {volume} "
                   f"-qtree {qtree} -export-policy {policy}")
 
+    def get_qtree_export_policy(self, cluster, svm, volume, qtree) -> str:
+        r = self._run(cluster,
+                      f"volume qtree show -vserver {svm} -volume {volume} "
+                      f"-qtree {qtree} -instance")
+        fields = parse_instance(r.stdout)
+        return get_instance_field(fields, "export policy",
+                                  "export policy name") or ""
+
     def export_policy_exists(self, cluster, svm, policy) -> bool:
         r = self._run(cluster,
                       f"vserver export-policy show -vserver {svm} "
@@ -330,11 +376,38 @@ class SshClient(OntapClient):
         text = f"{r.stdout}{r.stderr}".lower()
         return "no entries matching" not in text and "does not exist" not in text
 
-    def create_export_policy(self, cluster, svm, policy):
-        """Created with no rule: an empty policy denies every client."""
+    def get_export_policy_rules(self, cluster, svm, policy) -> List[ExportRule]:
+        """A policy with no rule prints 'no entries', which is not an error."""
+        r = self._run(cluster,
+                      f"vserver export-policy rule show -vserver {svm} "
+                      f"-policyname {policy} -instance", allow_failure=True)
+        if "no entries matching" in f"{r.stdout}{r.stderr}".lower():
+            return []
+        if r.exit_code != 0:
+            raise OntapError(cluster, f"export policy '{policy}' on {svm}",
+                             r.stderr.strip() or r.stdout.strip())
+        return parse_export_rules(r.stdout)
+
+    def create_export_policy(self, cluster, svm, policy, rules=None):
+        """Create the policy, then add each rule in order.
+
+        Unlike REST, the CLI has no way to create a policy and its rules in
+        one command, so the policy exists ruleless — denying everyone — for
+        as long as the rules take to add. That is the safe direction to fail
+        in, and this only ever runs against a destination no client uses yet.
+        """
         self._run(cluster,
                   f"vserver export-policy create -vserver {svm} "
                   f"-policyname {policy}")
+        for position, rule in enumerate(rules or [], start=1):
+            self._run(cluster,
+                      f"vserver export-policy rule create -vserver {svm} "
+                      f"-policyname {policy} -ruleindex {position} "
+                      f"-clientmatch {','.join(rule.clients)} "
+                      f"-rorule {','.join(rule.ro_rule) or 'any'} "
+                      f"-rwrule {','.join(rule.rw_rule) or 'any'} "
+                      f"-protocol {','.join(rule.protocols) or 'any'} "
+                      f"-superuser {','.join(rule.superuser) or 'none'}")
 
     def rename_qtree(self, cluster, svm, volume, qtree, new_name):
         self._run(cluster,

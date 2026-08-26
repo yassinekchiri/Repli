@@ -98,8 +98,9 @@ def test_the_export_policy_is_created_when_missing(engine, migrated, client,
 
 def test_an_existing_policy_is_reused_not_recreated(engine, migrated, client,
                                                     params):
-    client.export_policies[(params.source_cluster,
-                            params.source_vserver)] = {params.noaccess_policy}
+    client.export_policies.setdefault(
+        (params.source_cluster, params.source_vserver),
+        {})[params.noaccess_policy] = []
 
     result = engine.cleanup("q_fin", job=migrated)
 

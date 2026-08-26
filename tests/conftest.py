@@ -11,7 +11,8 @@ from typing import Dict, List, Optional
 
 import pytest
 
-from netapp_migration.models import (AggregateInfo, MigrationParams, OntapError,
+from netapp_migration.models import (AggregateInfo, ExportRule,
+                                     MigrationParams, OntapError,
                                      PeerInfo, SnapMirrorInfo, SvmInfo,
                                      VolumeInfo)
 from netapp_migration.transport.base import OntapClient
@@ -106,9 +107,25 @@ class FakeClient(OntapClient):
         self.qtrees: Dict[tuple, List[str]] = {
             ("SRC", "svm_source", "vol_prod_01"): ["q_fin", "q_hr", "q_ops"],
         }
-        # Export policies per (cluster, svm). ep_noaccess deliberately
-        # absent by default: cleanup has to create it.
-        self.export_policies: Dict[tuple, set] = {}
+        # (cluster, svm) -> {policy name: [ExportRule]}. ep_noaccess is
+        # deliberately absent everywhere: cleanup has to create it. The
+        # source SVM carries one real policy so clone has clients to copy.
+        self.export_policies: Dict[tuple, Dict[str, List[ExportRule]]] = {
+            ("SRC", "svm_source"): {
+                "ep_source": [ExportRule(clients=["10.0.0.0/8", "@admins"],
+                                         ro_rule=["sys"], rw_rule=["sys"],
+                                         superuser=["none"],
+                                         protocols=["nfs"], index=1)],
+                "default": [],
+            },
+        }
+        # (cluster, svm, volume, qtree) -> policy name. Absent means the
+        # qtree inherits the SVM default, exactly like a real cluster.
+        self.qtree_policies: Dict[tuple, str] = {
+            ("SRC", "svm_source", "vol_prod_01", "q_fin"): "ep_source",
+            ("SRC", "svm_source", "vol_prod_01", "q_hr"): "ep_source",
+            ("SRC", "svm_source", "vol_prod_01", "q_ops"): "ep_source",
+        }
         self.shares: Dict[tuple, Dict[str, str]] = {
             ("SRC", "svm_source"): {"fin_share": "/vol_prod_01/q_fin",
                                     "hr_share": "/vol_prod_01/q_hr"},
@@ -198,7 +215,17 @@ class FakeClient(OntapClient):
         return list(self.qtrees.get((cluster, svm, volume), []))
 
     def set_qtree_export_policy(self, cluster, svm, volume, qtree, policy):
-        self.calls.append(f"export_policy {volume}/{qtree}={policy}")
+        # Cluster included: like the rename, this may only ever happen on
+        # PROD — the DR clone is a mirror destination and thus read-only.
+        self.calls.append(f"export_policy {cluster} {volume}/{qtree}={policy}")
+        self.qtree_policies[(cluster, svm, volume, qtree)] = policy
+
+    def get_qtree_export_policy(self, cluster, svm, volume, qtree) -> str:
+        if qtree not in self.qtrees.get((cluster, svm, volume), []):
+            raise OntapError(cluster, f"qtree lookup {volume}/{qtree}",
+                             "qtree not found")
+        return self.qtree_policies.get((cluster, svm, volume, qtree),
+                                       "default")
 
     def rename_qtree(self, cluster, svm, volume, qtree, new_name):
         # Cluster included: renaming must happen on PROD only — the DR
@@ -211,11 +238,20 @@ class FakeClient(OntapClient):
 
     # ---- CIFS ----------------------------------------------------------- #
     def export_policy_exists(self, cluster, svm, policy) -> bool:
-        return policy in self.export_policies.get((cluster, svm), set())
+        return policy in self.export_policies.get((cluster, svm), {})
 
-    def create_export_policy(self, cluster, svm, policy):
-        self.calls.append(f"create_export_policy {cluster} {svm}:{policy}")
-        self.export_policies.setdefault((cluster, svm), set()).add(policy)
+    def get_export_policy_rules(self, cluster, svm, policy) -> List[ExportRule]:
+        policies = self.export_policies.get((cluster, svm), {})
+        if policy not in policies:
+            raise OntapError(cluster, f"export policy '{policy}' on {svm}",
+                             "policy not found")
+        return list(policies[policy])
+
+    def create_export_policy(self, cluster, svm, policy, rules=None):
+        self.calls.append(f"create_export_policy {cluster} {svm}:{policy} "
+                          f"rules={len(rules or [])}")
+        self.export_policies.setdefault((cluster, svm), {})[policy] = \
+            list(rules or [])
 
     def delete_qtree(self, cluster, svm, volume, qtree):
         self.calls.append(f"delete_qtree {cluster} {volume}/{qtree}")

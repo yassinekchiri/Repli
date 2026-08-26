@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 from ..models import (MigrationParams, OntapError, ConfirmationRequired,
                       PreflightFailed, PreflightReport, SnapMirrorInfo)
 from ..transport.base import OntapClient
-from .naming import migrated_qtree_name
+from .naming import destination_export_policy, migrated_qtree_name
 from .jobs import (JobStore, CREATE_STATUS_ORDER, ACTION_SUCCESS,
                    ACTION_FAILED, ACTION_REFUSED, ACTION_NEEDS_CONFIRMATION)
 from .preflight import PreflightChecker
@@ -756,12 +756,16 @@ class MigrationEngine:
 
     def _save_clone_metadata(self, job: Optional[dict],
                              volume_map: Dict[str, str], qtrees: List[str],
-                             renames: Optional[Dict[str, str]] = None):
+                             renames: Optional[Dict[str, str]] = None,
+                             exports: Optional[Dict[str, dict]] = None):
         if job is not None:
             job["volume_map"] = {q: volume_map[q] for q in qtrees}
             if renames:
                 job["qtree_map"] = {q: renames[q] for q in qtrees
                                     if q in renames}
+            if exports:
+                job["export_policy_map"] = {q: exports[q]["policy"]
+                                            for q in qtrees if q in exports}
             job["clone_volumes"] = [volume_map[q] for q in qtrees]
             job["test_env"] = False    # definitive clones, not a test env
             self.jobs.save(job)
@@ -831,6 +835,76 @@ class MigrationEngine:
                                 volumes[qtree], qtree, new_name)
             self.log.info("         '%s'  qtree %s -> %s.",
                           volumes[qtree], qtree, new_name)
+
+    def _carry_export_policies(self, qtrees: List[str],
+                               volumes: Dict[str, str],
+                               renames: Dict[str, str]) -> Dict[str, dict]:
+        """Give each destination qtree the clients its source qtree had.
+
+        A FlexClone inherits the parent volume's export policy NAME, and that
+        name means nothing on the destination SVM — export policies are SVM
+        objects, they do not travel with the data. Left alone, the migrated
+        qtree ends up pointing at a policy that either does not exist there
+        or belongs to somebody else. Either way the client's NFS access
+        breaks the moment they stop using the source.
+
+        So, per qtree: read the policy applied to it on the SOURCE, read that
+        policy's rules — the client matches — and create 'ep_<dest qtree>' on
+        PROD and DR carrying the same rules.
+
+        The policy is APPLIED on PROD only, before the clone mirror exists,
+        so the first resync carries the assignment to DR. On DR the policy is
+        only created: the DR clone becomes a read-only SnapMirror
+        destination, so it cannot be modified there — but the object must
+        exist under the same name, or the replicated assignment resolves to
+        nothing the day DR is activated.
+        """
+        p = self.p
+        carried: Dict[str, dict] = {}
+        for qtree in qtrees:
+            source_policy = self.c.get_qtree_export_policy(
+                p.source_cluster, p.source_vserver, p.volume, qtree)
+            rules = (self.c.get_export_policy_rules(
+                p.source_cluster, p.source_vserver, source_policy)
+                if source_policy else [])
+            clients = [c for rule in rules for c in rule.clients]
+
+            dest_qtree = renames.get(qtree, qtree)
+            policy = destination_export_policy(dest_qtree)
+
+            self.log.info("         '%s'  source policy '%s': %d rule(s), "
+                          "%d client match(es)", qtree, source_policy or "none",
+                          len(rules), len(clients))
+            if not rules:
+                self.log.warning("         '%s'  source policy '%s' has NO "
+                                 "rule — '%s' will deny every NFS client too.",
+                                 qtree, source_policy or "none", policy)
+
+            created = []
+            for cluster, svm, role in ((p.dest_cluster, p.dest_vserver, "PROD"),
+                                       (p.dr_cluster, p.dr_vserver, "DR")):
+                if self.c.export_policy_exists(cluster, svm, policy):
+                    # Never rewritten: an existing policy of that name may be
+                    # in use by something this job knows nothing about.
+                    self.log.info("         %-4s  policy '%s' already exists "
+                                  "— left as it is.", role, policy)
+                    continue
+                self.c.create_export_policy(cluster, svm, policy, rules)
+                created.append(role)
+                self.log.info("         %-4s  policy '%s' created with %d "
+                              "rule(s).", role, policy, len(rules))
+
+            self.c.set_qtree_export_policy(p.dest_cluster, p.dest_vserver,
+                                           volumes[qtree], dest_qtree, policy)
+            self.log.info("         PROD  %s/%s  export-policy -> %s",
+                          volumes[qtree], dest_qtree, policy)
+
+            carried[qtree] = {"source_policy": source_policy,
+                              "policy": policy,
+                              "clients": clients,
+                              "rules": len(rules),
+                              "created_on": created}
+        return carried
 
     def _promote_test_env(self, qtrees_arg: str, job: dict) -> dict:
         """Promote the existing TEST environment to the definitive one.
@@ -1012,6 +1086,11 @@ class MigrationEngine:
             self.log.warning("PRUNE DISABLED: each clone keeps every qtree of "
                              "the source volume, including other clients'.")
 
+        # Step 4d: carry each qtree's NFS clients over to PROD and DR. Before
+        # the mirror, so the PROD assignment reaches DR on the first resync.
+        self.log.info(">> [4/7]  Carrying export policies over from the source")
+        exports = self._carry_export_policies(qtrees, mapping, renames)
+
         # Step 5: SnapMirror between the clones + resync.
         self.log.info(">> [5/7]  SnapMirror (clone PROD -> clone DR) + resync")
         for qtree in qtrees:
@@ -1052,7 +1131,7 @@ class MigrationEngine:
             self.log.info("         '%s'  move launched  PROD -> %s  /  "
                           "DR -> %s.", clone_vol, prod_aggr, dr_aggr)
 
-        self._save_clone_metadata(job, mapping, qtrees, renames)
+        self._save_clone_metadata(job, mapping, qtrees, renames, exports)
 
         self.log.info("=" * 60)
         self.log.info("  Volume moves launched for %d clone(s). Exiting.",
@@ -1064,6 +1143,13 @@ class MigrationEngine:
                         [[q, mapping[q], renames.get(q, q),
                           ", ".join(pruned.get(q, [])) or "-",
                           prod_aggr, dr_aggr] for q in qtrees])
+        self.log.info("")
+        self._log_table(["Qtree", "Source policy", "Policy on PROD + DR",
+                         "Clients carried over"],
+                        [[q, exports[q]["source_policy"] or "none",
+                          exports[q]["policy"],
+                          ", ".join(exports[q]["clients"]) or "NONE"]
+                         for q in qtrees])
         self.log.info("")
         self.log.info("  Monitor moves: volume move show -vserver %s / %s",
                       p.dest_vserver, p.dr_vserver)
@@ -1085,6 +1171,7 @@ class MigrationEngine:
         return {"volume_map": {q: mapping[q] for q in qtrees},
                 "qtree_map": dict(renames),
                 "pruned": pruned,
+                "export_policies": exports,
                 "clone_volumes": [mapping[q] for q in qtrees],
                 "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr,
                 "abandoned_test_env": old_test_env}
@@ -1168,6 +1255,11 @@ class MigrationEngine:
             self.log.warning("PRUNE DISABLED: each clone keeps every qtree of "
                              "the source volume, including other clients'.")
 
+        # Step 4d: same export policies as production — the whole point of
+        # the test is that the client validates the access they will get.
+        self.log.info(">> [4/6]  Carrying export policies over from the source")
+        exports = self._carry_export_policies(qtrees, mapping, renames)
+
         # Step 5: SnapMirror between the clones + resync (like production).
         self.log.info(">> [5/6]  SnapMirror (clone PROD -> clone DR) + resync")
         for qtree in qtrees:
@@ -1192,6 +1284,7 @@ class MigrationEngine:
         if job is not None:
             job["volume_map"] = {q: mapping[q] for q in qtrees}
             job["qtree_map"] = {q: renames[q] for q in qtrees if q in renames}
+            job["export_policy_map"] = {q: exports[q]["policy"] for q in qtrees}
             job["clone_volumes"] = [mapping[q] for q in qtrees]
             job["test_env"] = True
             job["test_qtrees"] = qtrees
@@ -1207,9 +1300,9 @@ class MigrationEngine:
         self.log.info("")
         self._log_table(["Qtree", "Test clone",
                          f"PROD ({p.dest_cluster})", f"DR ({p.dr_cluster})",
-                         "Mirror"],
-                        [[q, mapping[q], "created", "created", "idle"]
-                         for q in qtrees])
+                         "Mirror", "Export policy"],
+                        [[q, mapping[q], "created", "created", "idle",
+                          exports[q]["policy"]] for q in qtrees])
         self.log.info("")
         self.log.info("  The client can now validate access and permissions.")
         self.log.info("  BEFORE %s:", expires.strftime("%Y-%m-%d"))
@@ -1229,6 +1322,7 @@ class MigrationEngine:
         self.log.info("=" * 60)
         return {"volume_map": {q: mapping[q] for q in qtrees},
                 "clone_volumes": [mapping[q] for q in qtrees],
+                "export_policies": exports,
                 "expires_at": expires.isoformat(timespec="seconds")}
 
     # =====================================================================

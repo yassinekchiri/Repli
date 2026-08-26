@@ -9,6 +9,7 @@ Requires ONTAP >= 9.9 (validated against 9.16.1). Endpoint map:
     qtrees            /api/storage/qtrees
     snapmirror        /api/snapmirror/relationships (+ /transfers)
     cifs shares       /api/protocols/cifs/shares
+    export policies   /api/protocols/nfs/export-policies
     file security     /api/protocols/file-security/permissions   (DACL forcing)
     jobs              /api/cluster/jobs/{uuid}
 
@@ -29,12 +30,55 @@ import urllib3
 
 from ..models import (OntapError, ClusterCredentials, VolumeInfo,
                       AggregateInfo, SnapMirrorInfo, SvmInfo, PeerInfo,
+                      ExportRule,
                       TRANSFER_ACTIVE, TRANSFER_FAILED, TRANSFER_IDLE)
 from .base import OntapClient
 
 # How long we wait for a *creation* job (volume/clone/snapshot) to finish.
 _CREATION_JOB_TIMEOUT = 600
 _JOB_POLL_SECONDS = 2
+
+
+def _export_rule_from_rest(raw: dict) -> ExportRule:
+    """One ONTAP rule record -> ExportRule.
+
+    'clients' comes back as [{'match': '10.0.0.0/8'}, ...]; the access lists
+    as [{'name': 'sys'}, ...]. Both are flattened to plain strings so the
+    engine and the pre-flight never touch REST shapes.
+    """
+    def names(key: str, sub: str) -> List[str]:
+        return [item[sub] for item in raw.get(key) or []
+                if isinstance(item, dict) and item.get(sub)]
+
+    return ExportRule(
+        clients=names("clients", "match"),
+        ro_rule=names("ro_rule", "name") or [],
+        rw_rule=names("rw_rule", "name") or [],
+        superuser=names("superuser", "name") or [],
+        protocols=[p for p in raw.get("protocols") or [] if p],
+        anonymous_user=raw.get("anonymous_user") or "",
+        index=raw.get("index"))
+
+
+def _export_rule_to_rest(rule: ExportRule) -> dict:
+    """ExportRule -> the body ONTAP expects when creating a rule.
+
+    'index' is deliberately dropped: rules are posted in order and ONTAP
+    numbers them itself, so a gap in the source numbering does not have to be
+    reproduced on the destination.
+    """
+    body: dict = {
+        "clients": [{"match": c} for c in rule.clients],
+        "ro_rule": [{"name": n} for n in rule.ro_rule],
+        "rw_rule": [{"name": n} for n in rule.rw_rule],
+        "protocols": list(rule.protocols),
+    }
+    if rule.superuser:
+        body["superuser"] = [{"name": n} for n in rule.superuser]
+    if rule.anonymous_user:
+        body["anonymous_user"] = rule.anonymous_user
+    return body
+
 
 # ONTAP messages that mean "the object is already there" (idempotent mode).
 _ALREADY_EXISTS_MARKERS = ("already exists", "duplicate entry",
@@ -306,16 +350,52 @@ class RestClient(OntapClient):
         rec = records[0]
         return rec["volume"]["uuid"], rec["id"]
 
+    def get_qtree_export_policy(self, cluster, svm, volume, qtree) -> str:
+        body = self._request(cluster, "GET", "/storage/qtrees",
+                             params={"svm.name": svm, "volume.name": volume,
+                                     "name": qtree,
+                                     "fields": "export_policy.name"})
+        records = body.get("records", [])
+        if not records:
+            raise OntapError(cluster, f"qtree lookup {volume}/{qtree}",
+                             "qtree not found")
+        return (records[0].get("export_policy") or {}).get("name", "")
+
     def export_policy_exists(self, cluster, svm, policy) -> bool:
         body = self._request(cluster, "GET", "/protocols/nfs/export-policies",
                              params={"name": policy, "svm.name": svm,
                                      "fields": "name"})
         return bool(body.get("records"))
 
-    def create_export_policy(self, cluster, svm, policy):
-        """Create it empty: no 'rules' key means no rule, means no access."""
+    def get_export_policy_rules(self, cluster, svm, policy) -> List[ExportRule]:
+        """Read a policy with its rules expanded.
+
+        'rules' is not returned by default — it has to be asked for by name
+        in 'fields', otherwise every policy comes back looking empty.
+        """
+        body = self._request(cluster, "GET", "/protocols/nfs/export-policies",
+                             params={"name": policy, "svm.name": svm,
+                                     "fields": "rules"})
+        records = body.get("records", [])
+        if not records:
+            raise OntapError(cluster, f"export policy '{policy}' on {svm}",
+                             "policy not found")
+        return [_export_rule_from_rest(raw)
+                for raw in records[0].get("rules") or []]
+
+    def create_export_policy(self, cluster, svm, policy, rules=None):
+        """Create the policy, with the given rules or none at all.
+
+        No 'rules' key means no rule, means no access — which is what the
+        cleanup action wants. Rules are posted with the policy in one call:
+        ONTAP accepts them inline, and creating the policy first would leave
+        a window where it exists and denies everyone.
+        """
+        payload = {"name": policy, "svm": {"name": svm}}
+        if rules:
+            payload["rules"] = [_export_rule_to_rest(r) for r in rules]
         self._request(cluster, "POST", "/protocols/nfs/export-policies",
-                      json_body={"name": policy, "svm": {"name": svm}})
+                      json_body=payload)
 
     def set_qtree_export_policy(self, cluster, svm, volume, qtree, policy):
         vol_uuid, qtree_id = self._qtree_ref(cluster, svm, volume, qtree)

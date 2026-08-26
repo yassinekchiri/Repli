@@ -248,10 +248,11 @@ consume by automation.
 | `resume` | job is exactly at `pivot_initialized`; pivot mirrored **and** idle; PROD/DR volumes exist; PROD/DR relationships declared and **not already initialized** (blocks a double initialize) |
 | `retry` | job status recognised; for phases still to run, the same peering / policy / schedule checks as `create` |
 | `test` | cascade complete and **healthy on all three legs**; **no test environment already in place**; qtrees exist on the source and are unique; derived clone name is a legal ONTAP volume name; peering + policy + schedule for the clone mirror PROD→DR |
-| `clone` (promotion) | requested qtrees **exactly match** the test set; each clone exists on PROD and DR; each clone mirror is healthy and idle; validity not expired (warning); a move-target aggregate exists other than the parent's |
+| `clone` (promotion) | requested qtrees **exactly match** the test set; each clone exists on PROD and DR; each clone mirror is healthy and idle; validity not expired (warning); the test environment carried the export policies over (warning); a move-target aggregate exists other than the parent's |
 | `clone` (full/fresh) | same as `test`, plus the move-target aggregate check; `--fresh` warns that the old test clones are abandoned |
 | `acl` | path provided, absolute, no traversal, **not `/`**; path belongs to a **clone volume of this job**; path resolves on the PROD SVM; volume security style is NTFS/mixed; AD group syntax |
 | `test` / `clone` naming | **every qtree has an explicit target volume name**; names are distinct; each is a legal ONTAP volume name; each is free on PROD **and** DR |
+| `test` / `clone` export policies | each qtree's **source** policy and its rules are readable; **preview of the clients that will be carried over** to `ep_<dest qtree>` on PROD and DR; warns when the source policy has **no rule** (the destination would deny every NFS client) and when the destination name is **already taken** (it is reused as it is, never rewritten) |
 | `cleanup` | at least one qtree, existing on the source, no duplicate, no path separator; migration `completed`; the qtree is in the job's `volume_map` and the migrated volume is present on PROD **and** DR; not already cleaned up (`_MIG_`); the new name is free; clones promoted (warning); **explicit preview of the exact CIFS shares** that will be deleted |
 
 ---

@@ -29,7 +29,8 @@ from ..models import (CheckResult, MigrationParams, OntapError,
 from ..security import csvio
 from ..transport.base import OntapClient
 from .jobs import CREATE_STATUS_ORDER
-from .naming import MIGRATED_MARK, migrated_qtree_name
+from .naming import (MIGRATED_MARK, destination_export_policy,
+                     migrated_qtree_name)
 
 # ONTAP volume names: letters, digits, underscore; 203 characters maximum.
 _VOLUME_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -807,6 +808,7 @@ class PreflightChecker:
         self._check_qtree_map(report, normalised, qtree_map, job)
         self._check_prune_plan(report, normalised, volume_map, qtree_map,
                                job, prune)
+        self._check_export_policies(report, normalised, qtree_map, job)
 
         # The clone mirror PROD -> DR needs its own peering, policy and
         # schedule on the DR cluster.
@@ -872,6 +874,23 @@ class PreflightChecker:
                                if expired else "",
                           target=job.get("job_id", ""),
                           severity=SEVERITY_WARNING)
+
+            # A promotion rebuilds nothing, export policies included: they
+            # were set by the test run. A test environment built before this
+            # existed has none, and nothing later would notice.
+            carried = job.get("export_policy_map") or {}
+            self._add(report, "PROMOTION_NO_EXPORT_POLICIES",
+                      "The test environment carried the export policies over",
+                      bool(carried), severity=SEVERITY_WARNING,
+                      detail=", ".join(f"{q} -> {pol}"
+                                       for q, pol in carried.items())
+                             if carried
+                             else "this test environment was built without "
+                                  "them — the clones keep whatever policy "
+                                  "name they inherited from their parent",
+                      hint="rebuild with --fresh, or set the destination "
+                           "export policies by hand" if not carried else "",
+                      target=job.get("job_id", ""))
         else:
             status = job.get("status", "unknown") if job else "unknown"
             if job:
@@ -890,6 +909,8 @@ class PreflightChecker:
                                   None if fresh else job)
             self._check_prune_plan(report, normalised, volume_map, qtree_map,
                                    None if fresh else job, prune)
+            self._check_export_policies(report, normalised, qtree_map,
+                                        None if fresh else job)
             self._check_peering(report, p.dr_cluster, p.dr_vserver,
                                 p.dest_cluster, p.dest_vserver,
                                 "clone PROD -> clone DR")
@@ -1100,6 +1121,94 @@ class PreflightChecker:
                              else f"keeps '{kept}', the source holds nothing "
                                   f"else",
                       target=f"{p.dest_cluster} / {p.dest_vserver}:{volume}")
+
+    def _check_export_policies(self, report: PreflightReport,
+                               qtrees: Sequence[str],
+                               qtree_map: Optional[Dict[str, str]],
+                               job: Optional[dict]):
+        """Announce which clients each qtree carries over, before it happens.
+
+        Read-only, and it answers the question the operator actually has:
+        after the migration, who still reaches this data? A qtree whose
+        source policy has no rule is the interesting case — the destination
+        would deny every NFS client, silently, and nobody notices until the
+        source is cut.
+        """
+        p = self.p
+        renames = dict((job or {}).get("qtree_map") or {})
+        renames.update({k: v for k, v in (qtree_map or {}).items() if v})
+
+        for qtree in qtrees:
+            source = f"{p.source_cluster} / {p.source_vserver}:{p.volume}/{qtree}"
+            policy, err = self._safe(
+                lambda q=qtree: self.c.get_qtree_export_policy(
+                    p.source_cluster, p.source_vserver, p.volume, q), None)
+            if policy is None:
+                self._add(report, "EXPORT_POLICY_UNREADABLE",
+                          f"'{qtree}': source export policy readable", False,
+                          severity=SEVERITY_WARNING, detail=err,
+                          hint="grant readonly on /api/storage/qtrees and "
+                               "/api/protocols/nfs/export-policies",
+                          target=source)
+                continue
+
+            rules, err = self._safe(
+                lambda pol=policy: self.c.get_export_policy_rules(
+                    p.source_cluster, p.source_vserver, pol), None) \
+                if policy else ([], "")
+            if rules is None:
+                self._add(report, "EXPORT_RULES_UNREADABLE",
+                          f"'{qtree}': rules of policy '{policy}' readable",
+                          False, severity=SEVERITY_WARNING, detail=err,
+                          hint="grant readonly on "
+                               "/api/protocols/nfs/export-policies",
+                          target=source)
+                continue
+
+            clients = [c for rule in rules for c in rule.clients]
+            dest_qtree = renames.get(qtree, qtree)
+            target_policy = destination_export_policy(dest_qtree)
+
+            # No rule at the source means no client at the destination. Not
+            # an error — some qtrees really are CIFS-only — but never silent.
+            self._add(report, "EXPORT_POLICY_NO_CLIENT",
+                      f"'{qtree}': source policy '{policy or 'none'}' grants "
+                      f"at least one client", bool(clients),
+                      severity=SEVERITY_WARNING,
+                      detail=f"{len(rules)} rule(s), clients: "
+                             f"{', '.join(clients)}" if clients
+                             else f"policy '{policy or 'none'}' has no rule — "
+                                  f"'{target_policy}' will deny every NFS "
+                                  f"client",
+                      hint="check this qtree is CIFS-only before relying on it"
+                           if not clients else "",
+                      target=source)
+
+            # Exactly what will be created, and where. Never a guess.
+            self._add(report, "EXPORT_POLICY_PLAN",
+                      f"'{qtree}': policy '{target_policy}' on PROD and DR",
+                      True,
+                      detail=f"{policy or 'none'} -> {target_policy} "
+                             f"({len(rules)} rule(s))",
+                      target=f"{p.dest_cluster} + {p.dr_cluster}")
+
+            # A name already in use belongs to somebody else: the engine
+            # leaves it alone, and that qtree would inherit their access.
+            for cluster, svm, role in ((p.dest_cluster, p.dest_vserver, "PROD"),
+                                       (p.dr_cluster, p.dr_vserver, "DR")):
+                taken, err = self._safe(
+                    lambda c=cluster, s=svm: self.c.export_policy_exists(
+                        c, s, target_policy), None)
+                if taken is None or not taken:
+                    continue
+                self._add(report, "EXPORT_POLICY_NAME_TAKEN",
+                          f"{role}: '{target_policy}' does not already exist",
+                          False, severity=SEVERITY_WARNING,
+                          detail="a policy of that name is already defined — "
+                                 "it will be reused as it is, not rewritten",
+                          hint="check its rules match the clients this qtree "
+                               "should have",
+                          target=f"{cluster} / {svm}")
 
     def for_cleanup(self, job: Optional[dict],
                     qtrees: Sequence[str]) -> PreflightReport:

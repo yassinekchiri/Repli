@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 
 from ..models import (VolumeInfo, AggregateInfo, SnapMirrorInfo, SvmInfo,
-                      PeerInfo)
+                      PeerInfo, ExportRule)
 
 
 class OntapClient(ABC):
@@ -82,17 +82,37 @@ class OntapClient(ABC):
                      qtree: str, new_name: str) -> None: ...
 
     @abstractmethod
+    def get_qtree_export_policy(self, cluster: str, svm: str, volume: str,
+                                qtree: str) -> str:
+        """Name of the export policy currently applied to a qtree.
+
+        A qtree that was never exported explicitly reports the policy it
+        inherits, usually the SVM's 'default'.
+        """
+
+    @abstractmethod
     def export_policy_exists(self, cluster: str, svm: str,
                              policy: str) -> bool:
         """Is this export policy defined on the SVM?"""
 
     @abstractmethod
-    def create_export_policy(self, cluster: str, svm: str,
-                             policy: str) -> None:
-        """Create an export policy with NO rules.
+    def get_export_policy_rules(self, cluster: str, svm: str,
+                                policy: str) -> List[ExportRule]:
+        """The rules of an export policy, in order.
 
-        No rules is the point: an empty policy denies every client, which is
-        exactly what 'cut the source access' means.
+        An empty list is a real answer, not a failure: a policy with no rule
+        exists and denies every client.
+        """
+
+    @abstractmethod
+    def create_export_policy(self, cluster: str, svm: str, policy: str,
+                             rules: Optional[List[ExportRule]] = None) -> None:
+        """Create an export policy, with the given rules or none at all.
+
+        No rules is a deliberate, useful case: an empty policy denies every
+        client, which is exactly what 'cut the source access' means. Passing
+        rules is the other case — carrying a source qtree's clients over to
+        the destination so they still reach their data after the migration.
         """
 
     @abstractmethod

@@ -246,6 +246,34 @@ class VolumeInfo:
 
 
 @dataclass
+class ExportRule:
+    """One rule of an NFS export policy, as the tool copies it.
+
+    Only the fields that decide *who gets in and how* are carried across.
+    Anything else ONTAP stores on a rule is left at its default on the
+    destination: this is a migration of access, not a byte-for-byte clone of
+    the policy object.
+
+    ``clients`` is the match list of a single rule — one rule can already
+    name several clients ('10.0.0.0/8', '@netgroup', 'host.example.com').
+    """
+    clients: List[str] = field(default_factory=list)
+    ro_rule: List[str] = field(default_factory=lambda: ["any"])
+    rw_rule: List[str] = field(default_factory=lambda: ["any"])
+    superuser: List[str] = field(default_factory=lambda: ["none"])
+    protocols: List[str] = field(default_factory=lambda: ["any"])
+    anonymous_user: str = ""
+    index: Optional[int] = None     # position in the source policy
+
+    def describe(self) -> str:
+        """One line for a log table or a pre-flight detail."""
+        who = ", ".join(self.clients) or "(no client)"
+        return (f"{who}  [ro={'|'.join(self.ro_rule) or '-'} "
+                f"rw={'|'.join(self.rw_rule) or '-'} "
+                f"proto={'|'.join(self.protocols) or '-'}]")
+
+
+@dataclass
 class AggregateInfo:
     name: str
     available_bytes: int = 0

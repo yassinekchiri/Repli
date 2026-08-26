@@ -9,7 +9,7 @@ import logging
 from typing import List
 
 from ..models import (VolumeInfo, AggregateInfo, SnapMirrorInfo,
-                      SvmInfo, PeerInfo)
+                      SvmInfo, PeerInfo, ExportRule)
 from .base import OntapClient
 
 _FAKE_SIZE = 1024 ** 3          # 1 GiB source volume
@@ -86,12 +86,27 @@ class DryRunClient(OntapClient):
         self._trace(cluster, f"qtree list {svm}:{volume}")
         return ["qtree_dryrun1", "qtree_dryrun2"]
 
+    def get_qtree_export_policy(self, cluster, svm, volume, qtree) -> str:
+        self._trace(cluster,
+                    f"qtree show {volume}/{qtree} export-policy -> ep_dryrun")
+        return "ep_dryrun"
+
     def export_policy_exists(self, cluster, svm, policy) -> bool:
         self._trace(cluster, f"export-policy exists? {svm}:{policy} -> yes")
         return True
 
-    def create_export_policy(self, cluster, svm, policy):
-        self._trace(cluster, f"export-policy create {svm}:{policy} (no rules)")
+    def get_export_policy_rules(self, cluster, svm, policy) -> List[ExportRule]:
+        self._trace(cluster, f"export-policy rule show {svm}:{policy}")
+        return [ExportRule(clients=["10.0.0.0/8"], ro_rule=["sys"],
+                           rw_rule=["sys"], superuser=["none"],
+                           protocols=["nfs"], index=1)]
+
+    def create_export_policy(self, cluster, svm, policy, rules=None):
+        rules = rules or []
+        count = f"{len(rules)} rule(s)" if rules else "no rules"
+        self._trace(cluster, f"export-policy create {svm}:{policy} ({count})")
+        for position, rule in enumerate(rules, start=1):
+            self._trace(cluster, f"    rule {position}: {rule.describe()}")
 
     def set_qtree_export_policy(self, cluster, svm, volume, qtree, policy):
         self._trace(cluster, f"qtree modify {volume}/{qtree} export-policy={policy}")

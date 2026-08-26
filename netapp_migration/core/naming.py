@@ -12,6 +12,23 @@ from ..security.csvio import _MAX_QTREE_NAME
 MIGRATED_MARK = "_MIG_"
 
 
+# Prefix of the export policy created on PROD and DR for each migrated
+# qtree. One policy per destination qtree, named after it, so an operator
+# reading `vserver export-policy show` can tell at a glance which qtree a
+# policy belongs to.
+EXPORT_POLICY_PREFIX = "ep_"
+
+
+def destination_export_policy(dest_qtree: str) -> str:
+    """Export policy a migrated qtree gets on PROD and DR: ep_<qtree>.
+
+    Named after the qtree as it exists ON THE DESTINATION, not the source:
+    when the client renamed it through the qtree map, the policy follows the
+    new name, because that is the one an operator sees on the cluster.
+    """
+    return f"{EXPORT_POLICY_PREFIX}{dest_qtree}"
+
+
 def job_reference(job_id: str) -> str:
     """The short, still-unique tail of a job id, for use inside a name."""
     return (job_id or "unknown").split("_")[-1][:8] or "unknown"
