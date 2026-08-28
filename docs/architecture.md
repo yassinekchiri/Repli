@@ -252,7 +252,7 @@ consume by automation.
 | `clone` (full/fresh) | same as `test`, plus the move-target aggregate check; `--fresh` warns that the old test clones are abandoned |
 | `acl` | path provided, absolute, no traversal, **not `/`**; path belongs to a **clone volume of this job**; path resolves on the PROD SVM; volume security style is NTFS/mixed; AD group syntax |
 | `test` / `clone` naming | **every qtree has an explicit target volume name**; names are distinct; each is a legal ONTAP volume name; each is free on PROD **and** DR |
-| `test` / `clone` export policies | each qtree's **source** policy and its rules are readable; **preview of the clients that will be carried over** to `ep_<dest qtree>` on PROD and DR; warns when the source policy has **no rule** (the destination would deny every NFS client) and when the destination name is **already taken** (it is reused as it is, never rewritten) |
+| `test` / `clone` export policies | each qtree's **source** policy and its rules are readable; **preview of the exact clients that will be carried over** to `ep_<dest qtree>` on PROD and DR, one rule per client, and of the **parameters forced** on every rule; warns when a client is a **network** (skipped, never copied), when **no client at all** would be carried (the destination would deny every NFS client) and when the destination name is **already taken** (it is reused as it is, never rewritten) |
 | `cleanup` | at least one qtree, existing on the source, no duplicate, no path separator; migration `completed`; the qtree is in the job's `volume_map` and the migrated volume is present on PROD **and** DR; not already cleaned up (`_MIG_`); the new name is free; clones promoted (warning); **explicit preview of the exact CIFS shares** that will be deleted |
 
 ---

@@ -52,13 +52,25 @@ def parse_field_value(stdout: str, field_name: str) -> Optional[str]:
 
 
 def parse_instance(stdout: str) -> dict:
-    """Parse an ONTAP -instance output into a lowercase {key: value} dict."""
+    """Parse an ONTAP -instance output into a lowercase {key: value} dict.
+
+    A long value wraps onto the following line, which then carries no colon
+    — an export rule listing several clients does this routinely. Such a
+    line continues the field above it, and is joined without a separator
+    because ONTAP breaks after the comma of a list or mid-token, never
+    between two tokens that need a space put back.
+    """
     fields: dict = {}
+    last_key = ""
     for line in stdout.splitlines():
         m = re.match(r"^\s*(.+?)\s*:\s*(.*?)\s*$", line)
-        if not m:
+        if m:
+            last_key = m.group(1).strip().lower()
+            fields[last_key] = m.group(2).strip()
             continue
-        fields[m.group(1).strip().lower()] = m.group(2).strip()
+        continuation = line.strip()
+        if continuation and last_key:
+            fields[last_key] += continuation
     return fields
 
 
@@ -85,6 +97,23 @@ def parse_size_to_bytes(size_str: Optional[str]) -> Optional[int]:
 def _as_int(value: Optional[str]) -> Optional[int]:
     """'12345' -> 12345; '-' / 'unlimited' / anything else -> None."""
     return int(value) if value and value.isdigit() else None
+
+
+def _as_bool(value: Optional[str]) -> Optional[bool]:
+    """'true'/'false' -> bool; anything else -> None (the source did not say).
+
+    None matters: it is the difference between 'the source set this to false'
+    and 'the source did not report it', and only the first should be written
+    to the destination.
+    """
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in ("true", "yes", "enabled"):
+        return True
+    if text in ("false", "no", "disabled"):
+        return False
+    return None
 
 
 def parse_qtree_list(stdout: str) -> List[str]:
@@ -117,9 +146,16 @@ def parse_export_rules(stdout: str) -> List[ExportRule]:
         index = get_instance_field(fields, "rule index")
         if index is None:
             continue
-        clients = get_instance_field(fields, "client match hostname, ip "
-                                             "address, netgroup, or domain",
-                                     "client match spec", "client match")
+        # ONTAP words this field differently across releases; 9.16 uses the
+        # first form. Read as a list so a rename does not silently produce a
+        # rule with no client at all.
+        clients = get_instance_field(
+            fields,
+            "list of client match hostnames, ip addresses, netgroups, "
+            "or domains",
+            "client match hostname, ip address, netgroup, or domain",
+            "client match hostnames, ip addresses, netgroups, or domains",
+            "client match spec", "client match")
         rules.append(ExportRule(
             clients=_split_list_field(clients),
             ro_rule=_split_list_field(
@@ -132,6 +168,16 @@ def parse_export_rules(stdout: str) -> List[ExportRule]:
                 get_instance_field(fields, "access protocol")),
             anonymous_user=get_instance_field(
                 fields, "user id to which anonymous users are mapped") or "",
+            allow_suid=_as_bool(get_instance_field(
+                fields, "honor setuid bits in setattr")),
+            allow_device_creation=_as_bool(get_instance_field(
+                fields, "allow creation of devices")),
+            # The 'Vserver ...' variants of the next two are SVM settings
+            # shown for context, not rule fields — never read as one.
+            ntfs_unix_security=get_instance_field(
+                fields, "ntfs unix security options") or "",
+            chown_mode=get_instance_field(
+                fields, "change ownership mode") or "",
             index=int(index) if index.isdigit() else None))
     return rules
 
@@ -146,6 +192,11 @@ def parse_cifs_shares_for_path(stdout: str, fragment: str) -> List[str]:
         if share and path and fragment in path:
             shares.append(share)
     return shares
+
+
+def _yes_no(flag: bool) -> str:
+    """The ONTAP CLI spells booleans 'true'/'false'."""
+    return "true" if flag else "false"
 
 
 @dataclass
@@ -406,14 +457,26 @@ class SshClient(OntapClient):
                   f"vserver export-policy create -vserver {svm} "
                   f"-policyname {policy}")
         for position, rule in enumerate(rules or [], start=1):
-            self._run(cluster,
-                      f"vserver export-policy rule create -vserver {svm} "
-                      f"-policyname {policy} -ruleindex {position} "
-                      f"-clientmatch {','.join(rule.clients)} "
-                      f"-rorule {','.join(rule.ro_rule) or 'any'} "
-                      f"-rwrule {','.join(rule.rw_rule) or 'any'} "
-                      f"-protocol {','.join(rule.protocols) or 'any'} "
-                      f"-superuser {','.join(rule.superuser) or 'none'}")
+            command = (f"vserver export-policy rule create -vserver {svm} "
+                       f"-policyname {policy} -ruleindex {position} "
+                       f"-clientmatch {','.join(rule.clients)} "
+                       f"-rorule {','.join(rule.ro_rule) or 'any'} "
+                       f"-rwrule {','.join(rule.rw_rule) or 'any'} "
+                       f"-protocol {','.join(rule.protocols) or 'any'} "
+                       f"-superuser {','.join(rule.superuser) or 'none'}")
+            if rule.anonymous_user:
+                command += f" -anon {rule.anonymous_user}"
+            # Only what the source actually reported: an option left off
+            # takes ONTAP's default, which is what the source rule had too.
+            if rule.allow_suid is not None:
+                command += f" -allow-suid {_yes_no(rule.allow_suid)}"
+            if rule.allow_device_creation is not None:
+                command += f" -allow-dev {_yes_no(rule.allow_device_creation)}"
+            if rule.ntfs_unix_security:
+                command += f" -ntfs-unix-security-ops {rule.ntfs_unix_security}"
+            if rule.chown_mode:
+                command += f" -chown-mode {rule.chown_mode}"
+            self._run(cluster, command)
 
     def rename_qtree(self, cluster, svm, volume, qtree, new_name):
         self._run(cluster,

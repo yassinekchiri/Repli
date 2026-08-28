@@ -8,6 +8,11 @@ qtree points at a policy that is absent, or worse, belongs to somebody else.
 
 import pytest
 
+from netapp_migration.core.exports import (CLIENT_HOST, CLIENT_NETWORK,
+                                          CLIENT_OTHER,
+                                          DESTINATION_RULE,
+                                          classify_client,
+                                          destination_rules)
 from netapp_migration.core.naming import destination_export_policy
 from netapp_migration.models import ExportRule, OntapError
 from netapp_migration.transport.ssh import parse_export_rules
@@ -61,28 +66,126 @@ def test_dr_gets_the_policy_even_though_nothing_is_applied_there(
 
 def test_the_clients_are_the_ones_the_source_qtree_had(engine, ready, client,
                                                        params):
+    """One rule per client: the source rule named two hosts and a network."""
     engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
 
     carried = policies_on(client, params.dest_cluster,
                           params.dest_vserver)["ep_q_fin"]
-    assert [r.clients for r in carried] == [["10.0.0.0/8", "@admins"]]
-    assert carried[0].ro_rule == ["sys"]
-    assert carried[0].protocols == ["nfs"]
+    assert [r.clients for r in carried] == [["10.0.0.1"], ["10.0.0.2"]]
+
+
+def test_every_other_field_of_the_rule_is_copied_unchanged(engine, ready,
+                                                           client, params):
+    """The destination rule must behave exactly like the source one."""
+    engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    rule = policies_on(client, params.dest_cluster,
+                       params.dest_vserver)["ep_q_fin"][0]
+    assert rule.ro_rule == ["any"]
+    assert rule.rw_rule == ["any"]
+    assert rule.superuser == ["any"]
+    assert rule.protocols == ["nfs4"]
+    assert rule.anonymous_user == "none"
+    assert rule.allow_suid is True
+    assert rule.allow_device_creation is True
+    assert rule.ntfs_unix_security == "fail"
+    assert rule.chown_mode == "restricted"
+
+
+def test_the_destination_index_is_left_to_ontap(engine, ready, client, params):
+    """The split renumbers everything anyway, so the source index is dropped."""
+    carried_before = engine.clone("q_fin", job=ready,
+                                  volume_map=vmap("q_fin"))
+
+    rules = policies_on(client, params.dest_cluster,
+                        params.dest_vserver)["ep_q_fin"]
+    assert all(r.index is None for r in rules)
+    assert carried_before["export_policies"]["q_fin"]["rules"] == 2
+
+
+def test_a_network_is_not_carried_over(engine, ready, client, params):
+    """A subnet names whatever lives in that range on the destination side,
+    which is not necessarily the same machines."""
+    engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    carried = policies_on(client, params.dest_cluster,
+                          params.dest_vserver)["ep_q_fin"]
+    every_client = [c for r in carried for c in r.clients]
+    assert "10.20.0.0/16" not in every_client
+
+
+def test_a_network_does_not_fail_the_clone(engine, ready, client, params):
+    """The rest of the policy is still worth having."""
+    result = engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    assert result["export_policies"]["q_fin"]["skipped_networks"] == \
+        ["10.20.0.0/16"]
+    assert result["export_policies"]["q_fin"]["clients"] == ["10.0.0.1",
+                                                             "10.0.0.2"]
+
+
+def test_a_host_written_as_a_full_prefix_is_still_a_host(engine, ready, client,
+                                                         params):
+    """10.0.0.9/32 covers exactly one address: a host spelled the long way."""
+    source_policy(client, params)[0].clients = ["10.0.0.9/32"]
+
+    engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    carried = policies_on(client, params.dest_cluster,
+                          params.dest_vserver)["ep_q_fin"]
+    assert [r.clients for r in carried] == [["10.0.0.9/32"]]
+
+
+def test_hostnames_and_netgroups_are_carried_one_per_rule(engine, ready,
+                                                          client, params):
+    source_policy(client, params)[0].clients = ["host.example.com", "@admins",
+                                                ".example.com"]
+
+    engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    carried = policies_on(client, params.dest_cluster,
+                          params.dest_vserver)["ep_q_fin"]
+    assert [r.clients for r in carried] == [["host.example.com"], ["@admins"],
+                                            [".example.com"]]
+
+
+def test_a_policy_of_networks_only_carries_nothing(engine, ready, client,
+                                                   params):
+    source_policy(client, params)[0].clients = ["10.0.0.0/8", "192.168.0.0/16"]
+
+    result = engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    assert policies_on(client, params.dest_cluster,
+                       params.dest_vserver)["ep_q_fin"] == []
+    assert len(result["export_policies"]["q_fin"]["skipped_networks"]) == 2
 
 
 def test_every_rule_is_carried_not_just_the_first(engine, ready, client,
                                                   params):
     source_policy(client, params).append(
-        ExportRule(clients=["192.168.0.0/16"], ro_rule=["krb5"],
-                   rw_rule=["never"], protocols=["nfs4"], index=2))
+        ExportRule(clients=["192.168.0.5"], ro_rule=["krb5"],
+                   rw_rule=["never"], protocols=["nfs3"], index=3))
 
     engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
 
     carried = policies_on(client, params.dest_cluster,
                           params.dest_vserver)["ep_q_fin"]
-    assert len(carried) == 2
-    assert carried[1].clients == ["192.168.0.0/16"]
-    assert carried[1].rw_rule == ["never"]
+    assert [r.clients for r in carried] == [["10.0.0.1"], ["10.0.0.2"],
+                                            ["192.168.0.5"]]
+    assert carried[2].rw_rule == DESTINATION_RULE["rw_rule"], \
+        "the source rule's own settings are not inherited"
+
+
+def test_the_same_client_twice_makes_one_rule(engine, ready, client, params):
+    """ONTAP rejects a duplicate client match within a policy."""
+    source_policy(client, params).append(
+        ExportRule(clients=["10.0.0.1"], index=3))
+
+    engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    carried = policies_on(client, params.dest_cluster,
+                          params.dest_vserver)["ep_q_fin"]
+    assert [r.clients for r in carried] == [["10.0.0.1"], ["10.0.0.2"]]
 
 
 def test_the_policy_is_applied_to_the_qtree_in_the_prod_clone(engine, ready,
@@ -227,7 +330,8 @@ def test_the_result_reports_the_clients_that_were_carried(engine, ready):
     carried = result["export_policies"]["q_fin"]
     assert carried["source_policy"] == "ep_source"
     assert carried["policy"] == "ep_q_fin"
-    assert carried["clients"] == ["10.0.0.0/8", "@admins"]
+    assert carried["clients"] == ["10.0.0.1", "10.0.0.2"]
+    assert carried["source_rules"] == 1 and carried["rules"] == 2
     assert sorted(carried["created_on"]) == ["DR", "PROD"]
 
 
@@ -252,7 +356,7 @@ def test_the_preflight_lists_the_clients(engine, ready):
 
     check = next(c for c in report.to_dict()["checks"]
                  if c["code"] == "EXPORT_POLICY_NO_CLIENT")
-    assert "10.0.0.0/8" in check["detail"]
+    assert "10.0.0.1" in check["detail"] and "10.0.0.2" in check["detail"]
     assert check["passed"]
 
 
@@ -338,6 +442,29 @@ User ID To Which Anonymous Users Are Mapped: 65534
                    Superuser Security Types: sys
 """
 
+# Copied from a 9.16.1 cluster, wrapped value and all. The field is worded
+# differently from the block above — reading only one spelling produced a
+# rule with NO client instead of failing, which is the worst outcome
+# available: the migration would silently grant nobody access.
+RULE_SHOW_9161 = """
+                                Policy Name: exp_f5EEbTP57
+                                 Rule Index: 2
+                            Access Protocol: nfs4
+List of Client Match Hostnames, IP Addresses, Netgroups, or Domains: 10.0.0.1,10.0.0.2,10.20.0.0/16,192.168.1.
+222
+                             RO Access Rule: any
+                             RW Access Rule: any
+User ID To Which Anonymous Users Are Mapped: none
+                   Superuser Security Types: any
+               Honor SetUID Bits in SETATTR: true
+                  Allow Creation of Devices: true
+                 NTFS Unix Security Options: fail
+         Vserver NTFS Unix Security Options: use_export_policy
+                      Change Ownership Mode: restricted
+              Vserver Change Ownership Mode: use_export_policy
+                                  Policy ID: 373662154756
+"""
+
 
 def test_the_ssh_parser_reads_every_rule():
     rules = parse_export_rules(RULE_SHOW)
@@ -348,6 +475,43 @@ def test_the_ssh_parser_reads_every_rule():
     assert rules[1].clients == ["backup.example.com"]
     assert rules[1].rw_rule == ["never"]
     assert rules[1].superuser == ["sys"]
+
+
+def test_the_ssh_parser_reads_the_9161_wording():
+    rule = parse_export_rules(RULE_SHOW_9161)[0]
+
+    assert rule.clients, "an unread client list would grant nobody access"
+    assert rule.protocols == ["nfs4"]
+    assert rule.allow_suid is True
+    assert rule.allow_device_creation is True
+
+
+def test_the_ssh_parser_reassembles_a_wrapped_client_list():
+    """ONTAP wraps a long value onto the next line. Dropping the remainder
+    would silently lose whichever clients happened to fall past the margin."""
+    rule = parse_export_rules(RULE_SHOW_9161)[0]
+
+    assert rule.clients == ["10.0.0.1", "10.0.0.2", "10.20.0.0/16",
+                            "192.168.1.222"]
+
+
+def test_the_svm_wide_settings_are_never_read_as_rule_settings():
+    """'Vserver NTFS Unix Security Options' is what the rule falls back to,
+    not what the rule is. Writing it per rule would reconfigure the SVM."""
+    rule = parse_export_rules(RULE_SHOW_9161)[0]
+
+    assert rule.ntfs_unix_security == "fail"
+    assert rule.chown_mode == "restricted"
+
+
+def test_a_real_rule_becomes_one_destination_rule_per_host():
+    rule = parse_export_rules(RULE_SHOW_9161)[0]
+
+    carried, skipped = destination_rules([rule])
+
+    assert [r.clients[0] for r in carried] == ["10.0.0.1", "10.0.0.2",
+                                               "192.168.1.222"]
+    assert [m for _, m in skipped] == ["10.20.0.0/16"]
 
 
 def test_the_ssh_parser_ignores_blocks_that_are_not_rules():
@@ -386,3 +550,145 @@ def test_promoting_an_older_test_environment_warns(engine, ready, store):
                  if c["code"] == "PROMOTION_NO_EXPORT_POLICIES")
     assert not check["passed"] and check["severity"] == "warning"
     assert report.ok, "a promotion must still be possible"
+
+
+# =============================================================================
+# Only the client comes from the source
+# =============================================================================
+
+def test_the_source_parameters_are_not_inherited(engine, ready, client, params):
+    """The destination is a new uniform environment, not a copy of whatever
+    each source policy accumulated over the years."""
+    source_policy(client, params)[0].ro_rule = ["krb5"]
+    source_policy(client, params)[0].protocols = ["nfs3"]
+    source_policy(client, params)[0].chown_mode = "unrestricted"
+    source_policy(client, params)[0].allow_suid = False
+
+    engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    rule = policies_on(client, params.dest_cluster,
+                       params.dest_vserver)["ep_q_fin"][0]
+    assert rule.ro_rule == ["any"]
+    assert rule.protocols == ["nfs4"]
+    assert rule.chown_mode == "restricted"
+    assert rule.allow_suid is True
+
+
+def test_every_destination_rule_gets_the_same_parameters(engine, ready, client,
+                                                         params):
+    engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    rules = policies_on(client, params.dest_cluster,
+                        params.dest_vserver)["ep_q_fin"]
+    assert len(rules) > 1
+    for rule in rules:
+        for field, expected in DESTINATION_RULE.items():
+            assert getattr(rule, field) == expected
+
+
+def test_the_forced_parameters_are_the_ones_asked_for():
+    """Pinned: changing one changes every migrated qtree's access."""
+    assert DESTINATION_RULE == {
+        "ro_rule": ["any"],
+        "rw_rule": ["any"],
+        "superuser": ["any"],
+        "protocols": ["nfs4"],
+        "anonymous_user": "none",
+        "allow_suid": True,
+        "allow_device_creation": True,
+        "ntfs_unix_security": "fail",
+        "chown_mode": "restricted",
+    }
+
+
+# =============================================================================
+# Classifying a client match
+# =============================================================================
+
+@pytest.mark.parametrize("match", [
+    "10.0.0.7", "10.0.0.7/32", "2001:db8::1", "2001:db8::1/128",
+])
+def test_a_single_address_is_a_host(match):
+    assert classify_client(match) == CLIENT_HOST
+
+
+@pytest.mark.parametrize("match", [
+    "10.0.0.0/8", "10.0.0.0/255.0.0.0", "2001:db8::/64", "0.0.0.0/0",
+])
+def test_a_range_is_a_network(match):
+    assert classify_client(match) == CLIENT_NETWORK
+
+
+@pytest.mark.parametrize("match", [
+    "host.example.com", ".example.com", "@admins", "", "  ",
+])
+def test_what_is_neither_is_left_alone(match):
+    assert classify_client(match) == CLIENT_OTHER
+
+
+# =============================================================================
+# The pre-flight says all of this in advance
+# =============================================================================
+
+def test_the_preflight_names_the_networks_it_will_skip(engine, ready):
+    report = engine.checker.for_clone(ready, ["q_fin"], volume_map=vmap("q_fin"))
+
+    check = next(c for c in report.to_dict()["checks"]
+                 if c["code"] == "EXPORT_NETWORK_SKIPPED")
+    assert not check["passed"] and check["severity"] == "warning"
+    assert "10.20.0.0/16" in check["detail"]
+    assert report.ok, "a skipped network must not refuse the clone"
+
+
+def test_the_preflight_passes_that_check_without_networks(engine, ready,
+                                                          client, params):
+    source_policy(client, params)[0].clients = ["10.0.0.1"]
+
+    report = engine.checker.for_clone(ready, ["q_fin"], volume_map=vmap("q_fin"))
+
+    check = next(c for c in report.to_dict()["checks"]
+                 if c["code"] == "EXPORT_NETWORK_SKIPPED")
+    assert check["passed"]
+
+
+def test_the_preflight_announces_the_split(engine, ready):
+    report = engine.checker.for_clone(ready, ["q_fin"], volume_map=vmap("q_fin"))
+
+    plan = next(c for c in report.to_dict()["checks"]
+                if c["code"] == "EXPORT_POLICY_PLAN")
+    assert "1 source rule(s) -> 2 rule(s)" in plan["detail"]
+
+
+def test_the_preflight_states_the_forced_parameters(engine, ready):
+    report = engine.checker.for_clone(ready, ["q_fin"], volume_map=vmap("q_fin"))
+
+    check = next(c for c in report.to_dict()["checks"]
+                 if c["code"] == "EXPORT_RULE_PARAMETERS")
+    assert "proto=nfs4" in check["detail"]
+    assert "chown=restricted" in check["detail"]
+
+
+def test_the_preflight_warns_when_only_networks_would_be_carried(
+        engine, ready, client, params):
+    source_policy(client, params)[0].clients = ["10.0.0.0/8"]
+
+    report = engine.checker.for_clone(ready, ["q_fin"], volume_map=vmap("q_fin"))
+
+    check = next(c for c in report.to_dict()["checks"]
+                 if c["code"] == "EXPORT_POLICY_NO_CLIENT")
+    assert not check["passed"]
+    assert report.ok
+
+
+def test_the_preflight_predicts_what_the_engine_does(engine, ready, client,
+                                                     params):
+    """The two must agree: the report is worthless if it predicts something
+    other than what runs."""
+    report = engine.checker.for_clone(ready, ["q_fin"], volume_map=vmap("q_fin"))
+    predicted = next(c for c in report.to_dict()["checks"]
+                     if c["code"] == "EXPORT_POLICY_NO_CLIENT")["detail"]
+
+    result = engine.clone("q_fin", job=ready, volume_map=vmap("q_fin"))
+
+    for client_match in result["export_policies"]["q_fin"]["clients"]:
+        assert client_match in predicted

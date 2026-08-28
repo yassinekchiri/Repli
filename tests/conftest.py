@@ -110,12 +110,19 @@ class FakeClient(OntapClient):
         # (cluster, svm) -> {policy name: [ExportRule]}. ep_noaccess is
         # deliberately absent everywhere: cleanup has to create it. The
         # source SVM carries one real policy so clone has clients to copy.
+        # ep_source is shaped like a real one: several clients on a single
+        # rule, one of them a network, and every option a rule can carry —
+        # so the split, the skipped network and the field copy are all
+        # exercised by default rather than only where a test opts in.
         self.export_policies: Dict[tuple, Dict[str, List[ExportRule]]] = {
             ("SRC", "svm_source"): {
-                "ep_source": [ExportRule(clients=["10.0.0.0/8", "@admins"],
-                                         ro_rule=["sys"], rw_rule=["sys"],
-                                         superuser=["none"],
-                                         protocols=["nfs"], index=1)],
+                "ep_source": [ExportRule(
+                    clients=["10.0.0.1", "10.0.0.2", "10.20.0.0/16"],
+                    ro_rule=["any"], rw_rule=["any"], superuser=["any"],
+                    protocols=["nfs4"], anonymous_user="none",
+                    allow_suid=True, allow_device_creation=True,
+                    ntfs_unix_security="fail", chown_mode="restricted",
+                    index=2)],
                 "default": [],
             },
         }

@@ -94,7 +94,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 258 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 298 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -712,13 +712,61 @@ alors vers une policy absente, ou pire, appartenant à quelqu'un d'autre. Dans
 les deux cas l'accès NFS du client casse dès que la source est coupée.
 
 `clone` et `test` lisent donc, pour chaque qtree **à la source**, l'export
-policy qui lui est appliquée et les règles de cette policy — les client
-matches — puis créent `ep_<qtree de destination>` sur **PROD et DR** avec les
-mêmes règles :
+policy qui lui est appliquée et les **client matches** de ses règles, puis
+créent `ep_<qtree de destination>` sur **PROD et DR**.
+
+**Seul le client vient de la source.** Tous les autres paramètres sont
+forcés, à l'identique sur chaque règle de chaque qtree migré — la destination
+est un environnement neuf et uniforme, pas une copie de ce que chaque policy
+source a accumulé au fil des années :
+
+| Paramètre | Valeur |
+|---|---|
+| Access protocol | `nfs4` |
+| RO / RW access rule | `any` / `any` |
+| Superuser security types | `any` |
+| Anonymous user mapping | `none` |
+| Honor SetUID bits in SETATTR | `true` |
+| Allow creation of devices | `true` |
+| NTFS Unix security options | `fail` |
+| Change ownership mode | `restricted` |
+
+Ils sont définis à un seul endroit, `DESTINATION_RULE` dans
+`netapp_migration/core/exports.py`. Y changer une valeur la change pour tous
+les qtrees migrés.
+
+**Une règle, un client.** Une règle source nommant trois machines devient
+trois règles à la destination : on peut donc révoquer une machine plus tard
+sans toucher aux deux autres.
 
 ```
-| Qtree | Source policy | Policy on PROD + DR | Clients carried over  |
-| q_fin | ep_prod_nfs   | ep_finance          | 10.0.0.0/8, @admins   |
+source  rule 2 : 10.0.0.1, 10.0.0.2, 10.20.0.0/16, 192.168.1.222
+                     |          |          |             |
+dest    rule 1 : 10.0.0.1       |       (ignoré)         |
+        rule 2 : ───────── 10.0.0.2                      |
+        rule 3 : ─────────────────────────────── 192.168.1.222
+```
+
+**Les réseaux ne sont pas repris.** Un sous-réseau désigne ce qui vit dans
+cette plage côté destination, pas nécessairement les mêmes machines. Il est
+ignoré, jamais deviné et **jamais bloquant** — le reste de la policy vaut
+toujours la peine :
+
+```
+'q_fin'  1 network(s) NOT carried over to 'ep_finance': 10.20.0.0/16 (source rule 2)
+'q_fin'  add them by hand if those ranges really should reach the destination.
+```
+
+Un hôte écrit en préfixe complet (`10.0.0.9/32`, `2001:db8::1/128`) ne couvre
+qu'une seule adresse : il compte comme un hôte, pas comme un réseau. Les noms
+d'hôtes, domaines (`.example.com`) et netgroups (`@admins`) sont repris à
+raison d'une règle chacun, comme tout autre client unique. Un même client
+nommé par deux règles source ne donne qu'une règle à la destination, ONTAP
+refusant un match dupliqué.
+
+```
+| Qtree | Source policy | Policy on PROD + DR | Rules  | Clients carried over          | Networks NOT carried |
+| q_fin | ep_prod_nfs   | ep_finance          | 1 -> 3 | 10.0.0.1, 10.0.0.2, 192.168…  | 10.20.0.0/16         |
 ```
 
 La policy porte le nom du qtree **tel qu'il existe à la destination** : quand
@@ -734,19 +782,24 @@ est activé.
 
 Une policy existante portant ce nom est **réutilisée, jamais réécrite** :
 elle peut appartenir à quelque chose que ce job ignore. Le pré-vol le
-signale (`EXPORT_POLICY_NAME_TAKEN`) et annonce tout le plan avant exécution :
+signale (`EXPORT_POLICY_NAME_TAKEN`) et annonce tout le plan avant exécution
+— calculé par le code même qu'exécute le moteur, les deux ne peuvent donc pas
+diverger :
 
 ```
-| PASS | 'q_fin': policy 'ep_finance' on PROD and DR   | ep_prod_nfs -> ep_finance (2 rule(s)) |
-| PASS | 'q_fin': source policy 'ep_prod_nfs' grants…  | 2 rule(s), clients: 10.0.0.0/8, @admins |
+| PASS | 'q_fin': policy 'ep_finance' on PROD and DR  | ep_prod_nfs -> ep_finance: 1 source rule(s) -> 3 rule(s), one per client |
+| PASS | 'q_fin': parameters forced on every rule     | proto=nfs4 ro=any rw=any superuser=any anon=none suid=true dev=true ntfs-unix=fail chown=restricted |
+| PASS | 'q_fin': at least one client is carried over | clients: 10.0.0.1, 10.0.0.2, 192.168.1.222 |
+| WARN | 'q_fin': no client is a network              | NOT carried over: 10.20.0.0/16 (source rule 2) |
 ```
 
-Une policy source **sans aucune règle** n'est pas une erreur — certains
-qtrees sont réellement CIFS uniquement — mais ce n'est jamais silencieux,
-puisque la destination refuserait alors tous les clients NFS :
+Se retrouver **sans aucun client** n'est pas une erreur — certains qtrees
+sont réellement CIFS uniquement, et une policy composée uniquement de réseaux
+est un cas réel — mais ce n'est jamais silencieux, puisque la destination
+refuserait alors tous les clients NFS :
 
 ```
-| WARN | 'q_ops': source policy 'default' grants at least one client | policy 'default' has no rule — 'ep_q_ops' will deny every NFS client |
+| WARN | 'q_ops': at least one client is carried over | nothing to carry from 'default' — 'ep_q_ops' will deny every NFS client |
 ```
 
 ### 3.6 cleanup — coupure d'accès source

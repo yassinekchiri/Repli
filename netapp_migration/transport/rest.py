@@ -58,6 +58,10 @@ def _export_rule_from_rest(raw: dict) -> ExportRule:
         superuser=names("superuser", "name") or [],
         protocols=[p for p in raw.get("protocols") or [] if p],
         anonymous_user=raw.get("anonymous_user") or "",
+        allow_suid=raw.get("allow_suid"),
+        allow_device_creation=raw.get("allow_device_creation"),
+        ntfs_unix_security=raw.get("ntfs_unix_security") or "",
+        chown_mode=raw.get("chown_mode") or "",
         index=raw.get("index"))
 
 
@@ -65,8 +69,13 @@ def _export_rule_to_rest(rule: ExportRule) -> dict:
     """ExportRule -> the body ONTAP expects when creating a rule.
 
     'index' is deliberately dropped: rules are posted in order and ONTAP
-    numbers them itself, so a gap in the source numbering does not have to be
+    numbers them itself, so a gap in the source numbering — or the
+    renumbering the one-client-per-rule split forces — never has to be
     reproduced on the destination.
+
+    A field the source did not report is left out entirely rather than sent
+    as a default: ONTAP then applies its own, which is what the source rule
+    was doing too.
     """
     body: dict = {
         "clients": [{"match": c} for c in rule.clients],
@@ -78,6 +87,14 @@ def _export_rule_to_rest(rule: ExportRule) -> dict:
         body["superuser"] = [{"name": n} for n in rule.superuser]
     if rule.anonymous_user:
         body["anonymous_user"] = rule.anonymous_user
+    if rule.allow_suid is not None:
+        body["allow_suid"] = rule.allow_suid
+    if rule.allow_device_creation is not None:
+        body["allow_device_creation"] = rule.allow_device_creation
+    if rule.ntfs_unix_security:
+        body["ntfs_unix_security"] = rule.ntfs_unix_security
+    if rule.chown_mode:
+        body["chown_mode"] = rule.chown_mode
     return body
 
 

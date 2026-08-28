@@ -93,7 +93,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 258 tests, offline, no cluster contacted
+python3 -m pytest            # 298 tests, offline, no cluster contacted
 ```
 
 ---
@@ -701,12 +701,60 @@ a policy that is absent there, or worse, belongs to somebody else. Either way
 the client's NFS access breaks the moment the source is cut.
 
 So `clone` and `test` read, for each qtree on the **source**, the export
-policy applied to it and that policy's rules — the client matches — and
-create `ep_<destination qtree>` on **PROD and DR** carrying the same rules:
+policy applied to it and the **client matches** of its rules, then create
+`ep_<destination qtree>` on **PROD and DR**.
+
+**Only the client comes from the source.** Every other parameter is forced,
+identically on every rule of every migrated qtree — the destination is a new
+uniform environment, not a copy of whatever each source policy accumulated
+over the years:
+
+| Parameter | Value |
+|---|---|
+| Access protocol | `nfs4` |
+| RO / RW access rule | `any` / `any` |
+| Superuser security types | `any` |
+| Anonymous user mapping | `none` |
+| Honor SetUID bits in SETATTR | `true` |
+| Allow creation of devices | `true` |
+| NTFS Unix security options | `fail` |
+| Change ownership mode | `restricted` |
+
+They live in one place, `DESTINATION_RULE` in
+`netapp_migration/core/exports.py`. Changing a value there changes it for
+every migrated qtree.
+
+**One rule, one client.** A source rule naming three machines becomes three
+destination rules, so one machine can later be revoked without touching the
+other two:
 
 ```
-| Qtree | Source policy | Policy on PROD + DR | Clients carried over  |
-| q_fin | ep_prod_nfs   | ep_finance          | 10.0.0.0/8, @admins   |
+source  rule 2 : 10.0.0.1, 10.0.0.2, 10.20.0.0/16, 192.168.1.222
+                     |          |          |             |
+dest    rule 1 : 10.0.0.1       |      (skipped)         |
+        rule 2 : ───────── 10.0.0.2                      |
+        rule 3 : ─────────────────────────────── 192.168.1.222
+```
+
+**Networks are not carried.** A subnet names whatever lives in that range on
+the destination side, which is not necessarily the same machines. It is
+skipped, never guessed at and **never fatal** — the rest of the policy is
+still worth having:
+
+```
+'q_fin'  1 network(s) NOT carried over to 'ep_finance': 10.20.0.0/16 (source rule 2)
+'q_fin'  add them by hand if those ranges really should reach the destination.
+```
+
+A host written as a full prefix (`10.0.0.9/32`, `2001:db8::1/128`) covers
+exactly one address, so it counts as a host, not a network. Hostnames,
+domains (`.example.com`) and netgroups (`@admins`) are carried one per rule
+like any other single client. The same client named by two source rules
+produces one destination rule, since ONTAP rejects a duplicate match.
+
+```
+| Qtree | Source policy | Policy on PROD + DR | Rules  | Clients carried over          | Networks NOT carried |
+| q_fin | ep_prod_nfs   | ep_finance          | 1 -> 3 | 10.0.0.1, 10.0.0.2, 192.168…  | 10.20.0.0/16         |
 ```
 
 The policy is named after the qtree **as it exists on the destination**: when
@@ -722,19 +770,22 @@ resolves to nothing the day DR is activated.
 An existing policy of that name is **reused, never rewritten**: it may belong
 to something this job knows nothing about. The pre-flight warns when that
 happens (`EXPORT_POLICY_NAME_TAKEN`), and announces the whole plan before
-anything runs:
+anything runs — computed by the same code the engine runs, so the two cannot
+disagree:
 
 ```
-| PASS | 'q_fin': policy 'ep_finance' on PROD and DR   | ep_prod_nfs -> ep_finance (2 rule(s)) |
-| PASS | 'q_fin': source policy 'ep_prod_nfs' grants…  | 2 rule(s), clients: 10.0.0.0/8, @admins |
+| PASS | 'q_fin': policy 'ep_finance' on PROD and DR  | ep_prod_nfs -> ep_finance: 1 source rule(s) -> 3 rule(s), one per client |
+| PASS | 'q_fin': parameters forced on every rule     | proto=nfs4 ro=any rw=any superuser=any anon=none suid=true dev=true ntfs-unix=fail chown=restricted |
+| PASS | 'q_fin': at least one client is carried over | clients: 10.0.0.1, 10.0.0.2, 192.168.1.222 |
+| WARN | 'q_fin': no client is a network              | NOT carried over: 10.20.0.0/16 (source rule 2) |
 ```
 
-A source policy with **no rule** is not an error — some qtrees really are
-CIFS-only — but it is never silent, since the destination would then deny
-every NFS client:
+Ending up with **no client at all** is not an error — some qtrees really are
+CIFS-only, and a policy of nothing but networks is a real case — but it is
+never silent, since the destination would then deny every NFS client:
 
 ```
-| WARN | 'q_ops': source policy 'default' grants at least one client | policy 'default' has no rule — 'ep_q_ops' will deny every NFS client |
+| WARN | 'q_ops': at least one client is carried over | nothing to carry from 'default' — 'ep_q_ops' will deny every NFS client |
 ```
 
 ### 3.6 cleanup — cut source access

@@ -26,6 +26,8 @@ from typing import Dict, List, Optional
 from ..models import (MigrationParams, OntapError, ConfirmationRequired,
                       PreflightFailed, PreflightReport, SnapMirrorInfo)
 from ..transport.base import OntapClient
+from .exports import (describe_forced, describe_skipped,
+                      destination_rules)
 from .naming import destination_export_policy, migrated_qtree_name
 from .jobs import (JobStore, CREATE_STATUS_ORDER, ACTION_SUCCESS,
                    ACTION_FAILED, ACTION_REFUSED, ACTION_NEEDS_CONFIRMATION)
@@ -1151,6 +1153,17 @@ class MigrationEngine:
         policy's rules — the client matches — and create 'ep_<dest qtree>' on
         PROD and DR carrying the same rules.
 
+        Only the CLIENT comes from the source (see core/exports.py). Rules
+        are rebuilt one client per rule — a source rule granting three
+        machines becomes three destination rules, so one machine can later
+        be revoked without touching the other two — and every other
+        parameter is forced to exports.DESTINATION_RULE rather than
+        inherited, because the destination is a new uniform environment.
+
+        Networks are skipped with a warning rather than copied: a subnet
+        names whatever lives in that range on the destination side, which is
+        not necessarily the same machines.
+
         The policy is APPLIED on PROD only, before the clone mirror exists,
         so the first resync carries the assignment to DR. On DR the policy is
         only created: the DR clone becomes a read-only SnapMirror
@@ -1160,24 +1173,45 @@ class MigrationEngine:
         """
         p = self.p
         carried: Dict[str, dict] = {}
+        # Said once rather than per rule: it is the same for every qtree, and
+        # it is what an operator needs to see to know the destination rules
+        # were not inherited from whatever the source had accumulated.
+        self.log.info("         Every destination rule is created with: %s",
+                      describe_forced())
         for qtree in qtrees:
             source_policy = self.c.get_qtree_export_policy(
                 p.source_cluster, p.source_vserver, p.volume, qtree)
-            rules = (self.c.get_export_policy_rules(
+            source_rules = (self.c.get_export_policy_rules(
                 p.source_cluster, p.source_vserver, source_policy)
                 if source_policy else [])
+            # One rule, one client; every other parameter forced. Networks
+            # are left behind.
+            rules, skipped = destination_rules(source_rules)
             clients = [c for rule in rules for c in rule.clients]
 
             dest_qtree = renames.get(qtree, qtree)
             policy = destination_export_policy(dest_qtree)
 
-            self.log.info("         '%s'  source policy '%s': %d rule(s), "
-                          "%d client match(es)", qtree, source_policy or "none",
-                          len(rules), len(clients))
+            self.log.info("         '%s'  source policy '%s': %d rule(s) -> "
+                          "%d rule(s), one per client",
+                          qtree, source_policy or "none", len(source_rules),
+                          len(rules))
+            self.log.info("             clients: %s",
+                          ", ".join(clients) or "none")
+            if skipped:
+                # Not fatal, and never silent: a subnet names hosts that may
+                # not be the same machines on the destination side.
+                self.log.warning(
+                    "         '%s'  %d network(s) NOT carried over to '%s': "
+                    "%s", qtree, len(skipped), policy,
+                    describe_skipped(skipped))
+                self.log.warning(
+                    "         '%s'  add them by hand if those ranges really "
+                    "should reach the destination.", qtree)
             if not rules:
-                self.log.warning("         '%s'  source policy '%s' has NO "
-                                 "rule — '%s' will deny every NFS client too.",
-                                 qtree, source_policy or "none", policy)
+                self.log.warning("         '%s'  no client carried over — "
+                                 "'%s' will deny every NFS client.",
+                                 qtree, policy)
 
             created = []
             for cluster, svm, role in ((p.dest_cluster, p.dest_vserver, "PROD"),
@@ -1202,6 +1236,8 @@ class MigrationEngine:
                               "policy": policy,
                               "clients": clients,
                               "rules": len(rules),
+                              "source_rules": len(source_rules),
+                              "skipped_networks": [m for _, m in skipped],
                               "created_on": created}
         return carried
 
@@ -1444,10 +1480,14 @@ class MigrationEngine:
                           prod_aggr, dr_aggr] for q in qtrees])
         self.log.info("")
         self._log_table(["Qtree", "Source policy", "Policy on PROD + DR",
-                         "Clients carried over"],
+                         "Rules", "Clients carried over",
+                         "Networks NOT carried"],
                         [[q, exports[q]["source_policy"] or "none",
                           exports[q]["policy"],
-                          ", ".join(exports[q]["clients"]) or "NONE"]
+                          f"{exports[q]['source_rules']} -> "
+                          f"{exports[q]['rules']}",
+                          ", ".join(exports[q]["clients"]) or "NONE",
+                          ", ".join(exports[q]["skipped_networks"]) or "-"]
                          for q in qtrees])
         self.log.info("")
         self.log.info("  Monitor moves: volume move show -vserver %s / %s",

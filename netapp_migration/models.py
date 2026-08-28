@@ -253,15 +253,22 @@ class VolumeInfo:
 
 @dataclass
 class ExportRule:
-    """One rule of an NFS export policy, as the tool copies it.
+    """One rule of an NFS export policy, carried across as it stands.
 
-    Only the fields that decide *who gets in and how* are carried across.
-    Anything else ONTAP stores on a rule is left at its default on the
-    destination: this is a migration of access, not a byte-for-byte clone of
-    the policy object.
+    Every field ONTAP lets a rule set is copied, so the destination rule
+    behaves exactly like the source one — the client match is the only thing
+    that changes, because the migration splits a multi-client rule into one
+    rule per client.
 
-    ``clients`` is the match list of a single rule — one rule can already
-    name several clients ('10.0.0.0/8', '@netgroup', 'host.example.com').
+    The two 'Vserver ...' values ONTAP shows next to a rule
+    (`Vserver NTFS Unix Security Options`, `Vserver Change Ownership Mode`)
+    are deliberately absent: they are SVM settings displayed for context —
+    what the rule falls back to when it says `use_export_policy` — not
+    properties of the rule, and writing them per rule would silently
+    reconfigure the whole SVM.
+
+    ``clients`` is the match list of a single rule; on the source one rule
+    can name several ('10.0.0.1', '10.0.0.2', '@netgroup', 'host.example').
     """
     clients: List[str] = field(default_factory=list)
     ro_rule: List[str] = field(default_factory=lambda: ["any"])
@@ -269,6 +276,15 @@ class ExportRule:
     superuser: List[str] = field(default_factory=lambda: ["none"])
     protocols: List[str] = field(default_factory=lambda: ["any"])
     anonymous_user: str = ""
+    # 'Honor SetUID Bits in SETATTR' / 'Allow Creation of Devices'. None
+    # means the source did not say, so the destination keeps ONTAP's default
+    # instead of being forced to a value this tool invented.
+    allow_suid: Optional[bool] = None
+    allow_device_creation: Optional[bool] = None
+    # 'NTFS Unix Security Options': fail | ignore | use_export_policy
+    ntfs_unix_security: str = ""
+    # 'Change Ownership Mode': restricted | unrestricted | use_export_policy
+    chown_mode: str = ""
     index: Optional[int] = None     # position in the source policy
 
     def describe(self) -> str:

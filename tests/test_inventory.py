@@ -140,8 +140,8 @@ def test_the_export_policy_is_reported_with_its_rules(engine, cloned):
     policy = next(p for p in policies if p["name"] == "ep_finance")
     assert policy["present"] is True
     assert policy["id"] is not None
-    assert policy["rules"][0]["clients"] == ["10.0.0.0/8", "@admins"]
-    assert policy["rules"][0]["ro_rule"] == ["sys"]
+    assert policy["rules"][0]["clients"] == ["10.0.0.1"], "one rule, one client"
+    assert policy["rules"][0]["ro_rule"] == ["any"]
 
 
 def test_a_policy_a_qtree_points_at_is_reported_even_if_unexpected(

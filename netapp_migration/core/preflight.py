@@ -29,6 +29,8 @@ from ..models import (CheckResult, MigrationParams, OntapError,
 from ..security import csvio
 from ..transport.base import OntapClient
 from .jobs import CREATE_STATUS_ORDER
+from .exports import (describe_forced, describe_skipped,
+                      destination_rules)
 from .naming import (MIGRATED_MARK, destination_export_policy,
                      migrated_qtree_name)
 
@@ -1165,20 +1167,34 @@ class PreflightChecker:
                           target=source)
                 continue
 
-            clients = [c for rule in rules for c in rule.clients]
             dest_qtree = renames.get(qtree, qtree)
             target_policy = destination_export_policy(dest_qtree)
 
-            # No rule at the source means no client at the destination. Not
-            # an error — some qtrees really are CIFS-only — but never silent.
-            self._add(report, "EXPORT_POLICY_NO_CLIENT",
-                      f"'{qtree}': source policy '{policy or 'none'}' grants "
-                      f"at least one client", bool(clients),
+            # Exactly what the engine will build, computed the same way.
+            carried, skipped = destination_rules(rules)
+            clients = [c for rule in carried for c in rule.clients]
+
+            # A network is dropped on purpose, but never quietly: somebody
+            # has to decide whether that range still needs access.
+            self._add(report, "EXPORT_NETWORK_SKIPPED",
+                      f"'{qtree}': no client is a network", not skipped,
                       severity=SEVERITY_WARNING,
-                      detail=f"{len(rules)} rule(s), clients: "
-                             f"{', '.join(clients)}" if clients
-                             else f"policy '{policy or 'none'}' has no rule — "
-                                  f"'{target_policy}' will deny every NFS "
+                      detail=f"NOT carried over: {describe_skipped(skipped)}"
+                             if skipped else "no network in the source policy",
+                      hint="a subnet names whatever lives in that range on the "
+                           "destination side; add it by hand if it really "
+                           "should reach the migrated data" if skipped else "",
+                      target=source)
+
+            # No client at the destination is not an error — some qtrees
+            # really are CIFS-only — but never silent.
+            self._add(report, "EXPORT_POLICY_NO_CLIENT",
+                      f"'{qtree}': at least one client is carried over",
+                      bool(clients),
+                      severity=SEVERITY_WARNING,
+                      detail=f"clients: {', '.join(clients)}" if clients
+                             else f"nothing to carry from '{policy or 'none'}'"
+                                  f" — '{target_policy}' will deny every NFS "
                                   f"client",
                       hint="check this qtree is CIFS-only before relying on it"
                            if not clients else "",
@@ -1188,8 +1204,16 @@ class PreflightChecker:
             self._add(report, "EXPORT_POLICY_PLAN",
                       f"'{qtree}': policy '{target_policy}' on PROD and DR",
                       True,
-                      detail=f"{policy or 'none'} -> {target_policy} "
-                             f"({len(rules)} rule(s))",
+                      detail=f"{policy or 'none'} -> {target_policy}: "
+                             f"{len(rules)} source rule(s) -> "
+                             f"{len(carried)} rule(s), one per client",
+                      target=f"{p.dest_cluster} + {p.dr_cluster}")
+
+            # The destination rules do not inherit the source parameters, so
+            # the report says what they are given instead.
+            self._add(report, "EXPORT_RULE_PARAMETERS",
+                      f"'{qtree}': parameters forced on every rule", True,
+                      detail=describe_forced(),
                       target=f"{p.dest_cluster} + {p.dr_cluster}")
 
             # A name already in use belongs to somebody else: the engine
