@@ -87,8 +87,12 @@ def _strip_gzip_timestamp(blob: bytes) -> bytes:
     return blob[:4] + b"\x00\x00\x00\x00" + blob[8:]
 
 
-def _uncommitted(root: str) -> list:
-    """Paths git reports as changed, minus this tool's own output."""
+def uncommitted(root: str = ROOT) -> list:
+    """Paths git reports as changed, minus this tool's own output.
+
+    Shared by revision() and by the build scripts' end-of-run warning, so
+    the two can never disagree about what counts as drift.
+    """
     try:
         out = subprocess.run(["git", "-C", root, "status", "--porcelain"],
                              capture_output=True, text=True, check=True)
@@ -122,7 +126,7 @@ def revision(root: str = ROOT) -> str:
         return "unknown"
     if not described:
         return "unknown"
-    return f"{described}-dirty" if _uncommitted(root) else described
+    return f"{described}-dirty" if uncommitted(root) else described
 
 
 def build_date() -> str:

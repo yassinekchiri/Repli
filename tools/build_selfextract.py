@@ -67,9 +67,7 @@ def main() -> int:
     payload.emit(TEMPLATE, OUTPUT, MARKER, files, archive,
                  extra={"@DEFAULT_DIR@": DEFAULT_DIR})
 
-    dirty = [line for line in subprocess.run(
-        ["git", "-C", ROOT, "status", "--porcelain"],
-        capture_output=True, text=True).stdout.splitlines() if line.strip()]
+    dirty = payload.uncommitted(ROOT)
     if dirty:
         print(f"NOTE: {len(dirty)} uncommitted change(s) in the working tree. "
               "Modified tracked files ARE in this archive as they stand; "
