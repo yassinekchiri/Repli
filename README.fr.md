@@ -94,7 +94,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 311 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 328 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---

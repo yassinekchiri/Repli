@@ -40,23 +40,33 @@ _CREATION_JOB_TIMEOUT = 600
 _JOB_POLL_SECONDS = 2
 
 
-def _export_rule_from_rest(raw: dict) -> ExportRule:
-    """One ONTAP rule record -> ExportRule.
+def _flatten(values, key: str) -> List[str]:
+    """A REST list of enum values or of {key: value} objects -> plain strings.
 
-    'clients' comes back as [{'match': '10.0.0.0/8'}, ...]; the access lists
-    as [{'name': 'sys'}, ...]. Both are flattened to plain strings so the
-    engine and the pre-flight never touch REST shapes.
+    ONTAP is not uniform here: 'clients' is a list of objects carrying
+    'match', while 'ro_rule', 'rw_rule', 'superuser' and 'protocols' are
+    lists of bare enum strings. Both shapes are accepted on the way in so a
+    future ONTAP that changes one does not silently yield an empty list —
+    an access rule read as [] is indistinguishable from 'no access rule',
+    and that is not a difference worth discovering on a destination.
     """
-    def names(key: str, sub: str) -> List[str]:
-        return [item[sub] for item in raw.get(key) or []
-                if isinstance(item, dict) and item.get(sub)]
+    out = []
+    for item in values or []:
+        if isinstance(item, str) and item:
+            out.append(item)
+        elif isinstance(item, dict) and item.get(key):
+            out.append(item[key])
+    return out
 
+
+def _export_rule_from_rest(raw: dict) -> ExportRule:
+    """One ONTAP rule record -> ExportRule, with REST shapes flattened."""
     return ExportRule(
-        clients=names("clients", "match"),
-        ro_rule=names("ro_rule", "name") or [],
-        rw_rule=names("rw_rule", "name") or [],
-        superuser=names("superuser", "name") or [],
-        protocols=[p for p in raw.get("protocols") or [] if p],
+        clients=_flatten(raw.get("clients"), "match"),
+        ro_rule=_flatten(raw.get("ro_rule"), "name"),
+        rw_rule=_flatten(raw.get("rw_rule"), "name"),
+        superuser=_flatten(raw.get("superuser"), "name"),
+        protocols=_flatten(raw.get("protocols"), "name"),
         anonymous_user=raw.get("anonymous_user") or "",
         allow_suid=raw.get("allow_suid"),
         allow_device_creation=raw.get("allow_device_creation"),
@@ -76,15 +86,20 @@ def _export_rule_to_rest(rule: ExportRule) -> dict:
     A field the source did not report is left out entirely rather than sent
     as a default: ONTAP then applies its own, which is what the source rule
     was doing too.
+
+    Only 'clients' is a list of objects. The access rules and the protocol
+    list are BARE ENUM STRINGS — sending {"name": "any"} there is refused
+    with `The value "any" is invalid for field "rules[0].ro_rule[0]"`
+    (verified on 9.16.1).
     """
     body: dict = {
         "clients": [{"match": c} for c in rule.clients],
-        "ro_rule": [{"name": n} for n in rule.ro_rule],
-        "rw_rule": [{"name": n} for n in rule.rw_rule],
+        "ro_rule": list(rule.ro_rule),
+        "rw_rule": list(rule.rw_rule),
         "protocols": list(rule.protocols),
     }
     if rule.superuser:
-        body["superuser"] = [{"name": n} for n in rule.superuser]
+        body["superuser"] = list(rule.superuser)
     if rule.anonymous_user:
         body["anonymous_user"] = rule.anonymous_user
     if rule.allow_suid is not None:
