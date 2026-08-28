@@ -413,6 +413,10 @@ class SnapMirrorInfo:
     source_path: str = ""
     policy: str = ""
     schedule: str = ""
+    # 'XDP' | 'DP' | 'LS'. Decided by the policy on the REST transport, and
+    # reported so a mirror built as the wrong kind is visible before a
+    # failover discovers it.
+    relationship_type: str = ""
     last_transfer_end: str = ""
 
     # ---- transfer-level predicates ---------------------------------------

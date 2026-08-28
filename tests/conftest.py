@@ -95,10 +95,15 @@ class FakeClient(OntapClient):
                              peer_svm="svm_dest", peer_cluster="PRD")],
         }
 
+        # The cascade legs use one policy/schedule, the clone mirror
+        # another. Only DRC hosts the clone mirror, so only DRC carries the
+        # clone pair — a test that removes it must fail the pre-flight.
         self.policies: Dict[str, List[str]] = {
             c: ["MirrorAllSnapshots"] for c in ("PIV", "PRD", "DRC")}
+        self.policies["DRC"].append("MFA_MirrorAllSnapshots")
         self.schedules: Dict[str, List[str]] = {
             c: ["hourly", "daily"] for c in ("PIV", "PRD", "DRC")}
+        self.schedules["DRC"].append("pg-15-minutely")
 
         # dest_path -> SnapMirrorInfo
         self.relationships: Dict[str, SnapMirrorInfo] = {}
@@ -161,12 +166,14 @@ class FakeClient(OntapClient):
         self.junctions.setdefault((cluster, svm), []).append(f"/{volume}")
 
     def add_relationship(self, dest_path, state="snapmirrored",
-                         transfer_state="idle", source_path=""):
+                         transfer_state="idle", source_path="",
+                         policy="MirrorAllSnapshots", schedule="hourly",
+                         relationship_type="XDP"):
         self.relationships[dest_path] = SnapMirrorInfo(
             dest_path=dest_path, state=state, transfer_state=transfer_state,
             uuid=f"uuid-sm-{dest_path}".replace(":", "-").replace("/", "-"),
-            source_path=source_path, policy="MirrorAllSnapshots",
-            schedule="hourly")
+            source_path=source_path, policy=policy, schedule=schedule,
+            relationship_type=relationship_type)
 
     # ---- volumes -------------------------------------------------------- #
     def get_volume(self, cluster, svm, volume) -> VolumeInfo:
@@ -292,9 +299,11 @@ class FakeClient(OntapClient):
 
     # ---- SnapMirror ----------------------------------------------------- #
     def snapmirror_create(self, cluster, source_path, dest_path,
-                          policy="MirrorAllSnapshots", schedule="hourly",
+                          policy, schedule, relationship_type="XDP",
                           idempotent=False):
-        self.calls.append(f"snapmirror_create {source_path} -> {dest_path}")
+        self.calls.append(f"snapmirror_create {source_path} -> {dest_path} "
+                          f"type={relationship_type} policy={policy} "
+                          f"schedule={schedule}")
         if policy not in self.policies.get(cluster, []):
             raise OntapError(cluster, "snapmirror create",
                              f'Policy "{policy}" not found')
@@ -303,13 +312,15 @@ class FakeClient(OntapClient):
                              f'Schedule "{schedule}" not found in the '
                              f'Administrative SVM')
         self.add_relationship(dest_path, state="uninitialized",
-                              transfer_state="idle", source_path=source_path)
+                              transfer_state="idle", source_path=source_path,
+                              policy=policy, schedule=schedule,
+                              relationship_type=relationship_type)
 
     def snapmirror_initialize(self, cluster, dest_path):
         self.calls.append(f"snapmirror_initialize {dest_path}")
         self.add_relationship(dest_path, state="snapmirrored",
                               transfer_state="idle",
-                              source_path=self._source_of(dest_path))
+                              **self._declared(dest_path))
         self._replicate(dest_path)
 
     def snapmirror_update(self, cluster, dest_path):
@@ -319,13 +330,17 @@ class FakeClient(OntapClient):
         self.calls.append(f"snapmirror_resync {dest_path}")
         self.add_relationship(dest_path, state="snapmirrored",
                               transfer_state="idle",
-                              source_path=self._source_of(dest_path))
+                              **self._declared(dest_path))
         self._replicate(dest_path)
 
-    def _source_of(self, dest_path) -> str:
-        """Keep the source a relationship was declared with across states."""
+    def _declared(self, dest_path) -> dict:
+        """Keep what a relationship was declared with across state changes."""
         existing = self.relationships.get(dest_path)
-        return existing.source_path if existing else ""
+        if not existing:
+            return {}
+        return {"source_path": existing.source_path,
+                "policy": existing.policy, "schedule": existing.schedule,
+                "relationship_type": existing.relationship_type}
 
     def _locate(self, path):
         """'svm:volume' -> the (cluster, svm, volume) key holding it."""
@@ -343,7 +358,7 @@ class FakeClient(OntapClient):
         pruning or the export policies — and no test could tell the
         difference between working replication and none at all.
         """
-        source = self._locate(self._source_of(dest_path))
+        source = self._locate(self._declared(dest_path).get("source_path", ""))
         dest = self._locate(dest_path)
         if not source or not dest:
             return

@@ -251,8 +251,9 @@ def test_the_clone_mirror_is_reported_with_its_uuid(engine, cloned, params):
     assert mirror["source_path"] == params.path(params.dest_vserver,
                                                 "vol_q_fin")
     assert mirror["state"] == "snapmirrored"
-    assert mirror["policy"] == "MirrorAllSnapshots"
-    assert mirror["schedule"] == "hourly"
+    assert mirror["policy"] == "MFA_MirrorAllSnapshots"
+    assert mirror["schedule"] == "pg-15-minutely"
+    assert mirror["type"] == "XDP"
 
 
 # =============================================================================

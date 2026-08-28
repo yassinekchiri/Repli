@@ -94,7 +94,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 298 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 311 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -675,6 +675,46 @@ peut alors être omis. Trois modes :
   propagation cascade → FlexClones sur PROD et DR → **élagage** → SnapMirror
   entre clones + resync → sélection automatique du meilleur aggregate →
   `volume move` → sortie immédiate.
+
+#### Le miroir des clones : clone PROD -> clone DR
+
+Une migration comporte deux sortes de relations SnapMirror, configurées
+différemment. La **cascade** achemine les données une fois ; le **miroir des
+clones** est la relation avec laquelle le client vit ensuite, et c'est donc
+son schedule qui décide du retard toléré sur DR.
+
+| | Cascade (source → pivot → PROD/DR) | Miroir des clones (clone PROD → clone DR) |
+|---|---|---|
+| Type | `XDP` | `XDP` |
+| Policy | `MirrorAllSnapshots` | `MFA_MirrorAllSnapshots` |
+| Schedule | `hourly` | `pg-15-minutely` |
+
+Les deux jeux sont définis dans `netapp_migration/core/replication.py` — le
+seul endroit que lisent le moteur, le pré-vol et les transports. Rien ne
+retombe sur une valeur par défaut du transport : un pré-vol qui vérifierait
+un autre nom que celui envoyé par le moteur serait pire que pas de contrôle
+du tout.
+
+```
+>> [5/7]  SnapMirror (clone PROD -> clone DR) + resync
+         type=XDP policy=MFA_MirrorAllSnapshots schedule=pg-15-minutely
+```
+
+Le pré-vol vérifie que la policy **et** le schedule sont **visibles par le
+compte API** sur le cluster DR avant de lancer le clone, car ONTAP résout un
+objet référencé avec les permissions de l'appelant et signale `not found`
+celui que le rôle ne peut pas lire :
+
+```
+| FAIL | Clone mirror SnapMirror policy visible | policy 'MFA_MirrorAllSnapshots' not found |
+| FAIL | Clone mirror schedule visible          | schedule 'pg-15-minutely' not found       |
+```
+
+> **Sur le transport REST il n'existe pas de champ `type`** : la nature de la
+> relation découle du type de la *policy* — une policy async donne du XDP. Le
+> type n'est donc pas envoyé mais **vérifié après création**, et le run échoue
+> bruyamment si ONTAP a produit autre chose que du XDP. Le transport SSH
+> passe `-type XDP` directement.
 
 #### Élagage : un volume, les données d'un seul client
 

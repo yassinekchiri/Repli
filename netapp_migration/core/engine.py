@@ -29,6 +29,10 @@ from ..transport.base import OntapClient
 from .exports import (describe_forced, describe_skipped,
                       destination_rules)
 from .naming import destination_export_policy, migrated_qtree_name
+from .replication import (CASCADE_POLICY, CASCADE_SCHEDULE,
+                          CASCADE_TYPE, CLONE_POLICY,
+                          CLONE_SCHEDULE, CLONE_TYPE,
+                          describe_clone_mirror)
 from .jobs import (JobStore, CREATE_STATUS_ORDER, ACTION_SUCCESS,
                    ACTION_FAILED, ACTION_REFUSED, ACTION_NEEDS_CONFIRMATION)
 from .preflight import PreflightChecker
@@ -170,11 +174,12 @@ def _snapmirror_report(dest_path: str, sm) -> dict:
     if sm is None:
         return {"dest_path": dest_path, "uuid": "", "state": "unreadable",
                 "transfer_state": "unknown", "source_path": "", "policy": "",
-                "schedule": "", "last_transfer_end": "", "healthy": None}
+                "schedule": "", "type": "", "last_transfer_end": "",
+                "healthy": None}
     return {"dest_path": sm.dest_path, "uuid": sm.uuid, "state": sm.state,
             "transfer_state": sm.transfer_state,
             "source_path": sm.source_path, "policy": sm.policy,
-            "schedule": sm.schedule,
+            "schedule": sm.schedule, "type": sm.relationship_type,
             "last_transfer_end": sm.last_transfer_end,
             "healthy": not sm.is_broken}
 
@@ -419,10 +424,15 @@ class MigrationEngine:
         self.jobs.set_status(job, "volumes_created")
 
         # -- The three SnapMirror relationships (no transfer yet) ----------
-        self.c.snapmirror_create(p.pivot_cluster,
-                                 p.path(p.source_vserver, p.volume), pivot_path)
-        self.c.snapmirror_create(p.dest_cluster, pivot_path, prod_path)
-        self.c.snapmirror_create(p.dr_cluster,   pivot_path, dr_path)
+        for cluster, source, dest in (
+                (p.pivot_cluster, p.path(p.source_vserver, p.volume),
+                 pivot_path),
+                (p.dest_cluster, pivot_path, prod_path),
+                (p.dr_cluster, pivot_path, dr_path)):
+            self.c.snapmirror_create(cluster, source, dest,
+                                     policy=CASCADE_POLICY,
+                                     schedule=CASCADE_SCHEDULE,
+                                     relationship_type=CASCADE_TYPE)
         self.log.info("SnapMirror relationships declared (src->pivot, "
                       "pivot->PROD, pivot->DR).")
         self.jobs.set_status(job, "relationships_created")
@@ -733,9 +743,10 @@ class MigrationEngine:
         self.log.info("")
 
         self._log_table(
-            ["Clone mirror (PROD -> DR)", "UUID", "State", "Transfer",
+            ["Clone mirror (PROD -> DR)", "UUID", "Type", "State", "Transfer",
              "Policy", "Schedule", "Last transfer"],
             [[e["snapmirror"]["dest_path"], e["snapmirror"]["uuid"] or "-",
+              e["snapmirror"]["type"] or "-",
               e["snapmirror"]["state"], e["snapmirror"]["transfer_state"],
               e["snapmirror"]["policy"] or "-",
               e["snapmirror"]["schedule"] or "-",
@@ -953,13 +964,16 @@ class MigrationEngine:
 
         if need_rels:
             self.log.info("--- Phase: SnapMirror creation (idempotent) ---")
-            self.c.snapmirror_create(p.pivot_cluster,
-                                     p.path(p.source_vserver, p.volume),
-                                     pivot_path, idempotent=True)
-            self.c.snapmirror_create(p.dest_cluster, pivot_path, prod_path,
-                                     idempotent=True)
+            legs = [(p.pivot_cluster, p.path(p.source_vserver, p.volume),
+                     pivot_path),
+                    (p.dest_cluster, pivot_path, prod_path)]
             if dr_path:
-                self.c.snapmirror_create(p.dr_cluster, pivot_path, dr_path,
+                legs.append((p.dr_cluster, pivot_path, dr_path))
+            for cluster, source, dest in legs:
+                self.c.snapmirror_create(cluster, source, dest,
+                                         policy=CASCADE_POLICY,
+                                         schedule=CASCADE_SCHEDULE,
+                                         relationship_type=CASCADE_TYPE,
                                          idempotent=True)
             self.jobs.set_status(job, "relationships_created")
         else:
@@ -1428,11 +1442,15 @@ class MigrationEngine:
 
         # Step 5: SnapMirror between the clones + resync.
         self.log.info(">> [5/7]  SnapMirror (clone PROD -> clone DR) + resync")
+        self.log.info("         %s", describe_clone_mirror())
         for qtree in qtrees:
             clone_vol = mapping[qtree]
             prod_clone = p.path(p.dest_vserver, clone_vol)
             dr_clone = p.path(p.dr_vserver, clone_vol)
-            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone)
+            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone,
+                                     policy=CLONE_POLICY,
+                                     schedule=CLONE_SCHEDULE,
+                                     relationship_type=CLONE_TYPE)
             self.c.snapmirror_resync(p.dr_cluster, dr_clone)
             self.log.info("         '%s'  relationship created, resync "
                           "launched.", clone_vol)
@@ -1601,11 +1619,15 @@ class MigrationEngine:
 
         # Step 5: SnapMirror between the clones + resync (like production).
         self.log.info(">> [5/6]  SnapMirror (clone PROD -> clone DR) + resync")
+        self.log.info("         %s", describe_clone_mirror())
         for qtree in qtrees:
             clone_vol = mapping[qtree]
             prod_clone = p.path(p.dest_vserver, clone_vol)
             dr_clone = p.path(p.dr_vserver, clone_vol)
-            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone)
+            self.c.snapmirror_create(p.dr_cluster, prod_clone, dr_clone,
+                                     policy=CLONE_POLICY,
+                                     schedule=CLONE_SCHEDULE,
+                                     relationship_type=CLONE_TYPE)
             self.c.snapmirror_resync(p.dr_cluster, dr_clone)
             self.log.info("         '%s'  relationship created, resync "
                           "launched.", clone_vol)

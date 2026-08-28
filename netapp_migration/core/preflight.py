@@ -31,6 +31,9 @@ from ..transport.base import OntapClient
 from .jobs import CREATE_STATUS_ORDER
 from .exports import (describe_forced, describe_skipped,
                       destination_rules)
+from .replication import (CASCADE_POLICY, CASCADE_SCHEDULE,
+                          CLONE_POLICY, CLONE_SCHEDULE,
+                          CLONE_TYPE, describe_clone_mirror)
 from .naming import (MIGRATED_MARK, destination_export_policy,
                      migrated_qtree_name)
 
@@ -44,9 +47,11 @@ _AD_GROUP_RE = re.compile(r"^[^\\/:*?\"<>|]+(\\[^\\/:*?\"<>|]+)?$")
 # Statuses in which the replication cascade is fully in place.
 _CASCADE_READY_STATUSES = ("dest_initialized", "completed")
 
-# Kept here so the checks and the engine cannot drift apart.
-SNAPMIRROR_POLICY = "MirrorAllSnapshots"
-SNAPMIRROR_SCHEDULE = "hourly"
+# Re-exported from core/replication.py, which is the single place both the
+# engine and these checks read: a check that verifies a different policy or
+# schedule from the one the engine sends is worse than no check at all.
+SNAPMIRROR_POLICY = CASCADE_POLICY
+SNAPMIRROR_SCHEDULE = CASCADE_SCHEDULE
 
 
 class PreflightChecker:
@@ -818,8 +823,8 @@ class PreflightChecker:
                             p.dest_cluster, p.dest_vserver,
                             "clone PROD -> clone DR")
         self._check_policy_and_schedule(report, p.dr_cluster,
-                                        SNAPMIRROR_POLICY,
-                                        SNAPMIRROR_SCHEDULE, "clone mirror")
+                                        CLONE_POLICY, CLONE_SCHEDULE,
+                                        "clone mirror")
         return report
 
     def for_clone(self, job: dict, qtrees: Sequence[str],
@@ -917,8 +922,7 @@ class PreflightChecker:
                                 p.dest_cluster, p.dest_vserver,
                                 "clone PROD -> clone DR")
             self._check_policy_and_schedule(report, p.dr_cluster,
-                                            SNAPMIRROR_POLICY,
-                                            SNAPMIRROR_SCHEDULE,
+                                            CLONE_POLICY, CLONE_SCHEDULE,
                                             "clone mirror")
             if fresh and job and job.get("test_env"):
                 self._add(report, "FRESH_ABANDONS_TEST_ENV",

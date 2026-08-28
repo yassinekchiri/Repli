@@ -128,9 +128,11 @@ class DryRunClient(OntapClient):
 
     # ---- SnapMirror ------------------------------------------------------
     def snapmirror_create(self, cluster, source_path, dest_path,
-                          policy="MirrorAllSnapshots", schedule="hourly",
+                          policy, schedule, relationship_type="XDP",
                           idempotent=False):
-        self._trace(cluster, f"snapmirror create {source_path} -> {dest_path}")
+        self._trace(cluster, f"snapmirror create {source_path} -> {dest_path} "
+                             f"(type={relationship_type} policy={policy} "
+                             f"schedule={schedule})")
 
     def snapmirror_initialize(self, cluster, dest_path):
         self._trace(cluster, f"snapmirror initialize {dest_path}")

@@ -93,7 +93,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 298 tests, offline, no cluster contacted
+python3 -m pytest            # 311 tests, offline, no cluster contacted
 ```
 
 ---
@@ -661,9 +661,48 @@ be omitted there. Three modes:
       --qtrees q_fin,q_hr --fresh
   ```
 * **Full flow** — no test environment: dedicated snapshot → cascade
-  propagation → FlexClones on PROD and DR → **pruning** → SnapMirror between
-  the clones + resync → automatic best-aggregate selection → `volume move` →
-  immediate exit.
+  propagation → FlexClones on PROD and DR → **pruning** → **export policies**
+  → SnapMirror between the clones + resync → automatic best-aggregate
+  selection → `volume move` → immediate exit.
+
+#### The clone mirror: PROD clone -> DR clone
+
+Two kinds of SnapMirror relationship exist in a migration, and they are not
+configured alike. The **cascade** stages the data across once; the **clone
+mirror** is the relationship the client lives with afterwards, so its
+schedule decides how far behind DR is allowed to fall.
+
+| | Cascade (source → pivot → PROD/DR) | Clone mirror (PROD clone → DR clone) |
+|---|---|---|
+| Type | `XDP` | `XDP` |
+| Policy | `MirrorAllSnapshots` | `MFA_MirrorAllSnapshots` |
+| Schedule | `hourly` | `pg-15-minutely` |
+
+Both sets live in `netapp_migration/core/replication.py` — the single place
+the engine, the pre-flight and the transports all read. Nothing falls back
+on a transport default: a pre-flight that checked a different name from the
+one the engine sends would be worse than no check at all.
+
+```
+>> [5/7]  SnapMirror (clone PROD -> clone DR) + resync
+         type=XDP policy=MFA_MirrorAllSnapshots schedule=pg-15-minutely
+```
+
+The pre-flight verifies both the policy and the schedule are **visible to
+the API user** on the DR cluster before the clone starts, because ONTAP
+resolves a referenced object with the caller's permissions and reports one
+the role cannot read as `not found`:
+
+```
+| FAIL | Clone mirror SnapMirror policy visible | policy 'MFA_MirrorAllSnapshots' not found |
+| FAIL | Clone mirror schedule visible          | schedule 'pg-15-minutely' not found       |
+```
+
+> **On the REST transport there is no relationship `type` field**: the kind
+> follows from the *policy's* type — an async policy yields XDP. So the type
+> is not sent, it is **verified after creation** and the run fails loudly if
+> ONTAP produced something other than XDP. The SSH transport passes
+> `-type XDP` directly.
 
 #### Pruning: one volume, one client's data
 

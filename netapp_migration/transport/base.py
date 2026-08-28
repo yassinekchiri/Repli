@@ -139,11 +139,17 @@ class OntapClient(ABC):
     # ---- SnapMirror ------------------------------------------------------
     @abstractmethod
     def snapmirror_create(self, cluster: str, source_path: str,
-                          dest_path: str, policy: str = "MirrorAllSnapshots",
-                          schedule: str = "hourly",
+                          dest_path: str, policy: str, schedule: str,
+                          relationship_type: str = "XDP",
                           idempotent: bool = False) -> None:
         """Declare the relationship (no transfer). Runs on the cluster
-        hosting the DESTINATION volume."""
+        hosting the DESTINATION volume.
+
+        policy and schedule have no defaults on purpose: they differ between
+        the cascade and the clone mirror, and a default here would let a
+        caller create the wrong kind of relationship by forgetting an
+        argument. core/replication.py holds both sets.
+        """
 
     @abstractmethod
     def snapmirror_initialize(self, cluster: str, dest_path: str) -> None:

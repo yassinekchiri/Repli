@@ -98,6 +98,19 @@ def _export_rule_to_rest(rule: ExportRule) -> dict:
     return body
 
 
+def _relationship_type_of(rec: dict) -> str:
+    """XDP / DP / … from the policy type REST reports.
+
+    REST has no relationship 'type' field: an async policy makes an XDP
+    relationship, a sync one a sync relationship. Derived here so callers
+    see the CLI's vocabulary rather than having to know that.
+    """
+    policy_type = ((rec.get("policy", {}) or {}).get("type", "") or "").lower()
+    if not policy_type:
+        return ""
+    return "XDP" if policy_type.startswith("async") else policy_type.upper()
+
+
 # ONTAP messages that mean "the object is already there" (idempotent mode).
 _ALREADY_EXISTS_MARKERS = ("already exists", "duplicate entry",
                            "entry already exists", "already has")
@@ -473,8 +486,16 @@ class RestClient(OntapClient):
     # SnapMirror
     # ------------------------------------------------------------------ #
     def snapmirror_create(self, cluster, source_path, dest_path,
-                          policy="MirrorAllSnapshots", schedule="hourly",
+                          policy, schedule, relationship_type="XDP",
                           idempotent=False):
+        """Declare the relationship.
+
+        The REST API has no 'type' field: the relationship kind follows from
+        the POLICY's type — an async policy gives an XDP relationship, a sync
+        one gives a sync relationship. So the requested type is not sent,
+        it is VERIFIED after creation (_verify_relationship_type), which is
+        the only honest way to promise it on this transport.
+        """
         payload = {
             "source": {"path": source_path},
             "destination": {"path": dest_path},
@@ -495,12 +516,39 @@ class RestClient(OntapClient):
                 # cannot read is reported as missing even though it exists.
                 raise OntapError(
                     cluster, exc.operation,
-                    f"{exc.detail} — hint: the referenced object may exist "
-                    f"but be invisible to the API user's role. Grant "
-                    f"readonly access to /api/cluster/schedules, "
-                    f"/api/snapmirror/policies and /api/svm/peers "
-                    f"(see README section 2.5).") from exc
+                    f"{exc.detail} — hint: the referenced object '{policy}' / "
+                    f"'{schedule}' may exist but be invisible to the API "
+                    f"user's role. Grant readonly access to "
+                    f"/api/cluster/schedules, /api/snapmirror/policies and "
+                    f"/api/svm/peers (see README section 2.5).") from exc
             raise
+        self._verify_relationship_type(cluster, dest_path, relationship_type)
+
+    def _verify_relationship_type(self, cluster: str, dest_path: str,
+                                  wanted: str) -> None:
+        """Confirm ONTAP built the kind of relationship that was asked for.
+
+        The type is decided by the policy, so the wrong policy silently
+        yields the wrong kind of mirror. Checked rather than assumed, and
+        raised loudly: a DP relationship where XDP was wanted replicates
+        differently and would only be noticed at failover.
+        """
+        if not wanted:
+            return
+        body = self._try_get(cluster, "/snapmirror/relationships",
+                             params={"destination.path": dest_path,
+                                     "fields": "policy.type"})
+        records = body.get("records", [])
+        if not records:
+            self.log.warning("Could not read back %s to confirm it is %s.",
+                             dest_path, wanted)
+            return
+        actual = _relationship_type_of(records[0])
+        if actual and actual != wanted.upper():
+            raise OntapError(
+                cluster, f"snapmirror create {dest_path}",
+                f"relationship came out as '{actual}', not the '{wanted}' "
+                f"that was asked for — check the policy's type")
 
     def _relationship_uuid(self, cluster: str, dest_path: str) -> str:
         body = self._request(cluster, "GET", "/snapmirror/relationships",
@@ -551,6 +599,7 @@ class RestClient(OntapClient):
                                      "fields": "uuid,state,healthy,"
                                                "unhealthy_reason,"
                                                "source.path,policy.name,"
+                                               "policy.type,"
                                                "transfer_schedule.name,"
                                                "transfer.state,"
                                                "transfer.bytes_transferred,"
@@ -594,6 +643,7 @@ class RestClient(OntapClient):
             source_path=(rec.get("source", {}) or {}).get("path", "") or "",
             policy=(rec.get("policy", {}) or {}).get("name", "") or "",
             schedule=(rec.get("transfer_schedule", {}) or {}).get("name", "") or "",
+            relationship_type=_relationship_type_of(rec),
             last_transfer_end=transfer.get("end_time", "") or "",
         )
 
