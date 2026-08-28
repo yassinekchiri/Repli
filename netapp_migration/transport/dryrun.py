@@ -6,10 +6,11 @@ aggregate space. Used with --dry-run whatever the selected transport.
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from ..models import (VolumeInfo, AggregateInfo, SnapMirrorInfo,
-                      SvmInfo, PeerInfo, ExportRule)
+                      SvmInfo, PeerInfo, ExportRule, ExportPolicyInfo,
+                      QtreeInfo, QuotaRule)
 from .base import OntapClient
 
 _FAKE_SIZE = 1024 ** 3          # 1 GiB source volume
@@ -180,3 +181,30 @@ class DryRunClient(OntapClient):
     def junction_path_exists(self, cluster, svm, path) -> bool:
         self._trace(cluster, f"junction path exists? {svm}:{path} -> yes")
         return True
+
+    # ---- Read-only inventory (reporting) ---------------------------------
+    def list_qtree_details(self, cluster, svm, volume) -> List[QtreeInfo]:
+        self._trace(cluster, f"qtree show -instance {svm}:{volume}")
+        return [QtreeInfo(name="qtree_dryrun1", id=1, volume=volume,
+                          volume_uuid="00000000-dryrun-volume",
+                          path=f"/{volume}/qtree_dryrun1",
+                          export_policy="ep_dryrun", security_style="ntfs")]
+
+    def get_export_policy(self, cluster, svm, policy) -> Optional[ExportPolicyInfo]:
+        self._trace(cluster, f"export-policy show -instance {svm}:{policy}")
+        return ExportPolicyInfo(
+            name=policy, id=42, svm=svm,
+            rules=self.get_export_policy_rules(cluster, svm, policy))
+
+    def list_quota_rules(self, cluster, svm, volume) -> List[QuotaRule]:
+        self._trace(cluster, f"quota rule show {svm}:{volume}")
+        return [QuotaRule(uuid="00000000-dryrun-quota", type="tree",
+                          qtree="qtree_dryrun1",
+                          space_hard_limit=100 * 1024 ** 3,
+                          space_soft_limit=80 * 1024 ** 3,
+                          files_hard_limit=1_000_000,
+                          files_soft_limit=800_000)]
+
+    def get_quota_policy(self, cluster, svm) -> str:
+        self._trace(cluster, f"quota policy of {svm} -> default")
+        return "default"

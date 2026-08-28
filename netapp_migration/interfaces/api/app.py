@@ -12,7 +12,7 @@ Endpoint map (prefix /api/v1):
     POST /migrations                    create the cascade      -> 202 (background)
     GET  /migrations                    list all jobs
     GET  /migrations/{job_id}           job record + last run info
-    GET  /migrations/{job_id}/status    live ONTAP replication state
+    GET  /migrations/{job_id}/status    live state + destination inventory
     POST /migrations/{job_id}/resume    fan-out PROD + DR       (confirm: true)
     POST /migrations/{job_id}/retry     re-enter create         -> 202 (background)
     POST /migrations/{job_id}/test      thin FlexClones         -> 202 (background)
@@ -463,6 +463,11 @@ def get_migration(job_id: str, logs: int = 50,
 def migration_status(job_id: str,
                      principal: Principal = Depends(current_principal)):
     """Live ONTAP replication state (queries the clusters).
+
+    Once the clones exist, the answer also carries `destination`: the full
+    inventory of what the migration put on PROD and DR — volume UUIDs,
+    qtree ids, export policies with their rules, quota rules with their
+    limits, and the clone SnapMirror UUIDs.
 
     Strictly read-only: the job file is never modified by a GET. Use
     POST .../refresh when you want the observed state to be persisted

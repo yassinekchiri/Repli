@@ -87,6 +87,96 @@ def records(action: str):
     return decorator
 
 
+# ---------------------------------------------------------------------------
+# Destination inventory: ONTAP objects -> plain JSON-serialisable dicts.
+# Kept at module level so the shape of the report is readable in one place,
+# and so an object that could not be read still produces a full row.
+# ---------------------------------------------------------------------------
+
+_EMPTY_RULE = {"index": None, "clients": [], "ro_rule": [], "rw_rule": [],
+               "superuser": [], "protocols": [], "anonymous_user": ""}
+
+
+def _str(value) -> str:
+    """A table cell for a value that may legitimately be absent."""
+    return "-" if value is None or value == "" else str(value)
+
+
+def _gib(value: Optional[int]) -> str:
+    """Bytes as a human-readable size; 'unlimited' when ONTAP set no limit."""
+    if value is None:
+        return "unlimited"
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(size) < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return str(value)
+
+
+def _volume_report(vol) -> dict:
+    if vol is None:
+        return {"name": "", "uuid": "", "state": "unreadable", "type": "",
+                "aggregate": "", "junction_path": "", "size_bytes": None,
+                "security_style": "", "is_flexclone": None, "clone_parent": "",
+                "move_state": "", "quota_state": ""}
+    return {"name": vol.name, "uuid": vol.uuid or "", "state": vol.state,
+            "type": vol.volume_type, "aggregate": vol.aggregate or "",
+            "junction_path": vol.junction_path,
+            "size_bytes": vol.size_bytes,
+            "security_style": vol.security_style or "",
+            "is_flexclone": vol.is_flexclone,
+            "clone_parent": vol.clone_parent,
+            "move_state": vol.move_state, "quota_state": vol.quota_state}
+
+
+def _qtree_report(qtree) -> dict:
+    return {"name": qtree.name, "id": qtree.id, "path": qtree.path,
+            "volume_uuid": qtree.volume_uuid,
+            "export_policy": qtree.export_policy,
+            "security_style": qtree.security_style}
+
+
+def _rule_report(rule) -> dict:
+    return {"index": rule.index, "clients": list(rule.clients),
+            "ro_rule": list(rule.ro_rule), "rw_rule": list(rule.rw_rule),
+            "superuser": list(rule.superuser),
+            "protocols": list(rule.protocols),
+            "anonymous_user": rule.anonymous_user}
+
+
+def _policy_report(name: str, info) -> dict:
+    if info is None:
+        # Absent and unreadable are different answers, and the caller has
+        # already recorded the reason when it was the second one.
+        return {"name": name, "id": None, "rules": [], "present": False}
+    return {"name": info.name or name, "id": info.id, "present": True,
+            "rules": [_rule_report(r) for r in info.rules]}
+
+
+def _quota_report(rule) -> dict:
+    return {"uuid": rule.uuid, "type": rule.type, "qtree": rule.qtree,
+            "target": rule.target,
+            "space_hard_limit": rule.space_hard_limit,
+            "space_soft_limit": rule.space_soft_limit,
+            "files_hard_limit": rule.files_hard_limit,
+            "files_soft_limit": rule.files_soft_limit,
+            "user_mapping": rule.user_mapping}
+
+
+def _snapmirror_report(dest_path: str, sm) -> dict:
+    if sm is None:
+        return {"dest_path": dest_path, "uuid": "", "state": "unreadable",
+                "transfer_state": "unknown", "source_path": "", "policy": "",
+                "schedule": "", "last_transfer_end": "", "healthy": None}
+    return {"dest_path": sm.dest_path, "uuid": sm.uuid, "state": sm.state,
+            "transfer_state": sm.transfer_state,
+            "source_path": sm.source_path, "policy": sm.policy,
+            "schedule": sm.schedule,
+            "last_transfer_end": sm.last_transfer_end,
+            "healthy": not sm.is_broken}
+
+
 class MigrationEngine:
     """Drives one migration (one source volume) through all its actions."""
 
@@ -457,6 +547,209 @@ class MigrationEngine:
         else:
             self.log.info(line)
 
+    # ------------------------------------------------------------------ #
+    # Destination inventory (reporting only)
+    # ------------------------------------------------------------------ #
+    def _probe(self, description: str, fn, default):
+        """Run one inventory read; a failure becomes a note, not a crash.
+
+        The inventory is a report. One unreadable object — an RBAC gap on
+        quotas, a field an older ONTAP does not expose — must degrade that
+        one line, never lose the rest of the picture.
+        """
+        try:
+            return fn(), ""
+        except OntapError as exc:
+            self.log.debug("Inventory probe failed (%s): %s", description, exc)
+            return default, exc.detail or str(exc)
+        except Exception as exc:                          # noqa: BLE001
+            self.log.debug("Inventory probe raised (%s): %s", description, exc)
+            return default, str(exc)
+
+    def destination_inventory(self, job: dict) -> dict:
+        """Everything the migration put on PROD and DR, with its handles.
+
+        Answers the question an operator has once a clone is done: what
+        exists now, and how do I find it again? So every object is reported
+        with the identifier ONTAP knows it by — volume UUID, qtree id,
+        export-policy id, quota-rule UUID, SnapMirror UUID — alongside the
+        values that decide behaviour (limits, rules, states).
+
+        Strictly read-only, and never raises: an object that cannot be read
+        is reported as unreadable, with the reason, next to the ones that
+        could.
+        """
+        p = self.p
+        volumes = dict(job.get("volume_map") or {})
+        renames = dict(job.get("qtree_map") or {})
+        policies = dict(job.get("export_policy_map") or {})
+
+        inventory: dict = {"job_id": job.get("job_id", ""),
+                           "clusters": {"prod": p.dest_cluster,
+                                        "dr": p.dr_cluster},
+                           "vservers": {"prod": p.dest_vserver,
+                                        "dr": p.dr_vserver},
+                           "quota_policies": {},
+                           "volumes": [],
+                           "unreadable": []}
+
+        def note(what: str, error: str):
+            if error:
+                inventory["unreadable"].append({"object": what,
+                                                "reason": error})
+
+        for role, cluster, svm in (("PROD", p.dest_cluster, p.dest_vserver),
+                                   ("DR", p.dr_cluster, p.dr_vserver)):
+            policy, err = self._probe(f"{role} quota policy",
+                                      lambda c=cluster, s=svm:
+                                          self.c.get_quota_policy(c, s), "")
+            note(f"{role} quota policy", err)
+            inventory["quota_policies"][role] = (
+                policy or "not exposed by the REST API")
+
+        for qtree, volume in sorted(volumes.items()):
+            dest_qtree = renames.get(qtree, qtree)
+            entry: dict = {"qtree": qtree, "dest_qtree": dest_qtree,
+                           "volume": volume, "sides": {}}
+
+            for role, cluster, svm in (("PROD", p.dest_cluster, p.dest_vserver),
+                                       ("DR", p.dr_cluster, p.dr_vserver)):
+                where = f"{role} {cluster}/{svm}:{volume}"
+                side: dict = {"cluster": cluster, "vserver": svm}
+
+                vol, err = self._probe(where,
+                                       lambda c=cluster, s=svm, v=volume:
+                                           self.c.get_volume(c, s, v), None)
+                note(where, err)
+                side["volume"] = _volume_report(vol)
+
+                qtrees, err = self._probe(
+                    f"{where} qtrees",
+                    lambda c=cluster, s=svm, v=volume:
+                        self.c.list_qtree_details(c, s, v), [])
+                note(f"{where} qtrees", err)
+                side["qtrees"] = [_qtree_report(q) for q in qtrees]
+
+                # The policy this job set, plus any other policy the qtrees
+                # actually point at — the two differ when something outside
+                # this job changed one.
+                wanted = {policies.get(qtree) or destination_export_policy(
+                    dest_qtree)}
+                wanted.update(q.export_policy for q in qtrees
+                              if q.export_policy)
+                side["export_policies"] = []
+                for name in sorted(n for n in wanted if n):
+                    info, err = self._probe(
+                        f"{where} export policy {name}",
+                        lambda c=cluster, s=svm, n=name:
+                            self.c.get_export_policy(c, s, n), None)
+                    note(f"{where} export policy {name}", err)
+                    side["export_policies"].append(
+                        _policy_report(name, info))
+
+                quotas, err = self._probe(
+                    f"{where} quota rules",
+                    lambda c=cluster, s=svm, v=volume:
+                        self.c.list_quota_rules(c, s, v), [])
+                note(f"{where} quota rules", err)
+                side["quota_rules"] = [_quota_report(q) for q in quotas]
+
+                entry["sides"][role] = side
+
+            # One relationship per clone: PROD clone -> DR clone.
+            dest_path = p.path(p.dr_vserver, volume)
+            sm, err = self._probe(f"clone mirror {dest_path}",
+                                  lambda d=dest_path:
+                                      self.c.get_snapmirror(p.dr_cluster, d),
+                                  None)
+            note(f"clone mirror {dest_path}", err)
+            entry["snapmirror"] = _snapmirror_report(dest_path, sm)
+            inventory["volumes"].append(entry)
+
+        return inventory
+
+    def _log_inventory(self, inventory: dict) -> None:
+        """Print the inventory as tables, one section per kind of object."""
+        self.log.info("")
+        self.log.info("-" * 60)
+        self.log.info("  DESTINATION ENVIRONMENT")
+        self.log.info("-" * 60)
+
+        for role in ("PROD", "DR"):
+            self._log_table(
+                [f"{role} volume", "UUID", "State", "Type", "Aggregate",
+                 "Junction", "Size", "Clone of", "Quota"],
+                [[e["volume"],
+                  s["volume"]["uuid"] or "-", s["volume"]["state"] or "-",
+                  s["volume"]["type"] or "-", s["volume"]["aggregate"] or "-",
+                  s["volume"]["junction_path"] or "-",
+                  _gib(s["volume"]["size_bytes"]),
+                  s["volume"]["clone_parent"] or "(split)",
+                  s["volume"]["quota_state"] or "-"]
+                 for e in inventory["volumes"]
+                 for s in [e["sides"][role]]])
+            self.log.info("")
+
+        self._log_table(
+            ["Volume", "Side", "Qtree", "Id", "Path", "Export policy",
+             "Security"],
+            [[e["volume"], role, q["name"], _str(q["id"]), q["path"] or "-",
+              q["export_policy"] or "-", q["security_style"] or "-"]
+             for e in inventory["volumes"] for role in ("PROD", "DR")
+             for q in e["sides"][role]["qtrees"]])
+        self.log.info("")
+
+        self._log_table(
+            ["Side", "Export policy", "Id", "Rule", "Clients", "RO", "RW",
+             "Protocols"],
+            [[role, pol["name"], _str(pol["id"]), _str(rule["index"]),
+              ", ".join(rule["clients"]) or "NONE",
+              "|".join(rule["ro_rule"]) or "-",
+              "|".join(rule["rw_rule"]) or "-",
+              "|".join(rule["protocols"]) or "-"]
+             for e in inventory["volumes"] for role in ("PROD", "DR")
+             for pol in e["sides"][role]["export_policies"]
+             for rule in (pol["rules"] or [_EMPTY_RULE])])
+        self.log.info("")
+
+        self.log.info("  Quota policy   PROD: %s   |   DR: %s",
+                      inventory["quota_policies"].get("PROD", "-"),
+                      inventory["quota_policies"].get("DR", "-"))
+        quota_rows = [
+            [e["volume"], role, q["type"], q["qtree"] or "-",
+             q["target"] or "-", _gib(q["space_hard_limit"]),
+             _gib(q["space_soft_limit"]), _str(q["files_hard_limit"]),
+             _str(q["files_soft_limit"]), q["uuid"] or "-"]
+            for e in inventory["volumes"] for role in ("PROD", "DR")
+            for q in e["sides"][role]["quota_rules"]]
+        if quota_rows:
+            self._log_table(["Volume", "Side", "Type", "Qtree", "Target",
+                             "Space hard", "Space soft", "Files hard",
+                             "Files soft", "UUID"], quota_rows)
+        else:
+            self.log.info("  No quota rule on any destination volume.")
+        self.log.info("")
+
+        self._log_table(
+            ["Clone mirror (PROD -> DR)", "UUID", "State", "Transfer",
+             "Policy", "Schedule", "Last transfer"],
+            [[e["snapmirror"]["dest_path"], e["snapmirror"]["uuid"] or "-",
+              e["snapmirror"]["state"], e["snapmirror"]["transfer_state"],
+              e["snapmirror"]["policy"] or "-",
+              e["snapmirror"]["schedule"] or "-",
+              e["snapmirror"]["last_transfer_end"] or "-"]
+             for e in inventory["volumes"]])
+
+        if inventory["unreadable"]:
+            self.log.info("")
+            self.log.warning("  %d object(s) could not be read — the rest of "
+                             "the inventory is complete:",
+                             len(inventory["unreadable"]))
+            for item in inventory["unreadable"]:
+                self.log.warning("      %s: %s", item["object"],
+                                 item["reason"])
+        self.log.info("-" * 60)
+
     # Deliberately NOT recorded: check-status changes nothing, and filing
     # itself as the "last action" would overwrite — and hide — the outcome
     # the operator ran it to see.
@@ -489,6 +782,12 @@ class MigrationEngine:
             self._log_arch(pivot_note="idle", prod_note="idle", dr_note="idle")
             self.log.info("  Replication cascade complete for job %s.",
                           self.job_id)
+            # Once the clones exist there is a destination environment to
+            # describe, and this is the action an operator runs to see it.
+            if job.get("volume_map"):
+                inventory = self.destination_inventory(job)
+                self._log_inventory(inventory)
+                result["destination"] = inventory
             return result
 
         def leg(role, cluster, path) -> dict:

@@ -93,7 +93,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 234 tests, offline, no cluster contacted
+python3 -m pytest            # 258 tests, offline, no cluster contacted
 ```
 
 ---
@@ -328,6 +328,7 @@ from the cluster admin CLI. The role only grants the commands
 security login rest-role create -role mutrepli_rest -api /api/storage/volumes -access all
 security login rest-role create -role mutrepli_rest -api /api/storage/qtrees -access all
 security login rest-role create -role mutrepli_rest -api /api/storage/aggregates -access readonly
+security login rest-role create -role mutrepli_rest -api /api/storage/quota/rules -access readonly
 security login rest-role create -role mutrepli_rest -api /api/snapmirror/relationships -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/shares -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/nfs/export-policies -access all
@@ -354,6 +355,7 @@ security login rest-role create -role mutrepli_rest -api /api/svm/peers -access 
 security login role create -role mutrepli_cli -cmddirname "volume" -access all
 security login role create -role mutrepli_cli -cmddirname "snapmirror" -access all
 security login role create -role mutrepli_cli -cmddirname "storage aggregate" -access readonly
+security login role create -role mutrepli_cli -cmddirname "volume quota policy" -access readonly
 security login role create -role mutrepli_cli -cmddirname "vserver cifs share" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver export-policy" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver security file-directory" -access all
@@ -516,6 +518,54 @@ python3 netapp_cascade_migration.py --action create ... --create-mode pivot-only
 python3 netapp_cascade_migration.py --action check-status --job-id <ID>
 python3 netapp_cascade_migration.py --action resume       --job-id <ID>
 ```
+
+#### After the clone: the destination inventory
+
+Once the clones exist, `check-status` stops being a replication progress bar
+and becomes the answer to *what exists now, and how do I find it again?* It
+reports every object the migration created on **PROD and DR**, each with the
+handle ONTAP knows it by, next to the values that decide behaviour:
+
+| Object | Reported |
+|---|---|
+| Volume | UUID, state, type, aggregate, junction path, size, parent it was cloned from, quota state |
+| Qtrees | id, path, export policy in force, security style |
+| Export policies | id, and every rule — clients, RO/RW, protocols |
+| Quotas | rule UUID, type, target, **space hard and soft limits, files hard and soft limits** |
+| Quota policy | the SVM's active policy, per side |
+| SnapMirror | relationship UUID, source path, state, transfer state, policy, schedule, last transfer |
+
+```
++-------------+--------------------------------------+--------+------+-----------+------------+
+| PROD volume | UUID                                 | State  | Type | Aggregate | Junction   |
++-------------+--------------------------------------+--------+------+-----------+------------+
+| vol_q_fin   | 8f3a1c2e-9b44-11ee-b9d1-005056b0aa01 | online | rw   | aggr_prd2 | /vol_q_fin |
++-------------+--------------------------------------+--------+------+-----------+------------+
+```
+
+Both sides are shown, and **DR is read from DR** — not assumed from what
+PROD was told to do. That is what makes the report worth running: it shows
+what replication actually delivered.
+
+Same data through the API, under `destination`:
+
+```bash
+curl -s $BASE/migrations/$JOB/status | jq '.result.destination'
+```
+
+It is a **report**: strictly read-only, and one object it cannot read costs
+one line, never the whole picture. Anything that failed is listed at the end
+with the reason — usually a missing RBAC grant:
+
+```
+| WARN | 2 object(s) could not be read — the rest of the inventory is complete:
+|          PROD CMOPARPA4SFS100/svm_dest:vol_q_fin quota rules: not authorized
+```
+
+> The quota **policy** name is not exposed by the ONTAP REST API — rules are
+> applied to the SVM's active policy without naming it — so the REST
+> transport reports `not exposed by the REST API`. The SSH transport reads it
+> from `vserver show -fields quota-policy`.
 
 ### 3.2 retry — resume a failed create
 
@@ -806,7 +856,7 @@ screenshot of every step.
 | `POST` | `/api/v1/migrations` | create | `202` + job_id (background) |
 | `GET`  | `/api/v1/migrations` | list all jobs | `200` |
 | `GET`  | `/api/v1/migrations/{id}` | job record + last action (logs) | `200` |
-| `GET`  | `/api/v1/migrations/{id}/status` | live replication state (queries ONTAP) | `200` |
+| `GET`  | `/api/v1/migrations/{id}/status` | live replication state + destination inventory (queries ONTAP) | `200` |
 | `POST` | `/api/v1/migrations/{id}/resume` | PROD + DR fan-out | `200` / `409` |
 | `POST` | `/api/v1/migrations/{id}/retry` | resume after a failure | `202` (background) |
 | `POST` | `/api/v1/migrations/{id}/test` | full test env (clones + mirror, time-limited) | `202` (background) |

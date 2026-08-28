@@ -94,7 +94,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 234 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 258 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -334,6 +334,7 @@ la main depuis la CLI admin du cluster. Le rôle n'autorise que les commandes
 security login rest-role create -role mutrepli_rest -api /api/storage/volumes -access all
 security login rest-role create -role mutrepli_rest -api /api/storage/qtrees -access all
 security login rest-role create -role mutrepli_rest -api /api/storage/aggregates -access readonly
+security login rest-role create -role mutrepli_rest -api /api/storage/quota/rules -access readonly
 security login rest-role create -role mutrepli_rest -api /api/snapmirror/relationships -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/shares -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/nfs/export-policies -access all
@@ -360,6 +361,7 @@ security login rest-role create -role mutrepli_rest -api /api/svm/peers -access 
 security login role create -role mutrepli_cli -cmddirname "volume" -access all
 security login role create -role mutrepli_cli -cmddirname "snapmirror" -access all
 security login role create -role mutrepli_cli -cmddirname "storage aggregate" -access readonly
+security login role create -role mutrepli_cli -cmddirname "volume quota policy" -access readonly
 security login role create -role mutrepli_cli -cmddirname "vserver cifs share" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver export-policy" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver security file-directory" -access all
@@ -523,6 +525,55 @@ python3 netapp_cascade_migration.py --action create ... --create-mode pivot-only
 python3 netapp_cascade_migration.py --action check-status --job-id <ID>
 python3 netapp_cascade_migration.py --action resume       --job-id <ID>
 ```
+
+#### Après le clone : l'inventaire de la destination
+
+Une fois les clones créés, `check-status` cesse d'être une barre de
+progression de réplication et devient la réponse à *qu'est-ce qui existe
+maintenant, et comment le retrouver ?* Il rapporte chaque objet créé par la
+migration sur **PROD et DR**, chacun avec l'identifiant sous lequel ONTAP le
+connaît, à côté des valeurs qui décident du comportement :
+
+| Objet | Rapporté |
+|---|---|
+| Volume | UUID, état, type, aggregate, junction path, taille, parent dont il est le clone, état des quotas |
+| Qtrees | id, chemin, export policy en vigueur, security style |
+| Export policies | id, et chaque règle — clients, RO/RW, protocoles |
+| Quotas | UUID de la règle, type, cible, **limites d'espace hard et soft, limites de fichiers hard et soft** |
+| Quota policy | la policy active du SVM, par côté |
+| SnapMirror | UUID de la relation, chemin source, état, état du transfert, policy, schedule, dernier transfert |
+
+```
++-------------+--------------------------------------+--------+------+-----------+------------+
+| PROD volume | UUID                                 | State  | Type | Aggregate | Junction   |
++-------------+--------------------------------------+--------+------+-----------+------------+
+| vol_q_fin   | 8f3a1c2e-9b44-11ee-b9d1-005056b0aa01 | online | rw   | aggr_prd2 | /vol_q_fin |
++-------------+--------------------------------------+--------+------+-----------+------------+
+```
+
+Les deux côtés sont affichés, et **DR est lu sur DR** — pas déduit de ce
+qu'on a demandé à PROD. C'est ce qui rend le rapport utile : il montre ce que
+la réplication a réellement livré.
+
+Les mêmes données via l'API, sous `destination` :
+
+```bash
+curl -s $BASE/migrations/$JOB/status | jq '.result.destination'
+```
+
+C'est un **rapport** : strictement en lecture seule, et un objet illisible
+coûte une ligne, jamais l'ensemble du tableau. Ce qui a échoué est listé à la
+fin avec la raison — le plus souvent un droit RBAC manquant :
+
+```
+| WARN | 2 object(s) could not be read — the rest of the inventory is complete:
+|          PROD CMOPARPA4SFS100/svm_dest:vol_q_fin quota rules: not authorized
+```
+
+> Le **nom** de la quota policy n'est pas exposé par l'API REST d'ONTAP — les
+> règles sont appliquées à la policy active du SVM sans la nommer — donc le
+> transport REST rapporte `not exposed by the REST API`. Le transport SSH le
+> lit via `vserver show -fields quota-policy`.
 
 ### 3.2 retry — reprendre un create échoué
 
@@ -819,7 +870,7 @@ réelle à chaque étape.
 | `POST` | `/api/v1/migrations` | create | `202` + job_id (fond) |
 | `GET`  | `/api/v1/migrations` | liste des jobs | `200` |
 | `GET`  | `/api/v1/migrations/{id}` | fichier de job + dernière action (logs) | `200` |
-| `GET`  | `/api/v1/migrations/{id}/status` | état réplication live (interroge ONTAP) | `200` |
+| `GET`  | `/api/v1/migrations/{id}/status` | état réplication live + inventaire de la destination (interroge ONTAP) | `200` |
 | `POST` | `/api/v1/migrations/{id}/resume` | fan-out PROD + DR | `200` / `409` |
 | `POST` | `/api/v1/migrations/{id}/retry` | reprise après échec | `202` (fond) |
 | `POST` | `/api/v1/migrations/{id}/test` | env de test complet (clones + miroir, limité dans le temps) | `202` (fond) |

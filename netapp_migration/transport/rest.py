@@ -10,6 +10,7 @@ Requires ONTAP >= 9.9 (validated against 9.16.1). Endpoint map:
     snapmirror        /api/snapmirror/relationships (+ /transfers)
     cifs shares       /api/protocols/cifs/shares
     export policies   /api/protocols/nfs/export-policies
+    quota rules       /api/storage/quota/rules            (inventory only)
     file security     /api/protocols/file-security/permissions   (DACL forcing)
     jobs              /api/cluster/jobs/{uuid}
 
@@ -30,7 +31,7 @@ import urllib3
 
 from ..models import (OntapError, ClusterCredentials, VolumeInfo,
                       AggregateInfo, SnapMirrorInfo, SvmInfo, PeerInfo,
-                      ExportRule,
+                      ExportRule, ExportPolicyInfo, QtreeInfo, QuotaRule,
                       TRANSFER_ACTIVE, TRANSFER_FAILED, TRANSFER_IDLE)
 from .base import OntapClient
 
@@ -219,23 +220,33 @@ class RestClient(OntapClient):
         body = self._request(cluster, "GET", "/storage/volumes",
                              params={"name": volume, "svm.name": svm,
                                      "fields": "uuid,size,nas.security_style,"
+                                               "nas.path,"
                                                "aggregates.name,"
                                                "clone.is_flexclone,"
-                                               "movement.state"})
+                                               "clone.parent_volume.name,"
+                                               "movement.state,"
+                                               "state,type,quota.state"})
         records = body.get("records", [])
         if not records:
             raise OntapError(cluster, f"volume show {svm}:{volume}",
                              "volume not found")
         rec = records[0]
         aggregates = rec.get("aggregates", [])
+        nas = rec.get("nas", {}) or {}
+        clone = rec.get("clone", {}) or {}
         return VolumeInfo(
             name=volume, svm=svm,
             size_bytes=rec.get("size"),
-            security_style=(rec.get("nas", {}) or {}).get("security_style"),
+            security_style=nas.get("security_style"),
             aggregate=aggregates[0]["name"] if aggregates else None,
             uuid=rec.get("uuid"),
-            is_flexclone=(rec.get("clone", {}) or {}).get("is_flexclone"),
+            is_flexclone=clone.get("is_flexclone"),
             move_state=(rec.get("movement", {}) or {}).get("state", "") or "",
+            state=rec.get("state", "") or "",
+            volume_type=rec.get("type", "") or "",
+            junction_path=nas.get("path", "") or "",
+            quota_state=(rec.get("quota", {}) or {}).get("state", "") or "",
+            clone_parent=(clone.get("parent_volume", {}) or {}).get("name", ""),
         )
 
     def volume_exists(self, cluster: str, svm: str, volume: str) -> bool:
@@ -520,9 +531,13 @@ class RestClient(OntapClient):
     def get_snapmirror(self, cluster, dest_path) -> SnapMirrorInfo:
         body = self._request(cluster, "GET", "/snapmirror/relationships",
                              params={"destination.path": dest_path,
-                                     "fields": "state,healthy,unhealthy_reason,"
+                                     "fields": "uuid,state,healthy,"
+                                               "unhealthy_reason,"
+                                               "source.path,policy.name,"
+                                               "transfer_schedule.name,"
                                                "transfer.state,"
-                                               "transfer.bytes_transferred"})
+                                               "transfer.bytes_transferred,"
+                                               "transfer.end_time"})
         records = body.get("records", [])
         if not records:
             # 'absent' with an explicit unknown transfer state: is_idle and
@@ -558,6 +573,11 @@ class RestClient(OntapClient):
             transfer_state=transfer_state,
             last_transfer_size=str(transferred) if transferred is not None else "-",
             last_error=last_error,
+            uuid=rec.get("uuid", "") or "",
+            source_path=(rec.get("source", {}) or {}).get("path", "") or "",
+            policy=(rec.get("policy", {}) or {}).get("name", "") or "",
+            schedule=(rec.get("transfer_schedule", {}) or {}).get("name", "") or "",
+            last_transfer_end=transfer.get("end_time", "") or "",
         )
 
     # ------------------------------------------------------------------ #
@@ -675,3 +695,82 @@ class RestClient(OntapClient):
             if wanted == junction or wanted.startswith(junction + "/"):
                 return True
         return False
+
+    # ------------------------------------------------------------------ #
+    # Read-only inventory (reporting)
+    # ------------------------------------------------------------------ #
+    def list_qtree_details(self, cluster, svm, volume) -> List[QtreeInfo]:
+        body = self._request(cluster, "GET", "/storage/qtrees",
+                             params={"svm.name": svm, "volume.name": volume,
+                                     "fields": "name,id,path,volume.uuid,"
+                                               "export_policy.name,"
+                                               "security_style"})
+        details = []
+        for rec in body.get("records", []):
+            if rec.get("name") in ("", "-", None):
+                continue        # the volume's own root qtree, id 0
+            details.append(QtreeInfo(
+                name=rec["name"],
+                id=rec.get("id"),
+                volume=volume,
+                volume_uuid=(rec.get("volume", {}) or {}).get("uuid", ""),
+                path=rec.get("path", ""),
+                export_policy=(rec.get("export_policy", {}) or {}).get("name", ""),
+                security_style=rec.get("security_style", "") or ""))
+        return details
+
+    def get_export_policy(self, cluster, svm, policy) -> Optional[ExportPolicyInfo]:
+        body = self._request(cluster, "GET", "/protocols/nfs/export-policies",
+                             params={"name": policy, "svm.name": svm,
+                                     "fields": "id,name,rules"})
+        records = body.get("records", [])
+        if not records:
+            return None
+        rec = records[0]
+        return ExportPolicyInfo(
+            name=rec.get("name", policy), id=rec.get("id"), svm=svm,
+            rules=[_export_rule_from_rest(raw) for raw in rec.get("rules") or []])
+
+    def list_quota_rules(self, cluster, svm, volume) -> List[QuotaRule]:
+        """Quota rules of one volume, with their limits.
+
+        REST attaches rules to the SVM's ACTIVE quota policy without naming
+        it, so a rule here is always a rule of that policy — see
+        get_quota_policy.
+        """
+        body = self._request(cluster, "GET", "/storage/quota/rules",
+                             params={"svm.name": svm, "volume.name": volume,
+                                     "fields": "uuid,type,qtree.name,"
+                                               "users.name,group.name,"
+                                               "space.hard_limit,"
+                                               "space.soft_limit,"
+                                               "files.hard_limit,"
+                                               "files.soft_limit,"
+                                               "user_mapping"})
+        rules = []
+        for rec in body.get("records", []):
+            space = rec.get("space", {}) or {}
+            files = rec.get("files", {}) or {}
+            users = [u.get("name", "") for u in rec.get("users") or []
+                     if isinstance(u, dict)]
+            group = (rec.get("group", {}) or {}).get("name", "")
+            rules.append(QuotaRule(
+                uuid=rec.get("uuid", ""),
+                type=rec.get("type", "") or "",
+                qtree=(rec.get("qtree", {}) or {}).get("name", ""),
+                target=", ".join(u for u in users if u) or group,
+                space_hard_limit=space.get("hard_limit"),
+                space_soft_limit=space.get("soft_limit"),
+                files_hard_limit=files.get("hard_limit"),
+                files_soft_limit=files.get("soft_limit"),
+                user_mapping=rec.get("user_mapping")))
+        return rules
+
+    def get_quota_policy(self, cluster, svm) -> str:
+        """Not exposed by the REST API.
+
+        Quota rules are created against the SVM's active quota policy and no
+        REST endpoint names it, so this answers '' rather than inventing a
+        value. The SSH transport can read it (`vserver quota policy show`).
+        """
+        return ""

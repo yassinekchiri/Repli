@@ -140,7 +140,7 @@ flowchart LR
         H["GET /health"]
         L["GET /migrations"]
         G["GET /migrations/{id}<br/>job + last run + logs"]
-        S["GET /migrations/{id}/status<br/>live ONTAP state"]
+        S["GET /migrations/{id}/status<br/>live ONTAP state<br/>+ destination inventory"]
     end
 
     subgraph check["Check — feasibility only, never mutates"]
@@ -179,7 +179,7 @@ flowchart LR
 | `DELETE` | `/api/v1/auth/scopes/{id}` | revoke a token — **super admin** | `204` `400` |
 | `GET` | `/api/v1/migrations` | list jobs | `200` |
 | `GET` | `/api/v1/migrations/{id}` | job record, last run state, log tail, last pre-flight report | `200` `404` |
-| `GET` | `/api/v1/migrations/{id}/status` | live replication state — **read-only**, never writes the job | `200` `404` `502` |
+| `GET` | `/api/v1/migrations/{id}/status` | live replication state, plus the **full destination inventory** once the clones exist (UUIDs, qtrees, export policies, quota rules and limits, SnapMirror UUIDs) — **read-only**, never writes the job | `200` `404` `502` |
 | `POST` | `/api/v1/migrations/{id}/refresh` | same as above **and** persists a finished replication | `200` `404` |
 | `POST` | `/api/v1/preflight/create` | can a cascade be created? | `200` |
 | `POST` | `/api/v1/migrations/{id}/preflight/{action}` | is this action feasible? (`resume`, `retry`, `test`, `clone`, `acl`, `cleanup`) | `200` `400` `404` |

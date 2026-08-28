@@ -13,7 +13,8 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 
 from ..models import (VolumeInfo, AggregateInfo, SnapMirrorInfo, SvmInfo,
-                      PeerInfo, ExportRule)
+                      PeerInfo, ExportRule, ExportPolicyInfo, QtreeInfo,
+                      QuotaRule)
 
 
 class OntapClient(ABC):
@@ -210,3 +211,42 @@ class OntapClient(ABC):
     @abstractmethod
     def junction_path_exists(self, cluster: str, svm: str, path: str) -> bool:
         """Whether an absolute NAS path is reachable on the SVM (ACL target)."""
+
+    # =====================================================================
+    # READ-ONLY INVENTORY — what the destination actually looks like once a
+    # clone has run. Reporting only: nothing here drives a migration, and no
+    # caller may depend on these to decide whether an action is feasible.
+    # =====================================================================
+
+    @abstractmethod
+    def list_qtree_details(self, cluster: str, svm: str,
+                           volume: str) -> List[QtreeInfo]:
+        """Every qtree of a volume with its id, path and export policy.
+
+        Unlike list_qtrees, which answers 'which names are there', this one
+        carries the handles an operator needs to find the object again.
+        """
+
+    @abstractmethod
+    def get_export_policy(self, cluster: str, svm: str,
+                          policy: str) -> Optional[ExportPolicyInfo]:
+        """One export policy with its id and rules; None when absent."""
+
+    @abstractmethod
+    def list_quota_rules(self, cluster: str, svm: str,
+                         volume: str) -> List[QuotaRule]:
+        """Quota rules defined on a volume, with their limits.
+
+        An empty list means no quota rule, which is a real answer: a volume
+        with quotas switched on but no rule limits nothing.
+        """
+
+    @abstractmethod
+    def get_quota_policy(self, cluster: str, svm: str) -> str:
+        """Name of the SVM's active quota policy, '' when not exposed.
+
+        The REST API applies quota rules to the SVM's active policy without
+        naming it, so the REST transport legitimately answers '' — the
+        inventory reports that as 'not exposed by REST' rather than as a
+        missing policy.
+        """

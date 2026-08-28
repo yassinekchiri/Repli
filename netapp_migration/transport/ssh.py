@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ..models import (OntapError, VolumeInfo, AggregateInfo, SnapMirrorInfo,
-                      SvmInfo, PeerInfo, ExportRule)
+                      SvmInfo, PeerInfo, ExportRule, ExportPolicyInfo,
+                      QtreeInfo, QuotaRule)
 from .base import OntapClient
 
 # Typical error patterns returned by the ONTAP CLI even when the SSH exit
@@ -79,6 +80,11 @@ def parse_size_to_bytes(size_str: Optional[str]) -> Optional[int]:
     if not m:
         return None
     return int(float(m.group(1)) * units.get(m.group(2), 1))
+
+
+def _as_int(value: Optional[str]) -> Optional[int]:
+    """'12345' -> 12345; '-' / 'unlimited' / anything else -> None."""
+    return int(value) if value and value.isdigit() else None
 
 
 def parse_qtree_list(stdout: str) -> List[str]:
@@ -600,3 +606,84 @@ class SshClient(OntapClient):
                         wanted == junction or wanted.startswith(junction + "/")):
                     return True
         return False
+
+    # ------------------------------------------------------------------ #
+    # Read-only inventory (reporting)
+    # ------------------------------------------------------------------ #
+    def list_qtree_details(self, cluster, svm, volume) -> List[QtreeInfo]:
+        r = self._run(cluster,
+                      f"volume qtree show -vserver {svm} "
+                      f"-volume {volume} -instance")
+        details = []
+        for block in re.split(r"\n\s*\n", r.stdout):
+            fields = parse_instance(block)
+            name = get_instance_field(fields, "qtree name")
+            if not name or name in ('""', "-"):
+                continue
+            qid = get_instance_field(fields, "qtree id")
+            details.append(QtreeInfo(
+                name=name.strip('"'),
+                id=int(qid) if qid and qid.isdigit() else None,
+                volume=volume,
+                path=get_instance_field(fields, "qtree path") or "",
+                export_policy=get_instance_field(fields, "export policy",
+                                                 "export policy name") or "",
+                security_style=get_instance_field(fields,
+                                                  "security style") or ""))
+        return details
+
+    def get_export_policy(self, cluster, svm, policy) -> Optional[ExportPolicyInfo]:
+        r = self._run(cluster,
+                      f"vserver export-policy show -vserver {svm} "
+                      f"-policyname {policy} -instance", allow_failure=True)
+        text = f"{r.stdout}{r.stderr}".lower()
+        if r.exit_code != 0 or "no entries matching" in text:
+            return None
+        fields = parse_instance(r.stdout)
+        pid = get_instance_field(fields, "policy id")
+        return ExportPolicyInfo(
+            name=policy, svm=svm,
+            id=int(pid) if pid and pid.isdigit() else None,
+            rules=self.get_export_policy_rules(cluster, svm, policy))
+
+    def list_quota_rules(self, cluster, svm, volume) -> List[QuotaRule]:
+        """The CLI has no UUID for a quota rule: it is keyed by its target."""
+        r = self._run(cluster,
+                      f"volume quota policy rule show -vserver {svm} "
+                      f"-volume {volume} -instance", allow_failure=True)
+        if "no entries matching" in f"{r.stdout}{r.stderr}".lower():
+            return []
+        if self._detect_error(r):
+            raise OntapError(cluster, f"quota rules of {svm}:{volume}",
+                             r.stderr.strip() or r.stdout.strip())
+        rules = []
+        for block in re.split(r"\n\s*\n", r.stdout):
+            fields = parse_instance(block)
+            qtype = get_instance_field(fields, "type")
+            if not qtype:
+                continue
+            rules.append(QuotaRule(
+                type=qtype,
+                qtree=get_instance_field(fields, "qtree name") or "",
+                target=get_instance_field(fields, "target") or "",
+                space_hard_limit=parse_size_to_bytes(
+                    get_instance_field(fields, "disk limit")),
+                space_soft_limit=parse_size_to_bytes(
+                    get_instance_field(fields, "soft disk limit")),
+                files_hard_limit=_as_int(
+                    get_instance_field(fields, "files limit")),
+                files_soft_limit=_as_int(
+                    get_instance_field(fields, "soft files limit"))))
+        return rules
+
+    def get_quota_policy(self, cluster, svm) -> str:
+        r = self._run(cluster,
+                      f"vserver show -vserver {svm} -fields quota-policy",
+                      allow_failure=True)
+        if self._detect_error(r):
+            return ""
+        for line in r.stdout.splitlines():
+            tokens = line.split()
+            if len(tokens) == 2 and tokens[0] == svm:
+                return tokens[1]
+        return ""

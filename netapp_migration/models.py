@@ -243,6 +243,12 @@ class VolumeInfo:
     # ONTAP's volume-move state: 'success', 'failed', 'replicating',
     # 'cutover'... Empty when no move was ever run on this volume.
     move_state: str = ""
+    # Reported by the destination inventory, not needed to run a migration.
+    state: str = ""                 # 'online' | 'offline' | 'mixed'
+    volume_type: str = ""           # 'rw' | 'dp' | 'ls'
+    junction_path: str = ""
+    quota_state: str = ""           # 'on' | 'off' | 'initializing' | 'mixed'
+    clone_parent: str = ""          # parent volume while still a FlexClone
 
 
 @dataclass
@@ -271,6 +277,50 @@ class ExportRule:
         return (f"{who}  [ro={'|'.join(self.ro_rule) or '-'} "
                 f"rw={'|'.join(self.rw_rule) or '-'} "
                 f"proto={'|'.join(self.protocols) or '-'}]")
+
+
+@dataclass
+class QtreeInfo:
+    """A qtree as the destination inventory reports it."""
+    name: str
+    id: Optional[int] = None
+    volume: str = ""
+    volume_uuid: str = ""
+    path: str = ""
+    export_policy: str = ""
+    security_style: str = ""
+
+
+@dataclass
+class ExportPolicyInfo:
+    """An export policy with its identifier and its rules.
+
+    ONTAP identifies export policies by a numeric ``id``, not a UUID — the
+    inventory reports whichever handle the cluster actually gives out.
+    """
+    name: str
+    id: Optional[int] = None
+    svm: str = ""
+    rules: List[ExportRule] = field(default_factory=list)
+
+
+@dataclass
+class QuotaRule:
+    """One quota rule, with the limits that make it worth reporting.
+
+    Limits are bytes (space) and counts (files). ONTAP reports an unset
+    limit as absent, which stays None here — never 0, which would read as
+    'nothing allowed'.
+    """
+    uuid: str = ""
+    type: str = ""                  # 'tree' | 'user' | 'group'
+    qtree: str = ""
+    target: str = ""                # user or group name; '' for a tree rule
+    space_hard_limit: Optional[int] = None
+    space_soft_limit: Optional[int] = None
+    files_hard_limit: Optional[int] = None
+    files_soft_limit: Optional[int] = None
+    user_mapping: Optional[bool] = None
 
 
 @dataclass
@@ -341,6 +391,13 @@ class SnapMirrorInfo:
     last_transfer_size: str = "-"
     exists: bool = True
     last_error: str = ""
+    # Reported by the destination inventory. Empty when the transport cannot
+    # tell (the CLI identifies a relationship by its paths, not a UUID).
+    uuid: str = ""
+    source_path: str = ""
+    policy: str = ""
+    schedule: str = ""
+    last_transfer_end: str = ""
 
     # ---- transfer-level predicates ---------------------------------------
     @property
