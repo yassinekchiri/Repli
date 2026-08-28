@@ -29,6 +29,12 @@ EXCLUDED_DIRS = {"__pycache__", ".pytest_cache", ".git", ".venv", "venv",
 EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".orig", ".rej", ".swp", ".swo")
 LINE_WIDTH = 76
 
+# This tool's own output. Excluded from the dirty test in revision(): a build
+# necessarily rewrites them, so counting them would mean no artifact could
+# ever be stamped with a clean revision — the first build dirties the tree
+# the second build inspects, and a committed artifact still reads '-dirty'.
+GENERATED = ("install-standalone.sh", "repo-selfextract.sh")
+
 
 def collect(root: str, entries, excluded_relpaths=frozenset()) -> list:
     """Every file to embed, as (absolute path, archive name), sorted.
@@ -81,14 +87,42 @@ def _strip_gzip_timestamp(blob: bytes) -> bytes:
     return blob[:4] + b"\x00\x00\x00\x00" + blob[8:]
 
 
+def _uncommitted(root: str) -> list:
+    """Paths git reports as changed, minus this tool's own output."""
+    try:
+        out = subprocess.run(["git", "-C", root, "status", "--porcelain"],
+                             capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    paths = []
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        # 'XY path', or 'XY orig -> path' for a rename.
+        path = line[3:].split(" -> ")[-1].strip().strip('"')
+        if path not in GENERATED:
+            paths.append(path)
+    return paths
+
+
 def revision(root: str = ROOT) -> str:
+    """The commit a payload was built from, '-dirty' when the tree differs.
+
+    Stamped into both scripts so the recipient of a single file can say
+    exactly which source it carries. '-dirty' is a real warning — it means
+    the payload holds edits nobody can reproduce from the repository — so it
+    must not be raised by the generated scripts themselves.
+    """
     try:
         out = subprocess.run(
-            ["git", "-C", root, "describe", "--always", "--dirty", "--tags"],
+            ["git", "-C", root, "describe", "--always", "--tags"],
             capture_output=True, text=True, check=True)
-        return out.stdout.strip() or "unknown"
+        described = out.stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
+    if not described:
+        return "unknown"
+    return f"{described}-dirty" if _uncommitted(root) else described
 
 
 def build_date() -> str:
