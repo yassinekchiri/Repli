@@ -18,7 +18,7 @@
 # See --help for every option.
 #
 #   Built     : 2026-08-28
-#   Revision  : c50be36-dirty
+#   Revision  : 1b7f7d6
 #   Payload   : 53 files, 545,141 bytes, sha256 95d09be537977593
 
 set -Eeuo pipefail
@@ -34,7 +34,7 @@ umask 022
 SELF="${BASH_SOURCE[0]:-}"
 PAYLOAD_SHA256="95d09be537977593aaeac4f7263cde00d7dcd9c3d082f1193a9d1a42b84b7b4d"
 PAYLOAD_MARKER="__NETAPP_MIGRATION_PAYLOAD__"
-BUILD_REVISION="c50be36-dirty"
+BUILD_REVISION="1b7f7d6"
 
 # ----------------------------------------------------------------------------
 # Defaults
