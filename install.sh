@@ -287,6 +287,19 @@ fi
 # 4. Directories and code
 # ----------------------------------------------------------------------------
 step "Installing the code into ${PREFIX}"
+
+# Noted BEFORE the code is replaced. A running service keeps executing the
+# code it loaded at start-up, so an upgrade that only refreshes the files on
+# disk changes nothing the user can see — the API goes on answering with the
+# previous version until it is restarted. Said loudly in the summary rather
+# than restarted here: a restart drops the unlocked state and interrupts
+# whatever action is in flight, so it stays a deliberate act.
+SERVICE_WAS_RUNNING=0
+if (( INSTALL_SERVICE )) \
+        && systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+    SERVICE_WAS_RUNNING=1
+fi
+
 mkdir -p "${PREFIX}" "${JOB_DIR}" "${LOG_DIR}" "${ETC_DIR}"
 
 if [[ "${SOURCE_DIR}" != "${PREFIX}" ]]; then
@@ -604,6 +617,27 @@ ${BOLD}${GREEN}Installation complete.${RESET}
   Credentials       : ${CREDS_FILE}
   Job directory     : ${JOB_DIR}
   Token store       : ${TOKEN_STORE}
+EOF
+
+if (( SERVICE_WAS_RUNNING )); then
+cat <<EOF
+
+${BOLD}${YELLOW}The service was already running — RESTART IT.${RESET}
+
+  The new code is on disk, but ${SERVICE_NAME} is still executing the
+  version it loaded when it started. Nothing you just installed takes
+  effect until:
+
+       systemctl restart ${SERVICE_NAME}
+       ${CLI} --action api-unlock --unlock-socket ${UNLOCK_SOCKET}
+
+  It is not restarted automatically: that would drop the unlocked state
+  and cut whatever action is in flight. The restart comes back LOCKED,
+  hence the unlock on the second line.
+EOF
+fi
+
+cat <<EOF
 
 ${BOLD}Next steps${RESET}
 
