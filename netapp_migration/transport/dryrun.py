@@ -207,6 +207,12 @@ class DryRunClient(OntapClient):
                           files_hard_limit=1_000_000,
                           files_soft_limit=800_000)]
 
+    def create_quota_rule(self, cluster, svm, volume, rule) -> None:
+        self._trace(cluster, f"quota rule create {svm}:{volume} "
+                             f"type={rule.type} target='{rule.qtree}' "
+                             f"disk={rule.space_hard_limit} "
+                             f"soft={rule.space_soft_limit}")
+
     def get_quota_policy(self, cluster, svm) -> str:
         self._trace(cluster, f"quota policy of {svm} -> default")
         return "default"

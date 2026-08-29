@@ -248,6 +248,19 @@ class OntapClient(ABC):
         """
 
     @abstractmethod
+    def create_quota_rule(self, cluster: str, svm: str, volume: str,
+                          rule: QuotaRule) -> None:
+        """Add one quota rule to the SVM's active quota policy.
+
+        A tree rule with an empty ``qtree`` is the volume-level rule: it
+        covers everything not inside a qtree.
+
+        A limit left as None is not sent, so ONTAP applies no limit for it —
+        which is the difference between 'unlimited' and 0, and the two must
+        never be confused here.
+        """
+
+    @abstractmethod
     def get_quota_policy(self, cluster: str, svm: str) -> str:
         """Name of the SVM's active quota policy, '' when not exposed.
 

@@ -29,6 +29,9 @@ from ..transport.base import OntapClient
 from .exports import (describe_forced, describe_skipped,
                       destination_rules)
 from .naming import destination_export_policy, migrated_qtree_name
+from .quotas import (QUOTA_POLICY, describe_limit, describe_rule,
+                     destination_rules as quota_rules_for,
+                     source_rule_for)
 from .replication import (CASCADE_POLICY, CASCADE_SCHEDULE,
                           CASCADE_TYPE, CLONE_POLICY,
                           CLONE_SCHEDULE, CLONE_TYPE,
@@ -1255,6 +1258,75 @@ class MigrationEngine:
                               "created_on": created}
         return carried
 
+    def _carry_quotas(self, qtrees: List[str], volumes: Dict[str, str],
+                      renames: Dict[str, str]) -> Dict[str, dict]:
+        """Give each clone volume the two quota rules it needs.
+
+        Quota rules belong to the quota policy, which is an SVM object.
+        Volume-level SnapMirror does not replicate them, so — unlike a qtree
+        rename or an export-policy assignment — a rule created only on PROD
+        is simply absent the day DR is activated. Both sides get them.
+
+        Per volume (see core/quotas.py):
+          1. the volume-level tree rule, qtree "", limits at 0 — nothing may
+             be written outside the qtree the volume was created for;
+          2. the qtree rule, carrying the limits the qtree had on the source.
+
+        A limit the source did not set stays unset: 'unlimited' and 0 are
+        opposite answers and must never be confused.
+        """
+        p = self.p
+        carried: Dict[str, dict] = {}
+
+        source_quotas, err = self._probe(
+            "source quota rules",
+            lambda: self.c.list_quota_rules(p.source_cluster,
+                                            p.source_vserver, p.volume), None)
+        if source_quotas is None:
+            # Without the source limits the qtree rule would be invented, so
+            # the volume rule is still worth creating but the qtree one is
+            # not guessed at.
+            self.log.warning("         Source quota rules unreadable (%s) — "
+                             "the qtree rules will carry no limit.", err)
+            source_quotas = []
+
+        for qtree in qtrees:
+            source_rule = source_rule_for(source_quotas, qtree)
+            dest_qtree = renames.get(qtree, qtree)
+            rules = quota_rules_for(source_rule, dest_qtree)
+
+            self.log.info("         '%s'  source quota: %s", qtree,
+                          describe_rule(source_rule) if source_rule
+                          else "none — the qtree had no quota")
+            for rule in rules:
+                self.log.info("             -> %s", describe_rule(rule))
+
+            created_on = []
+            for cluster, svm, role in ((p.dest_cluster, p.dest_vserver, "PROD"),
+                                       (p.dr_cluster, p.dr_vserver, "DR")):
+                for rule in rules:
+                    self.c.create_quota_rule(cluster, svm, volumes[qtree],
+                                             rule)
+                created_on.append(role)
+                self.log.info("         %-4s  %s: %d rule(s) in policy '%s'.",
+                              role, volumes[qtree], len(rules), QUOTA_POLICY)
+
+            carried[qtree] = {
+                "policy": QUOTA_POLICY,
+                "source_limit": source_rule.space_hard_limit
+                if source_rule else None,
+                "source_soft_limit": source_rule.space_soft_limit
+                if source_rule else None,
+                "had_source_quota": source_rule is not None,
+                "rules": [{"qtree": r.qtree,
+                           "space_hard_limit": r.space_hard_limit,
+                           "space_soft_limit": r.space_soft_limit,
+                           "files_hard_limit": r.files_hard_limit,
+                           "files_soft_limit": r.files_soft_limit}
+                          for r in rules],
+                "created_on": created_on}
+        return carried
+
     def _promote_test_env(self, qtrees_arg: str, job: dict) -> dict:
         """Promote the existing TEST environment to the definitive one.
 
@@ -1440,6 +1512,10 @@ class MigrationEngine:
         self.log.info(">> [4/7]  Carrying export policies over from the source")
         exports = self._carry_export_policies(qtrees, mapping, renames)
 
+        # Step 4e: quotas. Not replicated by SnapMirror, so created on both.
+        self.log.info(">> [4/7]  Creating quota rules on PROD and DR")
+        quotas = self._carry_quotas(qtrees, mapping, renames)
+
         # Step 5: SnapMirror between the clones + resync.
         self.log.info(">> [5/7]  SnapMirror (clone PROD -> clone DR) + resync")
         self.log.info("         %s", describe_clone_mirror())
@@ -1497,6 +1573,16 @@ class MigrationEngine:
                           ", ".join(pruned.get(q, [])) or "-",
                           prod_aggr, dr_aggr] for q in qtrees])
         self.log.info("")
+        self._log_table(["Qtree", "Clone volume", "Quota policy",
+                         "Volume rule (qtree \"\")", "Qtree rule (disk)",
+                         "Qtree rule (soft)"],
+                        [[q, mapping[q], quotas[q]["policy"], "0 B",
+                          describe_limit(quotas[q]["rules"][1]
+                                         ["space_hard_limit"]),
+                          describe_limit(quotas[q]["rules"][1]
+                                         ["space_soft_limit"])]
+                         for q in qtrees])
+        self.log.info("")
         self._log_table(["Qtree", "Source policy", "Policy on PROD + DR",
                          "Rules", "Clients carried over",
                          "Networks NOT carried"],
@@ -1529,6 +1615,7 @@ class MigrationEngine:
                 "qtree_map": dict(renames),
                 "pruned": pruned,
                 "export_policies": exports,
+                "quotas": quotas,
                 "clone_volumes": [mapping[q] for q in qtrees],
                 "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr,
                 "abandoned_test_env": old_test_env}
@@ -1617,6 +1704,11 @@ class MigrationEngine:
         self.log.info(">> [4/6]  Carrying export policies over from the source")
         exports = self._carry_export_policies(qtrees, mapping, renames)
 
+        # Step 4e: same quotas too — a test that ignores them would let the
+        # client validate a volume with limits production will not have.
+        self.log.info(">> [4/6]  Creating quota rules on PROD and DR")
+        quotas = self._carry_quotas(qtrees, mapping, renames)
+
         # Step 5: SnapMirror between the clones + resync (like production).
         self.log.info(">> [5/6]  SnapMirror (clone PROD -> clone DR) + resync")
         self.log.info("         %s", describe_clone_mirror())
@@ -1684,6 +1776,7 @@ class MigrationEngine:
         return {"volume_map": {q: mapping[q] for q in qtrees},
                 "clone_volumes": [mapping[q] for q in qtrees],
                 "export_policies": exports,
+                "quotas": quotas,
                 "expires_at": expires.isoformat(timespec="seconds")}
 
     # =====================================================================

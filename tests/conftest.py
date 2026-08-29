@@ -145,7 +145,18 @@ class FakeClient(OntapClient):
         self.junctions: Dict[tuple, List[str]] = {}
         # Inventory-only state: nothing in the migration creates these, they
         # are what the destination is asked about once a clone has run.
-        self.quota_rules: Dict[tuple, List[QuotaRule]] = {}
+        # The source qtrees carry a real quota, so the clone has limits to
+        # copy; the destinations start with none, as a new clone would.
+        self.quota_rules: Dict[tuple, List[QuotaRule]] = {
+            ("SRC", "svm_source", "vol_prod_01"): [
+                QuotaRule(uuid="src-tree-fin", type="tree", qtree="q_fin",
+                          space_hard_limit=100 * 1024 ** 3,
+                          space_soft_limit=80 * 1024 ** 3),
+                QuotaRule(uuid="src-tree-hr", type="tree", qtree="q_hr",
+                          space_hard_limit=50 * 1024 ** 3,
+                          space_soft_limit=40 * 1024 ** 3),
+            ],
+        }
         self.quota_policies: Dict[tuple, str] = {
             ("PRD", "svm_dest"): "default", ("DRC", "svm_dr"): "default"}
 
@@ -429,6 +440,12 @@ class FakeClient(OntapClient):
 
     def list_quota_rules(self, cluster, svm, volume) -> List[QuotaRule]:
         return list(self.quota_rules.get((cluster, svm, volume), []))
+
+    def create_quota_rule(self, cluster, svm, volume, rule) -> None:
+        self.calls.append(
+            f"quota_rule {cluster} {volume} target='{rule.qtree}' "
+            f"disk={rule.space_hard_limit} soft={rule.space_soft_limit}")
+        self.quota_rules.setdefault((cluster, svm, volume), []).append(rule)
 
     def get_quota_policy(self, cluster, svm) -> str:
         return self.quota_policies.get((cluster, svm), "")

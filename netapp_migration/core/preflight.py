@@ -31,6 +31,9 @@ from ..transport.base import OntapClient
 from .jobs import CREATE_STATUS_ORDER
 from .exports import (describe_forced, describe_skipped,
                       destination_rules)
+from .quotas import (QUOTA_POLICY, describe_rule as describe_quota_rule,
+                     destination_rules as quota_rules_for,
+                     source_rule_for as quota_source_rule_for)
 from .replication import (CASCADE_POLICY, CASCADE_SCHEDULE,
                           CLONE_POLICY, CLONE_SCHEDULE,
                           CLONE_TYPE, describe_clone_mirror)
@@ -816,6 +819,7 @@ class PreflightChecker:
         self._check_prune_plan(report, normalised, volume_map, qtree_map,
                                job, prune)
         self._check_export_policies(report, normalised, qtree_map, job)
+        self._check_quotas(report, normalised, qtree_map, job)
 
         # The clone mirror PROD -> DR needs its own peering, policy and
         # schedule on the DR cluster.
@@ -918,6 +922,8 @@ class PreflightChecker:
                                    None if fresh else job, prune)
             self._check_export_policies(report, normalised, qtree_map,
                                         None if fresh else job)
+            self._check_quotas(report, normalised, qtree_map,
+                               None if fresh else job)
             self._check_peering(report, p.dr_cluster, p.dr_vserver,
                                 p.dest_cluster, p.dest_vserver,
                                 "clone PROD -> clone DR")
@@ -1237,6 +1243,56 @@ class PreflightChecker:
                           hint="check its rules match the clients this qtree "
                                "should have",
                           target=f"{cluster} / {svm}")
+
+    def _check_quotas(self, report: PreflightReport, qtrees: Sequence[str],
+                      qtree_map: Optional[Dict[str, str]],
+                      job: Optional[dict]):
+        """Announce the two rules each clone volume will get.
+
+        Read-only, and it answers the question that decides whether the
+        client can write anything at all after the migration: what ceiling
+        does the destination qtree have?
+        """
+        p = self.p
+        renames = dict((job or {}).get("qtree_map") or {})
+        renames.update({k: v for k, v in (qtree_map or {}).items() if v})
+
+        source, err = self._safe(
+            lambda: self.c.list_quota_rules(p.source_cluster,
+                                            p.source_vserver, p.volume), None)
+        if source is None:
+            self._add(report, "QUOTA_RULES_UNREADABLE",
+                      "Source quota rules readable", False,
+                      severity=SEVERITY_WARNING, detail=err,
+                      hint="grant readonly on /api/storage/quota/rules; "
+                           "without them the qtree rules carry no limit",
+                      target=f"{p.source_cluster} / {p.volume}")
+            source = []
+
+        for qtree in qtrees:
+            target = f"{p.source_cluster} / {p.source_vserver}:{p.volume}/{qtree}"
+            source_rule = quota_source_rule_for(source, qtree)
+            dest_qtree = renames.get(qtree, qtree)
+            rules = quota_rules_for(source_rule, dest_qtree)
+
+            # A qtree with no source quota gets no ceiling at the
+            # destination either. Correct, and a real case — but the client
+            # would then be limited only by the volume, so it is said.
+            self._add(report, "QUOTA_NO_SOURCE_LIMIT",
+                      f"'{qtree}': the source qtree has a quota",
+                      source_rule is not None,
+                      severity=SEVERITY_WARNING,
+                      detail=describe_quota_rule(source_rule) if source_rule
+                             else "no tree rule on the source — the "
+                                  "destination qtree will have no limit "
+                                  "either",
+                      target=target)
+
+            self._add(report, "QUOTA_PLAN",
+                      f"'{qtree}': quota rules in policy '{QUOTA_POLICY}'",
+                      True,
+                      detail="; ".join(describe_quota_rule(r) for r in rules),
+                      target=f"{p.dest_cluster} + {p.dr_cluster}")
 
     def for_cleanup(self, job: Optional[dict],
                     qtrees: Sequence[str]) -> PreflightReport:

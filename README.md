@@ -93,7 +93,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 328 tests, offline, no cluster contacted
+python3 -m pytest            # 351 tests, offline, no cluster contacted
 ```
 
 ---
@@ -328,7 +328,7 @@ from the cluster admin CLI. The role only grants the commands
 security login rest-role create -role mutrepli_rest -api /api/storage/volumes -access all
 security login rest-role create -role mutrepli_rest -api /api/storage/qtrees -access all
 security login rest-role create -role mutrepli_rest -api /api/storage/aggregates -access readonly
-security login rest-role create -role mutrepli_rest -api /api/storage/quota/rules -access readonly
+security login rest-role create -role mutrepli_rest -api /api/storage/quota/rules -access all
 security login rest-role create -role mutrepli_rest -api /api/snapmirror/relationships -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/cifs/shares -access all
 security login rest-role create -role mutrepli_rest -api /api/protocols/nfs/export-policies -access all
@@ -355,7 +355,7 @@ security login rest-role create -role mutrepli_rest -api /api/svm/peers -access 
 security login role create -role mutrepli_cli -cmddirname "volume" -access all
 security login role create -role mutrepli_cli -cmddirname "snapmirror" -access all
 security login role create -role mutrepli_cli -cmddirname "storage aggregate" -access readonly
-security login role create -role mutrepli_cli -cmddirname "volume quota policy" -access readonly
+security login role create -role mutrepli_cli -cmddirname "volume quota policy" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver cifs share" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver export-policy" -access all
 security login role create -role mutrepli_cli -cmddirname "vserver security file-directory" -access all
@@ -662,8 +662,56 @@ be omitted there. Three modes:
   ```
 * **Full flow** — no test environment: dedicated snapshot → cascade
   propagation → FlexClones on PROD and DR → **pruning** → **export policies**
-  → SnapMirror between the clones + resync → automatic best-aggregate
-  selection → `volume move` → immediate exit.
+  → **quotas** → SnapMirror between the clones + resync → automatic
+  best-aggregate selection → `volume move` → immediate exit.
+
+#### Quotas: two rules per clone volume
+
+A clone volume holds exactly one client's qtree, so its quota story is two
+rules, both in the SVM's **`default`** quota policy:
+
+| Rule | Target | Disk limit | Soft limit |
+|---|---|---|---|
+| Volume level | qtree `""` | **0 B** | **0 B** |
+| Qtree level | the destination qtree | copied from the source | copied from the source |
+
+The **volume-level rule** covers everything in the volume that is *not*
+inside a qtree. It is set to zero: without it a client could fill the volume
+by writing at the root and never touch their own quota.
+
+The **qtree rule** carries the ceiling the qtree had on the source, so the
+client sees the same limit they had before the migration.
+
+```
+'q_fin'  source quota: qtree 'q_fin': disk=100.0 GiB soft=80.0 GiB
+    -> volume (qtree ""): disk=0 B soft=0 B
+    -> qtree 'finance': disk=100.0 GiB soft=80.0 GiB
+PROD  vol_q_fin: 2 rule(s) in policy 'default'.
+DR    vol_q_fin: 2 rule(s) in policy 'default'.
+```
+
+Both rules are created on **PROD and DR**. Quota rules belong to the quota
+policy, which is an SVM object — volume-level SnapMirror does not replicate
+them, so a rule that exists only on PROD is simply absent the day DR is
+activated.
+
+**A limit the source did not set stays unset.** `unlimited` and `0` are
+opposite answers: sending 0 for a qtree that had no quota would stop the
+client writing anything at all. A qtree with no source quota gets the volume
+rule and an unlimited qtree rule, and the pre-flight says so:
+
+```
+| WARN | 'q_ops': the source qtree has a quota | no tree rule on the source — the destination qtree will have no limit either |
+| PASS | 'q_ops': quota rules in policy 'default' | volume (qtree ""): disk=0 B soft=0 B; qtree 'q_ops': disk=unlimited soft=unlimited |
+```
+
+Only **tree** rules are read from the source: a user or group rule limits a
+person across the whole volume, which is not a property of the qtree being
+migrated and would mean something different once the volume holds one qtree.
+
+> Creating the rules does not switch quotas **on**. Check
+> `check-status` — it reports each volume's quota state — and run
+> `volume quota on` where the rules need to take effect.
 
 #### The clone mirror: PROD clone -> DR clone
 

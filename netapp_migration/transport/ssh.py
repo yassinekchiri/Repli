@@ -740,6 +740,30 @@ class SshClient(OntapClient):
                     get_instance_field(fields, "soft files limit"))))
         return rules
 
+    def create_quota_rule(self, cluster, svm, volume, rule) -> None:
+        """`volume quota policy rule create`, against the SVM's policy.
+
+        The CLI wants the policy by name, so it is read first rather than
+        assumed: writing into the wrong policy would create rules that never
+        take effect.
+        """
+        policy = self.get_quota_policy(cluster, svm) or "default"
+        command = (f"volume quota policy rule create -vserver {svm} "
+                   f"-policy-name {policy} -volume {volume} "
+                   f"-type {rule.type or 'tree'} "
+                   f'-target "{rule.qtree or ""}"')
+        # -1 is how the CLI spells 'no limit'; a limit left unset must not
+        # become 0, which means the opposite.
+        if rule.space_hard_limit is not None:
+            command += f" -disk-limit {rule.space_hard_limit}"
+        if rule.space_soft_limit is not None:
+            command += f" -soft-disk-limit {rule.space_soft_limit}"
+        if rule.files_hard_limit is not None:
+            command += f" -file-limit {rule.files_hard_limit}"
+        if rule.files_soft_limit is not None:
+            command += f" -soft-file-limit {rule.files_soft_limit}"
+        self._run(cluster, command)
+
     def get_quota_policy(self, cluster, svm) -> str:
         r = self._run(cluster,
                       f"vserver show -vserver {svm} -fields quota-policy",

@@ -214,7 +214,19 @@ def test_an_unset_limit_stays_none(engine, cloned, client, params):
     assert rule["files_hard_limit"] is None
 
 
-def test_no_quota_rule_is_a_real_answer(engine, cloned):
+def test_the_rules_the_clone_created_are_reported(engine, cloned):
+    """The clone gives every volume two rules; the inventory shows them."""
+    inventory = engine.check_status(cloned)["destination"]
+
+    rules = entry_for(inventory, "vol_q_fin")["sides"]["PROD"]["quota_rules"]
+    assert [r["qtree"] for r in rules] == ["", "finance"]
+
+
+def test_no_quota_rule_is_a_real_answer(engine, cloned, client, params):
+    """A volume nobody put a rule on reports none, not an error."""
+    client.quota_rules[(params.dest_cluster, params.dest_vserver,
+                        "vol_q_fin")] = []
+
     inventory = engine.check_status(cloned)["destination"]
 
     assert entry_for(inventory,

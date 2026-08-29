@@ -848,6 +848,42 @@ class RestClient(OntapClient):
                 user_mapping=rec.get("user_mapping")))
         return rules
 
+    def create_quota_rule(self, cluster, svm, volume, rule) -> None:
+        """Add a rule to the SVM's active quota policy.
+
+        'space' and 'files' are only sent when the rule actually carries a
+        limit: an omitted limit means unlimited, and sending 0 for it would
+        mean the exact opposite.
+        """
+        payload: dict = {
+            "svm": {"name": svm},
+            "volume": {"name": volume},
+            "type": rule.type or "tree",
+        }
+        # An empty qtree name IS the volume-level rule, so it is sent as an
+        # empty name rather than omitted — omitting it would ask ONTAP to
+        # guess which tree the rule is for.
+        payload["qtree"] = {"name": rule.qtree or ""}
+
+        space = {}
+        if rule.space_hard_limit is not None:
+            space["hard_limit"] = rule.space_hard_limit
+        if rule.space_soft_limit is not None:
+            space["soft_limit"] = rule.space_soft_limit
+        if space:
+            payload["space"] = space
+
+        files = {}
+        if rule.files_hard_limit is not None:
+            files["hard_limit"] = rule.files_hard_limit
+        if rule.files_soft_limit is not None:
+            files["soft_limit"] = rule.files_soft_limit
+        if files:
+            payload["files"] = files
+
+        self._request(cluster, "POST", "/storage/quota/rules",
+                      json_body=payload)
+
     def get_quota_policy(self, cluster, svm) -> str:
         """Not exposed by the REST API.
 
