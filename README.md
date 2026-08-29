@@ -93,7 +93,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 351 tests, offline, no cluster contacted
+python3 -m pytest            # 372 tests, offline, no cluster contacted
 ```
 
 ---
@@ -661,9 +661,59 @@ be omitted there. Three modes:
       --qtrees q_fin,q_hr --fresh
   ```
 * **Full flow** — no test environment: dedicated snapshot → cascade
-  propagation → FlexClones on PROD and DR → **pruning** → **export policies**
-  → **quotas** → SnapMirror between the clones + resync → automatic
-  best-aggregate selection → `volume move` → immediate exit.
+  propagation → FlexClones on PROD and DR → **volume settings** → **pruning**
+  → **export policies** → **quotas** → SnapMirror between the clones + resync
+  → automatic best-aggregate selection → `volume move` → immediate exit.
+
+#### The destination volume settings
+
+A clone starts as a copy of the source volume's settings — sized and tuned
+for a shared volume holding every client. The destination holds one client's
+qtree, so every clone is reconfigured on **PROD and DR**:
+
+| Setting | Value |
+|---|---|
+| Encryption | `true` |
+| Snapshot reserve | `0 %` |
+| Space guarantee | `none` |
+| Snapshot policy | `none` |
+| Security style | `unix` |
+| Volume export policy | `default` |
+
+They live in one place, `CLONE_VOLUME_SETTINGS` in
+`netapp_migration/core/volumes.py`.
+
+This happens **right after the clones are created and before the clone
+mirror exists** — the only window in which the DR clone is still writable.
+Once it is a SnapMirror destination it cannot be modified at all.
+
+**A setting the cluster refuses does not abort the run.** The rest are still
+worth having on a volume nobody is using yet, and the refusal is named:
+
+```
+PROD  'vol_q_fin'  encryption NOT applied: cannot encrypt an attached FlexClone
+```
+
+The happy path is one call per volume. When ONTAP rejects the body it does
+not say which field was at fault in a form worth parsing, so each setting is
+then retried alone — the ones that work are applied, and the one that does
+not is reported by name.
+
+> **`unix` and the `acl` action are in tension.** Forcing AD-group DACLs
+> needs an NTFS or mixed volume, so `acl` will refuse every clone created
+> `unix`. That is a consequence of these settings, not a bug — the
+> pre-flight says so before the clone runs
+> (`VOLUME_SECURITY_STYLE_VS_ACL`). Set `security_style` to `mixed` in
+> `core/volumes.py` if these volumes also need NTFS permissions.
+
+> **Encryption on an attached FlexClone.** A clone shares blocks with its
+> parent, so a cluster may refuse to encrypt it until the `volume move` at
+> step 7 has split it. If that happens the refusal is reported per volume
+> and the other five settings still apply — encrypt on the move, or after
+> it, once the clone is detached.
+
+`check-status` reports what each volume actually ended up with, so a
+refused setting is visible afterwards and not only in the run log.
 
 #### Quotas: two rules per clone volume
 

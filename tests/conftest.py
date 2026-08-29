@@ -143,6 +143,9 @@ class FakeClient(OntapClient):
                                     "hr_share": "/vol_prod_01/q_hr"},
         }
         self.junctions: Dict[tuple, List[str]] = {}
+        # {setting: reason} for settings this estate refuses, so a test can
+        # reproduce a cluster that rejects one without rejecting the rest.
+        self.refuse_volume_settings: Dict[str, str] = {}
         # Inventory-only state: nothing in the migration creates these, they
         # are what the destination is asked about once a clone has run.
         # The source qtrees carry a real quota, so the clone has limits to
@@ -217,6 +220,27 @@ class FakeClient(OntapClient):
         if source is None:
             source = self.qtrees.get((cluster, svm, parent_volume), [])
         self.qtrees[(cluster, svm, clone_name)] = list(source)
+
+    def configure_volume(self, cluster, svm, volume, settings) -> dict:
+        self.calls.append(f"configure_volume {cluster} {svm}:{volume} "
+                          + " ".join(f"{k}={v}" for k, v in settings.items()))
+        info = self.volumes.get((cluster, svm, volume))
+        outcome = {}
+        for key, value in settings.items():
+            why = self.refuse_volume_settings.get(key, "")
+            outcome[key] = why
+            if why or info is None:
+                continue
+            # Applied for real, so a test can read back what the volume ends
+            # up with rather than only what was asked for.
+            setattr(info, {"encryption": "encrypted",
+                           "snapshot_reserve_percent":
+                               "snapshot_reserve_percent",
+                           "space_guarantee": "space_guarantee",
+                           "snapshot_policy": "snapshot_policy",
+                           "security_style": "security_style",
+                           "export_policy": "export_policy"}[key], value)
+        return outcome
 
     def start_volume_move(self, cluster, svm, volume, dest_aggregate):
         info = self.volumes.get((cluster, svm, volume))

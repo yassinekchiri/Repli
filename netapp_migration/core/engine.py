@@ -29,6 +29,9 @@ from ..transport.base import OntapClient
 from .exports import (describe_forced, describe_skipped,
                       destination_rules)
 from .naming import destination_export_policy, migrated_qtree_name
+from .volumes import (CLONE_VOLUME_SETTINGS,
+                      SETTING_LABELS as VOLUME_SETTING_LABELS,
+                      describe_settings as describe_volume_settings)
 from .quotas import (QUOTA_POLICY, describe_limit, describe_rule,
                      destination_rules as quota_rules_for,
                      source_rule_for)
@@ -128,7 +131,9 @@ def _volume_report(vol) -> dict:
         return {"name": "", "uuid": "", "state": "unreadable", "type": "",
                 "aggregate": "", "junction_path": "", "size_bytes": None,
                 "security_style": "", "is_flexclone": None, "clone_parent": "",
-                "move_state": "", "quota_state": ""}
+                "move_state": "", "quota_state": "", "encrypted": None,
+                "snapshot_policy": "", "snapshot_reserve_percent": None,
+                "space_guarantee": "", "export_policy": ""}
     return {"name": vol.name, "uuid": vol.uuid or "", "state": vol.state,
             "type": vol.volume_type, "aggregate": vol.aggregate or "",
             "junction_path": vol.junction_path,
@@ -136,7 +141,12 @@ def _volume_report(vol) -> dict:
             "security_style": vol.security_style or "",
             "is_flexclone": vol.is_flexclone,
             "clone_parent": vol.clone_parent,
-            "move_state": vol.move_state, "quota_state": vol.quota_state}
+            "move_state": vol.move_state, "quota_state": vol.quota_state,
+            "encrypted": vol.encrypted,
+            "snapshot_policy": vol.snapshot_policy,
+            "snapshot_reserve_percent": vol.snapshot_reserve_percent,
+            "space_guarantee": vol.space_guarantee,
+            "export_policy": vol.export_policy}
 
 
 def _qtree_report(qtree) -> dict:
@@ -692,14 +702,19 @@ class MigrationEngine:
 
         for role in ("PROD", "DR"):
             self._log_table(
-                [f"{role} volume", "UUID", "State", "Type", "Aggregate",
-                 "Junction", "Size", "Clone of", "Quota"],
+                [f"{role} volume", "UUID", "State", "Aggregate", "Size",
+                 "Encrypted", "Snap policy", "Snap reserve", "Guarantee",
+                 "Security", "Export policy", "Quota"],
                 [[e["volume"],
                   s["volume"]["uuid"] or "-", s["volume"]["state"] or "-",
-                  s["volume"]["type"] or "-", s["volume"]["aggregate"] or "-",
-                  s["volume"]["junction_path"] or "-",
+                  s["volume"]["aggregate"] or "-",
                   _gib(s["volume"]["size_bytes"]),
-                  s["volume"]["clone_parent"] or "(split)",
+                  _str(s["volume"]["encrypted"]),
+                  s["volume"]["snapshot_policy"] or "-",
+                  _str(s["volume"]["snapshot_reserve_percent"]),
+                  s["volume"]["space_guarantee"] or "-",
+                  s["volume"]["security_style"] or "-",
+                  s["volume"]["export_policy"] or "-",
                   s["volume"]["quota_state"] or "-"]
                  for e in inventory["volumes"]
                  for s in [e["sides"][role]]])
@@ -1258,6 +1273,51 @@ class MigrationEngine:
                               "created_on": created}
         return carried
 
+    def _configure_clones(self, qtrees: List[str],
+                          volumes: Dict[str, str]) -> Dict[str, dict]:
+        """Reconfigure each clone away from what it inherited.
+
+        A clone starts as a copy of the source volume's settings, tuned for
+        a shared volume holding every client. The destination holds one
+        client's qtree, so the settings are reapplied from
+        core/volumes.CLONE_VOLUME_SETTINGS.
+
+        Done here, right after creation and BEFORE the clone mirror exists,
+        because that is the only window in which the DR clone is still
+        writable — once it is a SnapMirror destination it cannot be modified
+        at all.
+
+        A setting the cluster refuses does not abort the run: the others are
+        still worth having on a volume nobody is using yet, and the refusal
+        is reported by name so the operator knows exactly what to fix.
+        """
+        p = self.p
+        applied: Dict[str, dict] = {}
+        self.log.info("         Every clone is set to: %s",
+                      describe_volume_settings())
+
+        for qtree in qtrees:
+            volume = volumes[qtree]
+            sides: Dict[str, dict] = {}
+            for cluster, svm, role in ((p.dest_cluster, p.dest_vserver, "PROD"),
+                                       (p.dr_cluster, p.dr_vserver, "DR")):
+                outcome = self.c.configure_volume(cluster, svm, volume,
+                                                  CLONE_VOLUME_SETTINGS)
+                refused = {k: why for k, why in outcome.items() if why}
+                sides[role] = {"applied": sorted(k for k, why
+                                                 in outcome.items() if not why),
+                               "refused": refused}
+                if refused:
+                    for key, why in refused.items():
+                        self.log.warning(
+                            "         %-4s  '%s'  %s NOT applied: %s", role,
+                            volume, VOLUME_SETTING_LABELS.get(key, key), why)
+                else:
+                    self.log.info("         %-4s  '%s'  %d setting(s) applied.",
+                                  role, volume, len(outcome))
+            applied[qtree] = sides
+        return applied
+
     def _carry_quotas(self, qtrees: List[str], volumes: Dict[str, str],
                       renames: Dict[str, str]) -> Dict[str, dict]:
         """Give each clone volume the two quota rules it needs.
@@ -1488,6 +1548,12 @@ class MigrationEngine:
         self.log.info(">> [4/7]  Creating FlexClone volumes on PROD and DR")
         self._create_clones_on_both(qtrees, snap_name, mapping)
 
+        # Step 4a: the clones inherit the source volume's settings. Applied
+        # now, while the DR side is still writable — after the mirror it is
+        # a read-only destination and cannot be modified at all.
+        self.log.info(">> [4/7]  Applying the destination volume settings")
+        volume_settings = self._configure_clones(qtrees, mapping)
+
         # Step 4b: rename inside the PROD clones, before the mirror exists,
         # so the first resync carries the new names to DR.
         if renames:
@@ -1616,6 +1682,7 @@ class MigrationEngine:
                 "pruned": pruned,
                 "export_policies": exports,
                 "quotas": quotas,
+                "volume_settings": volume_settings,
                 "clone_volumes": [mapping[q] for q in qtrees],
                 "prod_aggregate": prod_aggr, "dr_aggregate": dr_aggr,
                 "abandoned_test_env": old_test_env}
@@ -1679,6 +1746,11 @@ class MigrationEngine:
         # Step 4: FlexClones on future PROD and future DR.
         self.log.info(">> [4/6]  Creating thin FlexClone volumes on PROD and DR")
         self._create_clones_on_both(qtrees, snap_name, mapping)
+
+        # Step 4a: same settings as production, so what the client validates
+        # is the volume they will actually get.
+        self.log.info(">> [4/6]  Applying the destination volume settings")
+        volume_settings = self._configure_clones(qtrees, mapping)
 
         # Step 4b: rename inside the PROD clones, before the mirror exists,
         # so the first resync carries the new names to DR. The test
@@ -1777,6 +1849,7 @@ class MigrationEngine:
                 "clone_volumes": [mapping[q] for q in qtrees],
                 "export_policies": exports,
                 "quotas": quotas,
+                "volume_settings": volume_settings,
                 "expires_at": expires.isoformat(timespec="seconds")}
 
     # =====================================================================

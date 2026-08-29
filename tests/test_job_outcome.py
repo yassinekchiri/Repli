@@ -24,6 +24,18 @@ def ready(store, params, client):
     return job
 
 
+def ntfs(client, params, volume):
+    """Make a clone NTFS so 'acl' will run on it.
+
+    A clone is created 'unix' (core/volumes.CLONE_VOLUME_SETTINGS), and
+    forcing AD-group DACLs needs NTFS or mixed — so the two cannot both be
+    true of the same volume, and a test about 'acl' has to say which it
+    wants.
+    """
+    client.volumes[(params.dest_cluster, params.dest_vserver,
+                    volume)].security_style = "ntfs"
+
+
 def outcome_of(store, job):
     return JobStore.outcome(store.load(job["job_id"]))
 
@@ -131,8 +143,10 @@ def test_the_history_keeps_what_happened_before(engine, ready, client, store):
     assert all(h["ended_at"] for h in history)
 
 
-def test_the_history_does_not_grow_without_bound(engine, ready, store):
+def test_the_history_does_not_grow_without_bound(engine, ready, store,
+                                                 client, params):
     engine.test("q_fin", job=ready, volume_map=vmap("q_fin"))   # makes the path
+    ntfs(client, params, "vol_q_fin")
     for _ in range(25):
         engine.acl("CORP\\grp", acl_path="/vol_q_fin", job=ready)
 
@@ -157,10 +171,11 @@ def test_checking_the_status_does_not_overwrite_the_record(engine, ready,
     assert outcome["last_action_state"] == "failed"
 
 
-def test_every_action_records_itself(engine, ready, client, store):
+def test_every_action_records_itself(engine, ready, client, store, params):
     engine.test("q_fin", job=ready, volume_map=vmap("q_fin"))
     assert outcome_of(store, ready)["last_action"] == "test"
 
+    ntfs(client, params, "vol_q_fin")
     engine.acl("CORP\\grp", acl_path="/vol_q_fin/data", job=ready)
     assert outcome_of(store, ready)["last_action"] == "acl"
 

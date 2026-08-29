@@ -360,6 +360,49 @@ class SshClient(OntapClient):
                   f"-parent-snapshot {parent_snapshot} -junction-active true "
                   f"-junction-path /{clone_name}")
 
+    # One CLI option per setting. 'volume modify' takes them together, so
+    # the same map builds the whole command and a single-setting retry.
+    _VOLUME_SETTING_OPTION = {
+        "encryption": lambda v: f"-encrypt {_yes_no(bool(v))}",
+        "snapshot_reserve_percent": lambda v: f"-percent-snapshot-space {int(v)}",
+        "space_guarantee": lambda v: f"-space-guarantee {v}",
+        "snapshot_policy": lambda v: f"-snapshot-policy {v}",
+        "security_style": lambda v: f"-security-style {v}",
+        "export_policy": lambda v: f"-policy {v}",
+    }
+
+    def configure_volume(self, cluster, svm, volume, settings) -> dict:
+        """`volume modify`, then one command per setting if that is refused.
+
+        Same shape as the REST transport: the happy path is one command, and
+        a refusal costs one command per setting to say which one it was.
+        """
+        unknown = [k for k in settings if k not in self._VOLUME_SETTING_OPTION]
+        outcome = {k: "not supported by the SSH transport" for k in unknown}
+        wanted = {k: v for k, v in settings.items()
+                  if k in self._VOLUME_SETTING_OPTION}
+        if not wanted:
+            return outcome
+
+        base = f"volume modify -vserver {svm} -volume {volume}"
+
+        def modify(chosen: dict) -> str:
+            options = " ".join(self._VOLUME_SETTING_OPTION[k](v)
+                               for k, v in chosen.items())
+            r = self._run(cluster, f"{base} {options}", allow_failure=True)
+            return self._detect_error(r) or ""
+
+        reason = modify(wanted)
+        if not reason:
+            outcome.update({k: "" for k in wanted})
+            return outcome
+        self.log.warning("Applying %d setting(s) to %s:%s in one command "
+                         "failed (%s) — retrying one at a time to find which.",
+                         len(wanted), svm, volume, reason)
+        for key, value in wanted.items():
+            outcome[key] = modify({key: value})
+        return outcome
+
     def start_volume_move(self, cluster, svm, volume, dest_aggregate):
         self._run(cluster,
                   f"volume move start -vserver {svm} -volume {volume} "

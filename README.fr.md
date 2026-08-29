@@ -94,7 +94,7 @@ curl -s -X POST $BASE/migrations/$JOB/preflight/clone \
 
 ```bash
 pip install --no-index --find-links wheels/ -r requirements-dev.txt
-python3 -m pytest            # 351 tests, hors-ligne, aucun cluster contacté
+python3 -m pytest            # 372 tests, hors-ligne, aucun cluster contacté
 ```
 
 ---
@@ -675,6 +675,59 @@ peut alors être omis. Trois modes :
   propagation cascade → FlexClones sur PROD et DR → **élagage** → SnapMirror
   entre clones + resync → sélection automatique du meilleur aggregate →
   `volume move` → sortie immédiate.
+
+#### Les paramètres du volume de destination
+
+Un clone naît copie des réglages du volume source — dimensionné et réglé
+pour un volume partagé contenant tous les clients. La destination ne contient
+que le qtree d'un client : chaque clone est donc reconfiguré sur **PROD et
+DR** :
+
+| Paramètre | Valeur |
+|---|---|
+| Encryption | `true` |
+| Snapshot reserve | `0 %` |
+| Space guarantee | `none` |
+| Snapshot policy | `none` |
+| Security style | `unix` |
+| Export policy du volume | `default` |
+
+Ils sont définis à un seul endroit, `CLONE_VOLUME_SETTINGS` dans
+`netapp_migration/core/volumes.py`.
+
+Cela se produit **juste après la création des clones et avant l'existence du
+miroir** — la seule fenêtre pendant laquelle le clone DR est encore
+inscriptible. Devenu destination SnapMirror, il n'est plus modifiable du
+tout.
+
+**Un paramètre refusé par le cluster n'interrompt pas le run.** Les autres
+valent toujours la peine sur un volume que personne n'utilise encore, et le
+refus est nommé :
+
+```
+PROD  'vol_q_fin'  encryption NOT applied: cannot encrypt an attached FlexClone
+```
+
+Le chemin nominal coûte un appel par volume. Quand ONTAP refuse le corps, il
+ne dit pas quel champ était fautif sous une forme exploitable : chaque
+paramètre est alors réessayé seul — ceux qui passent sont appliqués, celui
+qui échoue est nommé.
+
+> **`unix` et l'action `acl` sont en tension.** Forcer des DACL de groupes AD
+> exige un volume NTFS ou mixed : `acl` refusera donc tout clone créé en
+> `unix`. C'est une conséquence de ces réglages, pas un bug — le pré-vol le
+> signale avant le clone (`VOLUME_SECURITY_STYLE_VS_ACL`). Passez
+> `security_style` à `mixed` dans `core/volumes.py` si ces volumes doivent
+> aussi porter des permissions NTFS.
+
+> **Encryption sur un FlexClone attaché.** Un clone partage ses blocs avec
+> son parent : un cluster peut refuser de le chiffrer tant que le
+> `volume move` de l'étape 7 ne l'a pas détaché. Le cas échéant, le refus est
+> rapporté par volume et les cinq autres réglages s'appliquent — chiffrez au
+> moment du move, ou après, une fois le clone détaché.
+
+`check-status` rapporte ce que chaque volume a réellement obtenu : un
+paramètre refusé reste donc visible après coup, pas seulement dans le log.
 
 #### Quotas : deux règles par volume clone
 

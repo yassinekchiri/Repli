@@ -50,6 +50,20 @@ class OntapClient(ABC):
                           dest_aggregate: str) -> None:
         """Launch (fire-and-forget) a volume move to another aggregate."""
 
+    @abstractmethod
+    def configure_volume(self, cluster: str, svm: str, volume: str,
+                         settings: dict) -> dict:
+        """Apply volume settings, reporting per setting what happened.
+
+        Returns {setting: ""} when applied and {setting: reason} when the
+        cluster refused it. A refusal is NOT raised: settings are applied
+        together and, when one is rejected, the others are still worth
+        having on a volume nobody is using yet — provided the operator is
+        told exactly which one failed and why.
+
+        Keys are those of core/volumes.CLONE_VOLUME_SETTINGS.
+        """
+
     # ---- Aggregates ------------------------------------------------------
     @abstractmethod
     def get_aggregate_available(self, cluster: str,

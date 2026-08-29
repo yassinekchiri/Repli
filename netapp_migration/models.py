@@ -249,6 +249,11 @@ class VolumeInfo:
     junction_path: str = ""
     quota_state: str = ""           # 'on' | 'off' | 'initializing' | 'mixed'
     clone_parent: str = ""          # parent volume while still a FlexClone
+    encrypted: Optional[bool] = None
+    snapshot_policy: str = ""
+    snapshot_reserve_percent: Optional[int] = None
+    space_guarantee: str = ""       # 'none' | 'volume'
+    export_policy: str = ""         # the VOLUME's policy, not a qtree's
 
 
 @dataclass

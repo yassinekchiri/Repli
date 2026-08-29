@@ -9,8 +9,10 @@ shapes are pinned here rather than left to be discovered in production.
 import pytest
 
 from netapp_migration.core.exports import DESTINATION_RULE
+from netapp_migration.core.volumes import CLONE_VOLUME_SETTINGS
 from netapp_migration.models import ExportRule
-from netapp_migration.transport.rest import (_export_rule_from_rest,
+from netapp_migration.transport.rest import (RestClient,
+                                             _export_rule_from_rest,
                                              _export_rule_to_rest,
                                              _relationship_type_of)
 
@@ -169,3 +171,44 @@ def test_the_relationship_kind_is_derived_from_the_policy(policy_type,
 
 def test_a_record_without_a_policy_reports_no_kind():
     assert _relationship_type_of({}) == ""
+
+
+# =============================================================================
+# Volume settings: the PATCH body
+# =============================================================================
+
+def settings_body(**overrides):
+    fields = dict(CLONE_VOLUME_SETTINGS)
+    fields.update(overrides)
+    return RestClient._volume_settings_body(fields)
+
+
+def test_each_setting_lands_where_ontap_expects_it():
+    body = settings_body()
+
+    assert body["encryption"] == {"enabled": True}
+    assert body["space"] == {"snapshot": {"reserve_percent": 0}}
+    assert body["guarantee"] == {"type": "none"}
+    assert body["snapshot_policy"] == {"name": "none"}
+
+
+def test_two_settings_under_the_same_key_are_merged():
+    """security_style and export_policy both live under 'nas'. A plain
+    update would send the second and silently drop the first."""
+    body = settings_body()
+
+    assert body["nas"] == {"security_style": "unix",
+                           "export_policy": {"name": "default"}}
+
+
+def test_a_single_setting_builds_the_same_fragment():
+    """The retry that isolates a refused setting must send exactly what the
+    combined body sent for it, or it would test something else."""
+    for key, value in CLONE_VOLUME_SETTINGS.items():
+        alone = RestClient._volume_settings_body({key: value})
+        top = next(iter(alone))
+        assert top in settings_body(), key
+
+
+def test_an_unknown_setting_is_dropped_rather_than_guessed():
+    assert RestClient._volume_settings_body({"not_a_setting": 1}) == {}

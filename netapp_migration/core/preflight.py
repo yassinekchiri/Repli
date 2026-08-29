@@ -31,6 +31,8 @@ from ..transport.base import OntapClient
 from .jobs import CREATE_STATUS_ORDER
 from .exports import (describe_forced, describe_skipped,
                       destination_rules)
+from .volumes import (CLONE_VOLUME_SETTINGS,
+                      describe_settings as describe_volume_settings)
 from .quotas import (QUOTA_POLICY, describe_rule as describe_quota_rule,
                      destination_rules as quota_rules_for,
                      source_rule_for as quota_source_rule_for)
@@ -820,6 +822,7 @@ class PreflightChecker:
                                job, prune)
         self._check_export_policies(report, normalised, qtree_map, job)
         self._check_quotas(report, normalised, qtree_map, job)
+        self._check_volume_settings(report)
 
         # The clone mirror PROD -> DR needs its own peering, policy and
         # schedule on the DR cluster.
@@ -924,6 +927,7 @@ class PreflightChecker:
                                         None if fresh else job)
             self._check_quotas(report, normalised, qtree_map,
                                None if fresh else job)
+            self._check_volume_settings(report)
             self._check_peering(report, p.dr_cluster, p.dr_vserver,
                                 p.dest_cluster, p.dest_vserver,
                                 "clone PROD -> clone DR")
@@ -1243,6 +1247,30 @@ class PreflightChecker:
                           hint="check its rules match the clients this qtree "
                                "should have",
                           target=f"{cluster} / {svm}")
+
+    def _check_volume_settings(self, report: PreflightReport):
+        """State what every clone volume will be set to, and the one
+        consequence that is easy to miss.
+
+        A clone created 'unix' cannot take AD-group DACLs, so the 'acl'
+        action will refuse it. That is a deliberate consequence of the
+        settings, not a bug, but nobody should discover it after the
+        migration.
+        """
+        self._add(report, "VOLUME_SETTINGS", "Clone volume settings", True,
+                  detail=describe_volume_settings(),
+                  target=f"{self.p.dest_cluster} + {self.p.dr_cluster}")
+
+        style = CLONE_VOLUME_SETTINGS.get("security_style", "")
+        if style and style not in ("ntfs", "mixed"):
+            self._add(report, "VOLUME_SECURITY_STYLE_VS_ACL",
+                      f"Clones are '{style}': action 'acl' will not run on "
+                      f"them", False, severity=SEVERITY_WARNING,
+                      detail=f"forcing AD-group DACLs needs NTFS or mixed, "
+                             f"and the clones are created '{style}'",
+                      hint="use 'mixed' in core/volumes.CLONE_VOLUME_SETTINGS "
+                           "if these volumes also need NTFS permissions",
+                      target=f"{self.p.dest_cluster} + {self.p.dr_cluster}")
 
     def _check_quotas(self, report: PreflightReport, qtrees: Sequence[str],
                       qtree_map: Optional[Dict[str, str]],

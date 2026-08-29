@@ -113,6 +113,17 @@ def _export_rule_to_rest(rule: ExportRule) -> dict:
     return body
 
 
+def _deep_merge(base: dict, extra: dict) -> dict:
+    """Merge nested dicts without losing a sibling key."""
+    merged = dict(base)
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _relationship_type_of(rec: dict) -> str:
     """XDP / DP / … from the policy type REST reports.
 
@@ -270,7 +281,12 @@ class RestClient(OntapClient):
                                                "clone.is_flexclone,"
                                                "clone.parent_volume.name,"
                                                "movement.state,"
-                                               "state,type,quota.state"})
+                                               "state,type,quota.state,"
+                                               "encryption.enabled,"
+                                               "snapshot_policy.name,"
+                                               "space.snapshot.reserve_percent,"
+                                               "guarantee.type,"
+                                               "nas.export_policy.name"})
         records = body.get("records", [])
         if not records:
             raise OntapError(cluster, f"volume show {svm}:{volume}",
@@ -292,6 +308,15 @@ class RestClient(OntapClient):
             junction_path=nas.get("path", "") or "",
             quota_state=(rec.get("quota", {}) or {}).get("state", "") or "",
             clone_parent=(clone.get("parent_volume", {}) or {}).get("name", ""),
+            encrypted=(rec.get("encryption", {}) or {}).get("enabled"),
+            snapshot_policy=(rec.get("snapshot_policy", {}) or {}).get("name", "")
+            or "",
+            snapshot_reserve_percent=((rec.get("space", {}) or {})
+                                      .get("snapshot", {}) or {})
+            .get("reserve_percent"),
+            space_guarantee=(rec.get("guarantee", {}) or {}).get("type", "") or "",
+            export_policy=(nas.get("export_policy", {}) or {}).get("name", "")
+            or "",
         )
 
     def volume_exists(self, cluster: str, svm: str, volume: str) -> bool:
@@ -335,6 +360,77 @@ class RestClient(OntapClient):
             "nas": {"path": f"/{clone_name}"},
         }
         self._request(cluster, "POST", "/storage/volumes", json_body=payload)
+
+    # How each setting is written on /storage/volumes. Kept as one map so
+    # the body for a whole set and the body for a single setting are built
+    # the same way, and a retry cannot drift from the first attempt.
+    _VOLUME_SETTING_BODY = {
+        "encryption": lambda v: {"encryption": {"enabled": bool(v)}},
+        "snapshot_reserve_percent":
+            lambda v: {"space": {"snapshot": {"reserve_percent": int(v)}}},
+        "space_guarantee": lambda v: {"guarantee": {"type": str(v)}},
+        "snapshot_policy": lambda v: {"snapshot_policy": {"name": str(v)}},
+        "security_style": lambda v: {"nas": {"security_style": str(v)}},
+        "export_policy": lambda v: {"nas": {"export_policy": {"name": str(v)}}},
+    }
+
+    @classmethod
+    def _volume_settings_body(cls, settings: dict) -> dict:
+        """Merge the per-setting fragments into one PATCH body.
+
+        'nas' and 'space' each carry more than one setting, so the merge is
+        one level deep rather than a plain update — otherwise the security
+        style would silently drop the export policy.
+        """
+        body: dict = {}
+        for key, value in settings.items():
+            build = cls._VOLUME_SETTING_BODY.get(key)
+            if build is None:
+                continue
+            for top, fragment in build(value).items():
+                if isinstance(fragment, dict) and isinstance(body.get(top), dict):
+                    body[top] = _deep_merge(body[top], fragment)
+                else:
+                    body[top] = fragment
+        return body
+
+    def configure_volume(self, cluster, svm, volume, settings) -> dict:
+        """One PATCH for the lot; on refusal, one PATCH each to find the
+        culprit.
+
+        The happy path costs a single call. When ONTAP refuses the body it
+        does not say which field was at fault in a form worth parsing, so
+        each setting is retried alone: the ones that work are applied and
+        the one that does not is named. Every wire-shape bug found in this
+        project so far would have been a one-line report instead of a lost
+        migration step.
+        """
+        unknown = [k for k in settings if k not in self._VOLUME_SETTING_BODY]
+        outcome = {k: "not supported by the REST transport" for k in unknown}
+        wanted = {k: v for k, v in settings.items()
+                  if k in self._VOLUME_SETTING_BODY}
+        if not wanted:
+            return outcome
+
+        uuid = self._volume_uuid(cluster, svm, volume)
+        try:
+            self._request(cluster, "PATCH", f"/storage/volumes/{uuid}",
+                          json_body=self._volume_settings_body(wanted))
+            outcome.update({k: "" for k in wanted})
+            return outcome
+        except OntapError as exc:
+            self.log.warning("Applying %d setting(s) to %s:%s in one call "
+                             "failed (%s) — retrying one at a time to find "
+                             "which.", len(wanted), svm, volume, exc.detail)
+
+        for key, value in wanted.items():
+            try:
+                self._request(cluster, "PATCH", f"/storage/volumes/{uuid}",
+                              json_body=self._volume_settings_body({key: value}))
+                outcome[key] = ""
+            except OntapError as exc:
+                outcome[key] = exc.detail or str(exc)
+        return outcome
 
     def start_volume_move(self, cluster, svm, volume, dest_aggregate):
         uuid = self._volume_uuid(cluster, svm, volume)

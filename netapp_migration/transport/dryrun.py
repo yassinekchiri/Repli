@@ -58,6 +58,12 @@ class DryRunClient(OntapClient):
                              f"(parent={parent_volume}@{parent_snapshot})")
         self._volumes.add((cluster, svm, clone_name))
 
+    def configure_volume(self, cluster, svm, volume, settings) -> dict:
+        self._trace(cluster, f"volume modify {svm}:{volume} "
+                             + " ".join(f"{k}={v}"
+                                        for k, v in settings.items()))
+        return {key: "" for key in settings}
+
     def start_volume_move(self, cluster, svm, volume, dest_aggregate):
         self._trace(cluster, f"volume move start {svm}:{volume} -> {dest_aggregate}")
 
